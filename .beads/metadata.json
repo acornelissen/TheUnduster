@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "TheUnduster",
+  "project_id": "25e2283e-a4f4-41a5-a9d3-4a14997d691f"
+}
