@@ -2,16 +2,18 @@
 
 from pathlib import Path
 
+import cv2
 import imageio.v3 as iio
 import numpy as np
-import tifffile
 
 
 def load_image(path: str | Path) -> np.ndarray:
     path = Path(path)
-    try:
-        raw = tifffile.imread(path)
-    except (ValueError, OSError, RuntimeError):
+    if path.suffix.lower() == ".png":
+        raw = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if raw.ndim == 3 and raw.shape[2] >= 3:
+            raw = raw[..., :3][..., ::-1]
+    else:
         raw = iio.imread(path)
     if raw.ndim == 3 and raw.shape[2] == 4:
         raw = raw[..., :3]
@@ -33,7 +35,9 @@ def save_image(path: str | Path, img: np.ndarray, bit_depth: int = 16) -> None:
     elif bit_depth == 16:
         out = (img * 65535.0 + 0.5).astype(np.uint16)
         if path.suffix.lower() == ".png":
-            tifffile.imwrite(path, out)
+            if out.ndim == 3:
+                out = out[..., ::-1]
+            cv2.imwrite(str(path), out)
         else:
             iio.imwrite(path, out)
     else:

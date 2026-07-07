@@ -19,6 +19,18 @@ def test_round_trip(tmp_path, ext, bit_depth):
     assert np.abs(back - img).max() <= tol
 
 
+def test_png_files_are_real_pngs(tmp_path):
+    img = np.linspace(0, 1, 32 * 32 * 3, dtype=np.float32).reshape(32, 32, 3)
+    for bit_depth in (8, 16):
+        path = tmp_path / f"x{bit_depth}.png"
+        save_image(path, img, bit_depth=bit_depth)
+        assert path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+        back = load_image(path)
+        assert back.shape == (32, 32, 3)
+        tol = (1 / 255 if bit_depth == 8 else 1 / 65535) + 1e-6
+        assert np.abs(back - img).max() <= tol
+
+
 def test_gray_round_trip(tmp_path):
     img = np.linspace(0, 1, 32 * 32, dtype=np.float32).reshape(32, 32)
     path = tmp_path / "g.tif"
