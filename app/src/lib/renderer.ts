@@ -22,6 +22,11 @@ uniform float overlayOn;
 void main() {
   vec4 base = texture(tile, vUv);
   float p = texture(probs, vUv).r;
+  // p is an 8-bit quantization of the native f32 probability (see
+  // build_prob_pyramid), so this GPU compare can disagree with Rust's
+  // f32 threshold compare (used by the components command) by up to
+  // ~0.002 (half a u8 step out of 255). That's below the slider's step
+  // granularity (0.01), so it never produces a visibly different result.
   float hit = overlayOn * step(threshold, p) * step(0.004, p); // never tint p==0
   color = mix(base, vec4(1.0, 0.25, 0.25, 1.0), hit * 0.55);
 }`;
@@ -135,7 +140,15 @@ export class TileRenderer {
           } else {
             gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, bytes);
           }
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+          // Single-channel probability textures use NEAREST min filtering:
+          // LINEAR would interpolate probabilities across texels, softening
+          // the threshold edge in the shader (thresholding on a blended
+          // value instead of the real per-pixel probability).
+          gl.texParameteri(
+            gl.TEXTURE_2D,
+            gl.TEXTURE_MIN_FILTER,
+            opts.single ? gl.NEAREST : gl.LINEAR,
+          );
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);

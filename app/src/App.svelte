@@ -23,12 +23,14 @@
 
   $effect(() => {
     const un = listen<{ id: number; stage: string }>("app-progress", (e) => {
-      loading =
-        e.payload.stage === "ready"
-          ? null
-          : e.payload.stage === "decoding"
-            ? "Decoding scan"
-            : "Building preview";
+      // "detecting" must NOT gate the loader: the Viewer stays mounted and
+      // usable (zoom/pan survive) while a detect runs, surfaced instead via
+      // the `detecting` status flag below. Only the open-scan stages gate
+      // `loading`, and "ready" always clears it, regardless of the path
+      // (success or error) that produced it.
+      if (e.payload.stage === "decoding") loading = "Decoding scan";
+      else if (e.payload.stage === "building-pyramid") loading = "Building preview";
+      else if (e.payload.stage === "ready") loading = null;
     });
     return () => {
       un.then((f) => f());
@@ -72,9 +74,17 @@
       });
       detected = true;
       componentsAtHalf = report.components_at_half;
+      // The Viewer's `{#key info.id}` only remounts on an image swap, never
+      // on a detect (loading no longer gates on "detecting"), so this handle
+      // stays stable across the call.
       await viewer?.refreshDetections(overlay.threshold);
     } catch (e) {
       error = String(e);
+      // Belt and braces: the backend now guarantees a terminal "ready" emit
+      // on every detect exit path, which already clears `loading`. This
+      // catch clears it too in case that guarantee is ever violated, so a
+      // failed detect can never leave the app stuck behind the loader.
+      loading = null;
     } finally {
       detecting = false;
     }
@@ -99,12 +109,13 @@
         />
       </label>
       <p class="status" role="status">
-        {#if detecting}
-          Detecting...
-        {:else if detected && componentsAtHalf !== null}
+        {#if detected && componentsAtHalf !== null}
           {componentsAtHalf} defect{componentsAtHalf === 1 ? "" : "s"} at 50%
         {:else}
           Not yet detected
+        {/if}
+        {#if detecting}
+          &mdash; Detecting...
         {/if}
       </p>
     {/if}
@@ -115,7 +126,7 @@
       <p class="hint" role="status" aria-busy="true">{loading}...</p>
     {:else if info}
       {#key info.id}
-        <Viewer bind:this={viewer} {info} {overlay} onRequestDetect={requestDetect} />
+        <Viewer bind:this={viewer} {info} {overlay} {detected} onRequestDetect={requestDetect} />
       {/key}
     {:else}
       <p class="hint">Open a scan to begin.</p>

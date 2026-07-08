@@ -19,8 +19,14 @@
   let {
     info,
     overlay,
+    detected,
     onRequestDetect,
-  }: { info: ImageInfo; overlay: Overlay; onRequestDetect: () => void } = $props();
+  }: {
+    info: ImageInfo;
+    overlay: Overlay;
+    detected: boolean;
+    onRequestDetect: () => void;
+  } = $props();
 
   let canvas: HTMLCanvasElement;
   let renderer: TileRenderer | undefined;
@@ -45,6 +51,10 @@
       detections = [];
     }
     current = -1;
+    // Explicit redraw trigger: the overlay repaints once the component list
+    // (used by z/Z cycling) is fetched. This replaces relying on a Viewer
+    // remount to force a redraw.
+    requestFrame();
   }
 
   function cycleDetection(dir: 1 | -1) {
@@ -63,14 +73,21 @@
   $effect(() => {
     // Read both fields so the effect reruns on either change; a slider drag
     // redraws immediately (uniform-only, no refetch) and, debounced, syncs
-    // the component list used by z/Z so cycling targets stay current.
+    // the component list used by z/Z so cycling targets stay current. The
+    // redraw is unconditional (it must reflect the slider even before any
+    // detection exists), but the debounced refetch is non-load-bearing on
+    // mount: only invoke it when a detection actually exists, so a fresh
+    // Viewer mount doesn't fire a doomed `components` call before `detect`
+    // has ever run.
     const threshold = overlay.threshold;
     void overlay.enabled;
     requestFrame();
     clearTimeout(refreshTimer);
-    refreshTimer = setTimeout(() => {
-      refreshDetections(threshold);
-    }, 250);
+    if (detected) {
+      refreshTimer = setTimeout(() => {
+        refreshDetections(threshold);
+      }, 250);
+    }
     return () => clearTimeout(refreshTimer);
   });
 

@@ -188,6 +188,20 @@ impl Images {
         self.entries.get(&id).map(|e| e.image.clone())
     }
 
+    /// Snapshot of this entry's display-pyramid level dims, for building a
+    /// matching prob pyramid outside the lock (see `set_probs_built`).
+    pub fn level_dims(&self, id: u64) -> Option<Vec<(u32, u32)>> {
+        let entry = self.entries.get(&id)?;
+        Some(
+            entry
+                .pyramid
+                .levels
+                .iter()
+                .map(|l| (l.width, l.height))
+                .collect(),
+        )
+    }
+
     pub fn tile(&mut self, id: u64, level: u8, tx: u32, ty: u32) -> Option<Arc<Tile>> {
         let key = TileKey {
             image_id: id,
@@ -205,20 +219,46 @@ impl Images {
     /// max-pooled display pyramid to match this entry's tile levels.
     /// Returns false if `id` is unknown (e.g. the image was closed while
     /// inference ran).
+    ///
+    /// This is the slow path: it builds the (already computed elsewhere,
+    /// ideally) pyramid under the lock. Kept only so its existing tests stay
+    /// green; the `detect` command uses `level_dims` + `set_probs_built`
+    /// instead, which builds the pyramid outside the lock.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_probs(&mut self, id: u64, probs: Vec<f32>) -> bool {
+        let Some(level_dims) = self.level_dims(id) else {
+            return false;
+        };
+        let Some(entry) = self.entries.get(&id) else {
+            return false;
+        };
+        if probs.len() != (entry.image.width * entry.image.height) as usize {
+            return false;
+        }
+        let pyramid = build_prob_pyramid(&probs, &level_dims);
+        self.set_probs_built(id, probs, pyramid)
+    }
+
+    /// Store already-built native-res probabilities and their display
+    /// pyramid (typically built off-lock alongside inference). Validates
+    /// `probs.len()` against the entry's native dims and each pyramid level's
+    /// dims against the entry's display-pyramid levels; rejects on any
+    /// mismatch or unknown id, storing nothing.
+    pub fn set_probs_built(&mut self, id: u64, probs: Vec<f32>, pyramid: ProbPyramid) -> bool {
         let Some(entry) = self.entries.get_mut(&id) else {
             return false;
         };
         if probs.len() != (entry.image.width * entry.image.height) as usize {
             return false;
         }
-        let level_dims: Vec<(u32, u32)> = entry
-            .pyramid
-            .levels
-            .iter()
-            .map(|l| (l.width, l.height))
-            .collect();
-        let pyramid = build_prob_pyramid(&probs, &level_dims);
+        if pyramid.levels.len() != entry.pyramid.levels.len() {
+            return false;
+        }
+        for (built, expected) in pyramid.levels.iter().zip(entry.pyramid.levels.iter()) {
+            if built.width != expected.width || built.height != expected.height {
+                return false;
+            }
+        }
         entry.probs = Some((probs, pyramid));
         true
     }
@@ -377,5 +417,32 @@ mod tests {
         let info = images.open(&path).unwrap();
         assert!(!images.set_probs(info.id, vec![0.0; 10]));
         assert!(images.components(info.id, 0.5).is_none()); // nothing stored
+    }
+
+    #[test]
+    fn set_probs_built_rejects_mismatched_pyramid_level_dims() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_png(&dir, 600, 400);
+        let mut images = Images::default();
+        let info = images.open(&path).unwrap();
+        let level_dims = images.level_dims(info.id).unwrap();
+        assert_eq!(level_dims, vec![(600, 400), (300, 200)]);
+        let probs = vec![0.0f32; 600 * 400];
+
+        // Pyramid built against the right level count but a corrupted
+        // second-level width: disagrees with the entry's real pyramid.
+        let mut mismatched = build_prob_pyramid(&probs, &level_dims);
+        mismatched.levels[1].width = 299;
+        assert!(!images.set_probs_built(info.id, probs.clone(), mismatched));
+        assert!(images.components(info.id, 0.5).is_none()); // nothing stored
+
+        // Sanity: a correctly-shaped pyramid is accepted.
+        let good = build_prob_pyramid(&probs, &level_dims);
+        assert!(images.set_probs_built(info.id, probs.clone(), good));
+        assert!(images.components(info.id, 0.5).is_some());
+
+        // Unknown id is rejected too.
+        let another = build_prob_pyramid(&probs, &level_dims);
+        assert!(!images.set_probs_built(999, probs, another));
     }
 }

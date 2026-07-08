@@ -6,7 +6,7 @@ mod protocol;
 
 use std::sync::Mutex;
 
-use images::{ImageInfo, Images, Prepared};
+use images::{build_prob_pyramid, ImageInfo, Images, Prepared};
 use tauri::{Emitter, Manager, State};
 
 #[derive(serde::Serialize, Clone)]
@@ -82,11 +82,14 @@ struct DetectReport {
     components_at_half: usize,
 }
 
-#[tauri::command]
-async fn detect(
-    app: tauri::AppHandle,
-    images: State<'_, Mutex<Images>>,
-    detector: State<'_, detect::DetectorState>,
+/// Runs the fallible body of `detect`. Split out so `detect` can guarantee a
+/// terminal "ready" emit after this resolves, on every exit path (success or
+/// error alike) — the frontend gates its loading state on that emit and
+/// would otherwise hang behind the loader on any failure.
+async fn run_detect(
+    app: &tauri::AppHandle,
+    images: &State<'_, Mutex<Images>>,
+    detector: &State<'_, detect::DetectorState>,
     id: u64,
 ) -> Result<DetectReport, String> {
     let img = {
@@ -100,24 +103,42 @@ async fn detect(
             stage: "detecting",
         },
     );
-    let detector = detector.inner().clone(); // DetectorState is Clone over an Arc
-    let probs = tauri::async_runtime::spawn_blocking(move || detector.detect(&img))
-        .await
-        .map_err(|e| e.to_string())??;
-    let report = {
-        let mut images = images.lock().map_err(|e| e.to_string())?;
-        if !images.set_probs(id, probs) {
-            return Err(format!(
-                "image {id} closed during detection or detector output size mismatch"
-            ));
-        }
-        DetectReport {
-            id,
-            components_at_half: images.components(id, 0.5).unwrap_or_default().len(),
-        }
+    let level_dims = {
+        let images = images.lock().map_err(|e| e.to_string())?;
+        images
+            .level_dims(id)
+            .ok_or_else(|| format!("no image {id}"))?
     };
+    let detector = detector.inner().clone(); // DetectorState is Clone over an Arc
+    let (probs, pyramid) = tauri::async_runtime::spawn_blocking(move || {
+        let probs = detector.detect(&img)?;
+        let pyramid = build_prob_pyramid(&probs, &level_dims);
+        Ok::<_, String>((probs, pyramid))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let mut images = images.lock().map_err(|e| e.to_string())?;
+    if !images.set_probs_built(id, probs, pyramid) {
+        return Err(format!(
+            "image {id} closed during detection or detector output size mismatch"
+        ));
+    }
+    Ok(DetectReport {
+        id,
+        components_at_half: images.components(id, 0.5).unwrap_or_default().len(),
+    })
+}
+
+#[tauri::command]
+async fn detect(
+    app: tauri::AppHandle,
+    images: State<'_, Mutex<Images>>,
+    detector: State<'_, detect::DetectorState>,
+    id: u64,
+) -> Result<DetectReport, String> {
+    let result = run_detect(&app, &images, &detector, id).await;
     let _ = app.emit("app-progress", Progress { id, stage: "ready" });
-    Ok(report)
+    result
 }
 
 #[tauri::command]
@@ -129,7 +150,7 @@ fn components(
     let images = images.lock().map_err(|e| e.to_string())?;
     images
         .components(id, threshold)
-        .ok_or_else(|| "no detection for image".to_string())
+        .ok_or_else(|| format!("no detection for image {id}"))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
