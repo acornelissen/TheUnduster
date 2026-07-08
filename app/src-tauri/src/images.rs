@@ -340,7 +340,6 @@ impl Images {
     /// (original, healed, mask) for export verification and encoding.
     // Exercised by tests; the export path that consumes this wires up in a
     // later task.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn healed_parts(&self, id: u64) -> Option<HealedParts> {
         let entry = self.entries.get(&id)?;
         let healed = entry.healed.as_ref()?;

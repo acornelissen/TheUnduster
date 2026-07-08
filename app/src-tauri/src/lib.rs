@@ -1,6 +1,7 @@
 //! TheUnduster desktop shell: thin Tauri layer over the engine crates.
 
 mod detect;
+mod export;
 mod images;
 mod protocol;
 mod roll;
@@ -457,6 +458,26 @@ fn approve_frame(
     state.set_approved(index, approved)
 }
 
+#[tauri::command]
+async fn export_frame(
+    images: State<'_, Mutex<Images>>,
+    id: u64,
+    dest: String,
+) -> Result<usize, String> {
+    let (original, healed, mask) = {
+        let images = images.lock().map_err(|e| e.to_string())?;
+        images
+            .healed_parts(id)
+            .ok_or_else(|| format!("image {id} has no healed data to export"))?
+    };
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        export::export_healed(&original, &healed, &mask, std::path::Path::new(&dest))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(report.changed_pixels)
+}
+
 /// Fixed threshold for the background queue's stored bboxes/count. The
 /// operator's per-frame sensitivity slider (Task 2's `set_frame_threshold`)
 /// only affects live overlay/z-navigation on the activated frame; the queue
@@ -678,6 +699,7 @@ pub fn run() {
             activate_frame,
             set_frame_threshold,
             approve_frame,
+            export_frame,
             scan_roll
         ])
         .register_uri_scheme_protocol("tiles", |ctx, request| {
