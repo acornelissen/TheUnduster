@@ -46,11 +46,17 @@ pub fn export_healed(
     };
     match (&original.data, &healed.data) {
         (PixelData::U8(a), PixelData::U8(b)) => {
+            if a.len() != px * ch || b.len() != px * ch {
+                return Err("pixel buffer length does not match dimensions".to_string());
+            }
             for i in 0..px {
                 check(i, a[i * ch..(i + 1) * ch] != b[i * ch..(i + 1) * ch])?;
             }
         }
         (PixelData::U16(a), PixelData::U16(b)) => {
+            if a.len() != px * ch || b.len() != px * ch {
+                return Err("pixel buffer length does not match dimensions".to_string());
+            }
             for i in 0..px {
                 check(i, a[i * ch..(i + 1) * ch] != b[i * ch..(i + 1) * ch])?;
             }
@@ -66,7 +72,10 @@ pub fn export_healed(
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
-    fd_io::encode(&tmp, healed).map_err(|e| e.to_string())?;
+    fd_io::encode(&tmp, healed).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })?;
     std::fs::rename(&tmp, dest).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("{}: {e}", dest.display())
@@ -149,5 +158,50 @@ mod tests {
         let report = export_healed(&original, &noisy, &mask, &dest).unwrap();
         assert!(report.changed_pixels > 0);
         assert!(dest.exists());
+    }
+
+    #[test]
+    fn refuses_a_short_pixel_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = img(16, 16, 100);
+        let mut healed = original.clone();
+        let mask = vec![false; 256];
+        if let PixelData::U8(v) = &mut healed.data {
+            v.pop(); // truncate the healed buffer
+        }
+        let dest = dir.path().join("out.png");
+        let err = export_healed(&original, &healed, &mask, &dest).unwrap_err();
+        assert!(
+            err.contains("length"),
+            "Expected 'length' in error message, got: {}",
+            err
+        );
+        assert!(!dest.exists(), "Destination should not exist after error");
+    }
+
+    #[test]
+    fn cleans_up_temp_when_rename_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create the destination as a directory so rename will fail
+        let dest = dir.path().join("out.png");
+        std::fs::create_dir(&dest).unwrap();
+
+        let original = img(16, 16, 100);
+        let mut healed = original.clone();
+        let mut mask = vec![false; 256];
+        mask[42] = true;
+        if let PixelData::U8(v) = &mut healed.data {
+            v[42] = 200;
+        }
+        let err = export_healed(&original, &healed, &mask, &dest).unwrap_err();
+        assert!(
+            err.contains("out.png"),
+            "Expected destination in error message"
+        );
+        // Check that the temp file does not exist (cleanup succeeded)
+        assert!(
+            !dir.path().join(".unduster-tmp-out.png").exists(),
+            "Temp file should be cleaned up after rename failure"
+        );
     }
 }
