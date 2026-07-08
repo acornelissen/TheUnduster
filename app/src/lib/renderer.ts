@@ -28,7 +28,9 @@ void main() {
   // ~0.002 (half a u8 step out of 255). That's below the slider's step
   // granularity (0.01), so it never produces a visibly different result.
   float hit = overlayOn * step(threshold, p) * step(0.004, p); // never tint p==0
-  color = mix(base, vec4(1.0, 0.25, 0.25, 1.0), hit * 0.55);
+  // Saturated red at high opacity: masks must read at a glance on both
+  // grey film and colour scans; subtlety here costs missed defects.
+  color = mix(base, vec4(1.0, 0.05, 0.05, 1.0), hit * 0.9);
 }`;
 
 /** Maps a tile's rgba path to its probability-layer counterpart. */
