@@ -3,6 +3,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-dialog";
   import Viewer from "./lib/Viewer.svelte";
+  import Filmstrip from "./lib/Filmstrip.svelte";
   import type { Level } from "./lib/viewport";
 
   interface ImageInfo {
@@ -10,6 +11,20 @@
     width: number;
     height: number;
     levels: Level[];
+  }
+
+  interface FrameInfo {
+    index: number;
+    file_name: string;
+    threshold: number;
+    approved: boolean;
+    defect_count: number | null;
+    bboxes: [number, number, number, number][] | null;
+  }
+
+  interface RollInfo {
+    dir: string;
+    frames: FrameInfo[];
   }
 
   let info: ImageInfo | null = $state(null);
@@ -20,6 +35,11 @@
   let detected = $state(false);
   let componentsAtHalf: number | null = $state(null);
   let detecting = $state(false);
+
+  let roll: RollInfo | null = $state(null);
+  let currentIndex = $state(0);
+  let scanDone = $state(false);
+  let thresholdSaveTimer: ReturnType<typeof setTimeout> | undefined;
 
   $effect(() => {
     const un = listen<{ id: number; stage: string }>("app-progress", (e) => {
@@ -37,6 +57,36 @@
     };
   });
 
+  $effect(() => {
+    const un = listen<{ index: number; count: number | null }>("roll-progress", (e) => {
+      if (!roll) return;
+      roll.frames[e.payload.index].defect_count = e.payload.count;
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  $effect(() => {
+    const un = listen<{ index: number; message: string }>("roll-frame-error", (e) => {
+      if (!roll) return;
+      roll.frames[e.payload.index].defect_count = null;
+      error = `Frame ${roll.frames[e.payload.index].file_name}: ${e.payload.message}`;
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  $effect(() => {
+    const un = listen("roll-done", () => {
+      scanDone = true;
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
   async function openScan() {
     error = null;
     const path = await open({
@@ -45,6 +95,7 @@
     });
     if (typeof path !== "string") return;
     const previousId = info?.id;
+    roll = null;
     loading = "Opening scan";
     try {
       info = await invoke<ImageInfo>("open_image", { path });
@@ -62,6 +113,89 @@
         // best effort cleanup; the replaced image just lingers in the cache
       }
     }
+  }
+
+  async function openRoll() {
+    error = null;
+    const dir = await open({ multiple: false, directory: true });
+    if (typeof dir !== "string") return;
+    info = null;
+    scanDone = false;
+    try {
+      roll = await invoke<RollInfo>("open_roll", { dir });
+    } catch (e) {
+      error = String(e);
+      return;
+    }
+    currentIndex = 0;
+    if (roll.frames.length > 0) {
+      await activateCurrentFrame();
+    }
+    try {
+      await invoke("scan_roll");
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function activateCurrentFrame() {
+    if (!roll) return;
+    loading = "Opening frame";
+    overlay.threshold = roll.frames[currentIndex].threshold;
+    try {
+      info = await invoke<ImageInfo>("activate_frame", { index: currentIndex });
+    } catch (e) {
+      error = String(e);
+      loading = null;
+      return;
+    }
+    detected = false;
+    componentsAtHalf = null;
+  }
+
+  async function selectFrame(index: number) {
+    if (!roll || index === currentIndex) return;
+    currentIndex = index;
+    await activateCurrentFrame();
+  }
+
+  function stepFrame(delta: number) {
+    if (!roll) return;
+    const next = Math.min(Math.max(currentIndex + delta, 0), roll.frames.length - 1);
+    if (next === currentIndex) return;
+    currentIndex = next;
+    void activateCurrentFrame();
+  }
+
+  async function approveAndAdvance() {
+    if (!roll) return;
+    const frame = roll.frames[currentIndex];
+    frame.approved = true;
+    try {
+      await invoke("approve_frame", { index: currentIndex, approved: true });
+    } catch (e) {
+      error = String(e);
+      return;
+    }
+    const next = roll.frames.findIndex((f, i) => i > currentIndex && !f.approved);
+    if (next !== -1) {
+      currentIndex = next;
+      await activateCurrentFrame();
+    }
+  }
+
+  function onThresholdInput() {
+    if (!roll) return;
+    roll.frames[currentIndex].threshold = overlay.threshold;
+    clearTimeout(thresholdSaveTimer);
+    thresholdSaveTimer = setTimeout(() => {
+      invoke("set_frame_threshold", {
+        index: currentIndex,
+        threshold: overlay.threshold,
+      }).catch((e) => {
+        error = String(e);
+      });
+    }, 300);
   }
 
   async function requestDetect() {
@@ -89,11 +223,41 @@
       detecting = false;
     }
   }
+
+  function isTypingTarget(target: EventTarget | null): boolean {
+    if (!(target instanceof HTMLElement)) return false;
+    const tag = target.tagName;
+    return tag === "INPUT" || tag === "TEXTAREA" || target.isContentEditable;
+  }
+
+  function onWindowKey(e: KeyboardEvent) {
+    if (!roll) return;
+    // Roll navigation keys must not fire while the operator is typing in a
+    // form control (e.g. the sensitivity slider has focus via keyboard, or
+    // any future text input) -- "," "." and "A" are ordinary characters.
+    if (isTypingTarget(e.target)) return;
+    // Only handle roll-navigation keys; everything else (arrows, d/m/z/Z)
+    // stays owned by the canvas via its own onkeydown so focus there keeps
+    // working exactly as in single-image mode.
+    if (e.key === ",") {
+      e.preventDefault();
+      stepFrame(-1);
+    } else if (e.key === ".") {
+      e.preventDefault();
+      stepFrame(1);
+    } else if (e.key === "A") {
+      e.preventDefault();
+      void approveAndAdvance();
+    }
+  }
 </script>
+
+<svelte:window onkeydown={onWindowKey} />
 
 <div class="shell">
   <header>
     <button onclick={openScan} disabled={loading !== null}>Open scan</button>
+    <button onclick={openRoll} disabled={loading !== null}>Open roll</button>
     {#if info}
       <button onclick={requestDetect} disabled={loading !== null || detecting}>
         {detecting ? "Detecting..." : "Detect"}
@@ -106,6 +270,7 @@
           max="0.95"
           step="0.01"
           bind:value={overlay.threshold}
+          oninput={onThresholdInput}
         />
       </label>
       <p class="status" role="status">
@@ -117,6 +282,13 @@
         {#if detecting}
           &mdash; Detecting...
         {/if}
+        {#if roll}
+          &mdash; {roll.frames.filter((f) => f.approved).length}/{roll.frames.length} approved
+          {#if !scanDone}
+            &mdash; scanning ({roll.frames.filter((f) => f.defect_count !== null).length}/{roll
+              .frames.length})
+          {/if}
+        {/if}
       </p>
     {/if}
     {#if error}<p role="alert">{error}</p>{/if}
@@ -126,12 +298,22 @@
       <p class="hint" role="status" aria-busy="true">{loading}...</p>
     {:else if info}
       {#key info.id}
-        <Viewer bind:this={viewer} {info} {overlay} {detected} onRequestDetect={requestDetect} />
+        <Viewer
+          bind:this={viewer}
+          {info}
+          {overlay}
+          {detected}
+          onRequestDetect={requestDetect}
+          bboxes={roll ? roll.frames[currentIndex].bboxes : null}
+        />
       {/key}
     {:else}
-      <p class="hint">Open a scan to begin.</p>
+      <p class="hint">Open a scan or a roll to begin.</p>
     {/if}
   </section>
+  {#if roll}
+    <Filmstrip frames={roll.frames} {currentIndex} onSelect={selectFrame} />
+  {/if}
 </div>
 
 <style>

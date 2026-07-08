@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
-  import { fitZoom, visibleTiles, TILE, type Level } from "./viewport";
+  import { fitZoom, visibleTiles, ringsFor, TILE, type Level } from "./viewport";
   import { TileRenderer } from "./renderer";
 
   interface ImageInfo {
@@ -21,11 +21,13 @@
     overlay,
     detected,
     onRequestDetect,
+    bboxes = null,
   }: {
     info: ImageInfo;
     overlay: Overlay;
     detected: boolean;
     onRequestDetect: () => void;
+    bboxes?: [number, number, number, number][] | null;
   } = $props();
 
   let canvas: HTMLCanvasElement;
@@ -114,6 +116,11 @@
     if (renderer && needsFrame) {
       needsFrame = false;
       renderer.draw(tilePaths(), canvas.width, canvas.height, overlay);
+      const source = detections.length > 0 ? detections : bboxes ?? [];
+      if (zoom < 0.5 && source.length > 0) {
+        const rings = ringsFor(source, zoom, centerX, centerY, canvas.width, canvas.height, 12);
+        renderer.drawRings(rings, canvas.width, canvas.height);
+      }
     }
     requestAnimationFrame(frame);
   }
