@@ -18,6 +18,31 @@ def _frames(frames_dir: Path) -> list[Path]:
     return sorted(p for p in frames_dir.iterdir() if p.suffix.lower() in _EXTS)
 
 
+def competitor_detector(frames_dir, after_dir):
+    """Detector that recovers a competitor's mask from their healed output.
+
+    Pairs frames by stem: for frame 0001.tif it loads after_dir/0001.* and
+    diffs. Stateless per call except an internal position counter matched to
+    _frames() ordering, so it must be used with run_benchmark over the same
+    frames_dir.
+    """
+    frames = _frames(Path(frames_dir))
+    state = {"i": 0}
+
+    def detect(img):
+        frame_path = frames[state["i"]]
+        state["i"] += 1
+        matches = sorted(Path(after_dir).glob(f"{frame_path.stem}.*"))
+        if not matches:
+            raise FileNotFoundError(
+                f"no healed frame for {frame_path.stem} in {after_dir}"
+            )
+        healed = load_image(matches[0])
+        return implied_mask(img, healed)
+
+    return detect
+
+
 def run_benchmark(frames_dir, labels_dir, detectors: dict) -> dict:
     frames_dir, labels_dir = Path(frames_dir), Path(labels_dir)
     per_detector: dict[str, list[dict]] = {name: [] for name in detectors}
@@ -63,14 +88,7 @@ def main() -> None:
         detectors[name] = OnnxDetector(path)
     for spec in args.competitor:
         name, after_dir = spec.split("=", 1)
-        after = Path(after_dir)
-
-        def comp_det(img, _after=after, _frames=iter(_frames(Path(args.frames)))):
-            frame_path = next(_frames)
-            healed = load_image(_after / frame_path.name)
-            return implied_mask(img, healed)
-
-        detectors[name] = comp_det
+        detectors[name] = competitor_detector(args.frames, after_dir)
 
     results = run_benchmark(args.frames, args.labels, detectors)
     out = Path(args.out_dir)

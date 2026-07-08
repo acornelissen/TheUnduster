@@ -49,3 +49,38 @@ def test_report_files(tmp_path):
     assert "classical" in (tmp_path / "report.md").read_text()
     data = json.loads((tmp_path / "report.json").read_text())
     assert "classical" in data and "precision" in data["classical"]
+
+
+def test_report_renders_none_cells(tmp_path):
+    root = _make_roll(tmp_path)
+    from unduster_training.detectors import classical_detect
+
+    results = run_benchmark(root / "frames", root / "labels", {"classical": classical_detect})
+    write_report(results, tmp_path / "report.md", tmp_path / "report.json")
+    md = (tmp_path / "report.md").read_text()
+    row = next(line for line in md.splitlines() if line.startswith("| classical"))
+    assert "None" in row  # recall_hair: fixture has no hair labels
+    assert row.count("|") == 9  # header has 8 columns + edges: table stays well-formed
+    data = json.loads((tmp_path / "report.json").read_text())
+    assert data["classical"]["recall_hair"] is None
+
+
+def test_competitor_detector_scores_partial_heal(tmp_path):
+    root = _make_roll(tmp_path)
+    after = root / "competitor"
+    after.mkdir()
+    import imageio.v3 as iio
+    from unduster_training.benchmark import competitor_detector
+    from unduster_training.io import load_image, save_image
+
+    for f in sorted((root / "frames").iterdir()):
+        img = load_image(f)
+        label = iio.imread(root / "labels" / f"{f.stem}.png")
+        healed = img.copy()
+        healed[label == 1] = 0.7  # competitor heals dust only, misses scratches
+        save_image(after / f.name, healed)
+
+    det = competitor_detector(root / "frames", after)
+    results = run_benchmark(root / "frames", root / "labels", {"comp": det})
+    assert results["comp"]["recall_dust"] == 1.0
+    assert results["comp"]["recall_scratch"] == 0.0
