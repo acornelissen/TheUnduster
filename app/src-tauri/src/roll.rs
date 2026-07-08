@@ -1,10 +1,8 @@
-//! Roll state and sidecar persistence: pure data layer, no Tauri commands
-//! yet. `Roll::open`/`Roll::save` are exercised only by the tests below
-//! until a later task wires this module into command handlers, so the
-//! module is allowed to be dead code outside of `cfg(test)` builds.
-#![cfg_attr(not(test), allow(dead_code))]
+//! Roll state and sidecar persistence, plus the `RollState` wrapper that
+//! Tauri commands in `lib.rs` drive.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +68,8 @@ fn sidecar_path(dir: &Path) -> PathBuf {
     sidecar_dir(dir).join(SIDECAR_FILE)
 }
 
+/// Not yet consumed: reserved for a future thumbnail-generation task.
+#[allow(dead_code)]
 pub fn thumbs_dir(dir: &Path) -> PathBuf {
     sidecar_dir(dir).join("thumbs")
 }
@@ -96,11 +96,13 @@ fn list_image_files(dir: &Path) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-fn load_sidecar(dir: &Path) -> Result<Vec<Frame>, String> {
-    let path = sidecar_path(dir);
-    let bytes = match std::fs::read(&path) {
+/// Reads and parses the sidecar envelope at `path`, if present. `Ok(None)`
+/// means the file does not exist; any other read/parse/version failure is an
+/// error.
+fn read_envelope(path: &Path) -> Result<Option<SidecarEnvelope>, String> {
+    let bytes = match std::fs::read(path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
     let envelope: SidecarEnvelope =
@@ -112,7 +114,30 @@ fn load_sidecar(dir: &Path) -> Result<Vec<Frame>, String> {
             envelope.version
         ));
     }
-    Ok(envelope.frames)
+    Ok(Some(envelope))
+}
+
+/// Loads the sidecar, recovering from `roll.json.bak` if `roll.json` itself
+/// is missing. `save()` writes in three steps -- rename current file to
+/// `.bak`, write `.tmp`, rename `.tmp` into place -- so a crash in that
+/// window can leave only the `.bak` behind. Without this fallback that
+/// crash silently drops all remembered frame state on next open.
+fn load_sidecar(dir: &Path) -> Result<Vec<Frame>, String> {
+    let path = sidecar_path(dir);
+    if let Some(envelope) = read_envelope(&path)? {
+        return Ok(envelope.frames);
+    }
+    let bak = path.with_extension("json.bak");
+    if let Some(envelope) = read_envelope(&bak)? {
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "{}: missing, recovered frame state from {}",
+            path.display(),
+            bak.display()
+        );
+        return Ok(envelope.frames);
+    }
+    Ok(Vec::new())
 }
 
 /// Reconciles the sidecar's remembered frames with what is actually on disk:
@@ -166,6 +191,218 @@ impl Roll {
         }
         std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
         Ok(())
+    }
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct FrameInfo {
+    pub index: usize,
+    pub file_name: String,
+    pub threshold: f32,
+    pub approved: bool,
+    pub defect_count: Option<usize>,
+    pub bboxes: Option<Vec<[u32; 4]>>,
+}
+
+impl Frame {
+    fn info(&self, index: usize) -> FrameInfo {
+        FrameInfo {
+            index,
+            file_name: self.file_name.clone(),
+            threshold: self.threshold,
+            approved: self.approved,
+            defect_count: self.defect_count,
+            bboxes: self.bboxes.clone(),
+        }
+    }
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct RollInfo {
+    pub dir: String,
+    pub frames: Vec<FrameInfo>,
+}
+
+impl Roll {
+    pub fn info(&self) -> RollInfo {
+        RollInfo {
+            dir: self.dir.display().to_string(),
+            frames: self
+                .frames
+                .iter()
+                .enumerate()
+                .map(|(i, f)| f.info(i))
+                .collect(),
+        }
+    }
+}
+
+/// Shared roll handle managed by Tauri; commands lock it for the duration of
+/// a single frame mutation only (never across a decode).
+#[derive(Default)]
+pub struct RollState(pub Mutex<Option<Roll>>);
+
+impl RollState {
+    pub fn open(&self, dir: &Path) -> Result<RollInfo, String> {
+        let roll = Roll::open(dir)?;
+        let info = roll.info();
+        *self.0.lock().map_err(|e| e.to_string())? = Some(roll);
+        Ok(info)
+    }
+
+    /// Frame indices whose `image_id` should stay activated around `keep`:
+    /// keep-1, keep, keep+1 (clamped to the frame count, so edge frames
+    /// don't need special-casing by callers).
+    fn keep_window(len: usize, keep: usize) -> std::ops::Range<usize> {
+        let start = keep.saturating_sub(1);
+        let end = (keep + 2).min(len);
+        start..end
+    }
+
+    /// Ids to evict (frame index, image_id) so the caller can close them via
+    /// `Images::close` outside this lock -- eviction never touches the
+    /// `Images` registry itself; `RollState` only owns frame bookkeeping.
+    pub fn ids_to_evict(&self, keep: usize) -> Result<Vec<(usize, u64)>, String> {
+        let guard = self.0.lock().map_err(|e| e.to_string())?;
+        let roll = guard.as_ref().ok_or("no roll open")?;
+        let window = Self::keep_window(roll.frames.len(), keep);
+        Ok(roll
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(i, f)| !window.contains(i) && f.image_id.is_some())
+            .map(|(i, f)| (i, f.image_id.unwrap()))
+            .collect())
+    }
+
+    pub fn clear_image_id(&self, index: usize) -> Result<(), String> {
+        let mut guard = self.0.lock().map_err(|e| e.to_string())?;
+        let roll = guard.as_mut().ok_or("no roll open")?;
+        let frame = roll
+            .frames
+            .get_mut(index)
+            .ok_or_else(|| format!("no frame {index}"))?;
+        frame.image_id = None;
+        Ok(())
+    }
+
+    pub fn image_id(&self, index: usize) -> Result<Option<u64>, String> {
+        let guard = self.0.lock().map_err(|e| e.to_string())?;
+        let roll = guard.as_ref().ok_or("no roll open")?;
+        Ok(roll
+            .frames
+            .get(index)
+            .ok_or_else(|| format!("no frame {index}"))?
+            .image_id)
+    }
+
+    pub fn set_image_id(&self, index: usize, id: u64) -> Result<(), String> {
+        let mut guard = self.0.lock().map_err(|e| e.to_string())?;
+        let roll = guard.as_mut().ok_or("no roll open")?;
+        let frame = roll
+            .frames
+            .get_mut(index)
+            .ok_or_else(|| format!("no frame {index}"))?;
+        frame.image_id = Some(id);
+        Ok(())
+    }
+
+    pub fn frame_path(&self, index: usize) -> Result<PathBuf, String> {
+        let guard = self.0.lock().map_err(|e| e.to_string())?;
+        let roll = guard.as_ref().ok_or("no roll open")?;
+        let frame = roll
+            .frames
+            .get(index)
+            .ok_or_else(|| format!("no frame {index}"))?;
+        Ok(roll.dir.join(&frame.file_name))
+    }
+
+    pub fn set_threshold(&self, index: usize, threshold: f32) -> Result<(), String> {
+        let mut guard = self.0.lock().map_err(|e| e.to_string())?;
+        let roll = guard.as_mut().ok_or("no roll open")?;
+        let frame = roll
+            .frames
+            .get_mut(index)
+            .ok_or_else(|| format!("no frame {index}"))?;
+        frame.threshold = threshold;
+        roll.save()
+    }
+
+    pub fn set_approved(&self, index: usize, approved: bool) -> Result<(), String> {
+        let mut guard = self.0.lock().map_err(|e| e.to_string())?;
+        let roll = guard.as_mut().ok_or("no roll open")?;
+        let frame = roll
+            .frames
+            .get_mut(index)
+            .ok_or_else(|| format!("no frame {index}"))?;
+        frame.approved = approved;
+        roll.save()
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    fn touch(dir: &Path, name: &str) {
+        std::fs::write(dir.join(name), b"marker").unwrap();
+    }
+
+    fn opened_state(dir: &Path, n: usize) -> RollState {
+        for i in 0..n {
+            touch(dir, &format!("f{i:02}.tif"));
+        }
+        let state = RollState::default();
+        state.open(dir).unwrap();
+        state
+    }
+
+    #[test]
+    fn keep_window_clamps_at_both_edges() {
+        assert_eq!(RollState::keep_window(5, 0), 0..2);
+        assert_eq!(RollState::keep_window(5, 2), 1..4);
+        assert_eq!(RollState::keep_window(5, 4), 3..5);
+    }
+
+    #[test]
+    fn ids_to_evict_only_returns_activated_frames_outside_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = opened_state(dir.path(), 5);
+        state.set_image_id(0, 10).unwrap();
+        state.set_image_id(1, 11).unwrap();
+        state.set_image_id(2, 12).unwrap();
+        state.set_image_id(4, 14).unwrap();
+        // window around 2 is {1,2,3}: frame 0 and frame 4 are activated but
+        // outside it, frame 3 is inside the window but was never activated.
+        let mut evict = state.ids_to_evict(2).unwrap();
+        evict.sort();
+        assert_eq!(evict, vec![(0, 10), (4, 14)]);
+    }
+
+    #[test]
+    fn set_threshold_and_approved_persist_via_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = opened_state(dir.path(), 2);
+        state.set_threshold(0, 0.33).unwrap();
+        state.set_approved(1, true).unwrap();
+        let reopened = Roll::open(dir.path()).unwrap();
+        assert_eq!(reopened.frames[0].threshold, 0.33);
+        assert!(reopened.frames[1].approved);
+    }
+
+    #[test]
+    fn frame_path_joins_roll_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = opened_state(dir.path(), 1);
+        assert_eq!(state.frame_path(0).unwrap(), dir.path().join("f00.tif"));
+        assert!(state.frame_path(5).is_err());
+    }
+
+    #[test]
+    fn operations_before_open_error_clearly() {
+        let state = RollState::default();
+        assert!(state.set_threshold(0, 0.5).unwrap_err().contains("no roll"));
+        assert!(state.ids_to_evict(0).unwrap_err().contains("no roll"));
     }
 }
 
@@ -242,6 +479,52 @@ mod tests {
         assert!(bak.exists());
         let reopened = Roll::open(dir.path()).unwrap();
         assert!(reopened.frames[0].approved);
+    }
+
+    #[test]
+    fn open_after_crash_between_save_renames_recovers_from_bak() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "a.tif");
+        let mut roll = Roll::open(dir.path()).unwrap();
+        roll.frames[0].approved = true;
+        roll.frames[0].threshold = 0.9;
+        roll.save().unwrap(); // first save: writes roll.json, no .bak yet
+        roll.frames[0].defect_count = Some(7);
+        roll.save().unwrap(); // second save: roll.json -> roll.json.bak, then .tmp -> roll.json
+
+        // Simulate a crash in the window after roll.json was renamed to
+        // .bak but before .tmp was renamed into place: delete roll.json,
+        // leaving only roll.json.bak.
+        std::fs::remove_file(sidecar_path(dir.path())).unwrap();
+        assert!(sidecar_dir(dir.path()).join("roll.json.bak").exists());
+
+        let reopened = Roll::open(dir.path()).unwrap();
+        assert!(reopened.frames[0].approved);
+        assert_eq!(reopened.frames[0].threshold, 0.9);
+    }
+
+    #[test]
+    fn open_merges_new_file_between_two_surviving_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "a.tif");
+        touch(dir.path(), "c.tif");
+        let mut roll = Roll::open(dir.path()).unwrap();
+        roll.frames[0].approved = true; // a.tif
+        roll.frames[1].threshold = 0.8; // c.tif
+        roll.save().unwrap();
+
+        touch(dir.path(), "b.tif");
+        let reopened = Roll::open(dir.path()).unwrap();
+        let names: Vec<&str> = reopened
+            .frames
+            .iter()
+            .map(|f| f.file_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["a.tif", "b.tif", "c.tif"]);
+        assert!(reopened.frames[0].approved); // a.tif's state survived
+        assert!(!reopened.frames[1].approved); // b.tif is fresh
+        assert_eq!(reopened.frames[1].threshold, 0.5);
+        assert_eq!(reopened.frames[2].threshold, 0.8); // c.tif's state survived
     }
 
     #[test]

@@ -154,18 +154,126 @@ fn components(
         .ok_or_else(|| format!("no detection for image {id}"))
 }
 
+#[tauri::command]
+fn open_roll(state: State<'_, roll::RollState>, dir: String) -> Result<roll::RollInfo, String> {
+    state.open(std::path::Path::new(&dir))
+}
+
+#[tauri::command]
+async fn activate_frame(
+    app: tauri::AppHandle,
+    images: State<'_, Mutex<Images>>,
+    roll: State<'_, roll::RollState>,
+    index: usize,
+) -> Result<ImageInfo, String> {
+    // Reuse path: already activated and the registry still has it.
+    if let Some(id) = roll.image_id(index)? {
+        let known = {
+            let images = images.lock().map_err(|e| e.to_string())?;
+            images.image(id)
+        };
+        if let Some(image) = known {
+            let levels = {
+                let images = images.lock().map_err(|e| e.to_string())?;
+                images
+                    .level_dims(id)
+                    .ok_or_else(|| format!("no image {id}"))?
+            };
+            return Ok(ImageInfo {
+                id,
+                width: image.width,
+                height: image.height,
+                levels: levels
+                    .into_iter()
+                    .map(|(width, height)| images::LevelInfo { width, height })
+                    .collect(),
+            });
+        }
+    }
+
+    let path = roll.frame_path(index)?;
+    let _ = app.emit(
+        "app-progress",
+        Progress {
+            id: 0,
+            stage: "decoding",
+        },
+    );
+    let image = tauri::async_runtime::spawn_blocking(move || Images::decode_stage(&path))
+        .await
+        .map_err(|e| e.to_string())??;
+    let _ = app.emit(
+        "app-progress",
+        Progress {
+            id: 0,
+            stage: "building-pyramid",
+        },
+    );
+    let pyramid = {
+        let image = image.clone();
+        tauri::async_runtime::spawn_blocking(move || Images::pyramid_stage(&image))
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    let prepared = Prepared { image, pyramid };
+    let info = {
+        let mut images = images.lock().map_err(|e| e.to_string())?;
+        images.insert(prepared)
+    };
+    roll.set_image_id(index, info.id)?;
+
+    for (evict_index, evict_id) in roll.ids_to_evict(index)? {
+        let mut images = images.lock().map_err(|e| e.to_string())?;
+        images.close(evict_id);
+        drop(images);
+        roll.clear_image_id(evict_index)?;
+    }
+
+    let _ = app.emit(
+        "app-progress",
+        Progress {
+            id: info.id,
+            stage: "ready",
+        },
+    );
+    Ok(info)
+}
+
+#[tauri::command]
+fn set_frame_threshold(
+    state: State<'_, roll::RollState>,
+    index: usize,
+    threshold: f32,
+) -> Result<(), String> {
+    state.set_threshold(index, threshold)
+}
+
+#[tauri::command]
+fn approve_frame(
+    state: State<'_, roll::RollState>,
+    index: usize,
+    approved: bool,
+) -> Result<(), String> {
+    state.set_approved(index, approved)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Mutex::new(Images::default()))
         .manage(detect::DetectorState::default())
+        .manage(roll::RollState::default())
         .invoke_handler(tauri::generate_handler![
             open_image,
             close_image,
             load_detector,
             detect,
-            components
+            components,
+            open_roll,
+            activate_frame,
+            set_frame_threshold,
+            approve_frame
         ])
         .register_uri_scheme_protocol("tiles", |ctx, request| {
             let images = ctx.app_handle().state::<Mutex<Images>>();
