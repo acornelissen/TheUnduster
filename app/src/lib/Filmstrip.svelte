@@ -11,10 +11,12 @@
   let {
     frames,
     currentIndex,
+    thumbVersions = {},
     onSelect,
   }: {
     frames: FrameInfo[];
     currentIndex: number;
+    thumbVersions?: Record<number, number>;
     onSelect: (index: number) => void;
   } = $props();
 
@@ -74,10 +76,11 @@
     >
       <div class="thumb-wrap">
         <img
-          src={`tiles://localhost/thumb/${frame.index}`}
+          src={`tiles://localhost/thumb/${frame.index}?v=${thumbVersions[frame.index] ?? 0}`}
           alt=""
           class="thumb"
           onerror={(e) => ((e.currentTarget as HTMLImageElement).style.visibility = "hidden")}
+          onload={(e) => ((e.currentTarget as HTMLImageElement).style.visibility = "visible")}
         />
         {#if frame.defect_count === null}
           <span class="spinner" aria-hidden="true"></span>

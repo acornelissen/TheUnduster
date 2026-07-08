@@ -96,6 +96,20 @@
     };
   });
 
+  // Bumped when the queue reports a freshly written thumbnail; the filmstrip
+  // uses it to cache-bust its img src (same URL otherwise, so the webview
+  // would keep showing the earlier 404).
+  let thumbVersions: Record<number, number> = $state({});
+
+  $effect(() => {
+    const un = listen<{ index: number }>("roll-thumb", (e) => {
+      thumbVersions[e.payload.index] = (thumbVersions[e.payload.index] ?? 0) + 1;
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
   async function openScan() {
     error = null;
     const path = await open({
@@ -355,7 +369,7 @@
     {/if}
   </section>
   {#if roll}
-    <Filmstrip frames={roll.frames} {currentIndex} onSelect={selectFrame} />
+    <Filmstrip frames={roll.frames} {currentIndex} {thumbVersions} onSelect={selectFrame} />
   {/if}
 </div>
 

@@ -315,6 +315,13 @@ struct RollFrameError {
     message: String,
 }
 
+/// Emitted as soon as a frame's thumbnail exists on disk, well before its
+/// (slow) detection finishes, so the filmstrip can show previews early.
+#[derive(serde::Serialize, Clone)]
+struct RollThumb {
+    index: usize,
+}
+
 /// Clears the roll-scan flag when dropped, including on unwind, so a panic
 /// anywhere in the `scan_roll` queue task (outer async body, not just the
 /// `spawn_blocking` closures) can never wedge scanning permanently.
@@ -391,47 +398,75 @@ fn scan_roll(
                 .and_then(|n| n.to_str())
                 .unwrap_or_default()
                 .to_string();
-            let detector = detector.clone();
-            let outcome = tauri::async_runtime::spawn_blocking(move || {
+            // Stage 1: decode + thumbnail only, so the filmstrip gets its
+            // preview within seconds; the (much slower) detection follows in
+            // stage 2. `prepared` crosses the await into stage 2 and drops at
+            // its end, so the "at most 1 queue frame in memory" bound holds.
+            let thumb_path = roll::thumb_path(&roll_dir, &file_name);
+            let staged = tauri::async_runtime::spawn_blocking(move || {
                 let prepared = images::Images::prepare(&path)?;
-                let probs = detector.detect(&prepared.image)?;
-                let counted = images::components_from_probs(
-                    &probs,
-                    prepared.image.width,
-                    prepared.image.height,
-                    SCAN_THRESHOLD,
-                );
                 let coarsest = prepared
                     .pyramid
                     .levels
                     .last()
                     .expect("pyramid always has at least one level");
-                Ok::<_, String>((
-                    counted,
-                    coarsest.rgba.clone(),
+                let thumb = roll::write_thumbnail(
+                    &coarsest.rgba,
                     coarsest.width,
                     coarsest.height,
+                    &thumb_path,
+                );
+                Ok::<_, String>((prepared, thumb))
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r);
+
+            let prepared = match staged {
+                Ok((prepared, thumb)) => {
+                    match thumb {
+                        Ok(()) => {
+                            let _ = app_for_task.emit("roll-thumb", RollThumb { index });
+                        }
+                        Err(e) => {
+                            let _ = app_for_task.emit(
+                                "roll-frame-error",
+                                RollFrameError {
+                                    index,
+                                    message: format!("thumbnail: {e}"),
+                                },
+                            );
+                        }
+                    }
+                    prepared
+                }
+                Err(message) => {
+                    let _ = roll_state.record_scan_result(generation, index, None, None);
+                    let _ =
+                        app_for_task.emit("roll-frame-error", RollFrameError { index, message });
+                    continue;
+                }
+            };
+
+            // Stage 2: detection on the already-decoded frame.
+            let detector = detector.clone();
+            let outcome = tauri::async_runtime::spawn_blocking(move || {
+                let probs = detector.detect(&prepared.image)?;
+                Ok::<_, String>(images::components_from_probs(
+                    &probs,
+                    prepared.image.width,
+                    prepared.image.height,
+                    SCAN_THRESHOLD,
                 ))
-                // `prepared` (and its full-res pixels) drops here, at the end
-                // of the blocking closure, before the task moves to the next
-                // frame -- this is the "at most 1 queue frame" memory bound.
+                // `prepared` (and its full-res pixels) drops here, before the
+                // task moves to the next frame.
             })
             .await
             .map_err(|e| e.to_string())
             .and_then(|r| r);
 
             match outcome {
-                Ok((bboxes, thumb_rgba, tw, th)) => {
-                    let thumb_path = roll::thumb_path(&roll_dir, &file_name);
-                    if let Err(e) = roll::write_thumbnail(&thumb_rgba, tw, th, &thumb_path) {
-                        let _ = app_for_task.emit(
-                            "roll-frame-error",
-                            RollFrameError {
-                                index,
-                                message: format!("thumbnail: {e}"),
-                            },
-                        );
-                    }
+                Ok(bboxes) => {
                     let count = bboxes.len();
                     let _ =
                         roll_state.record_scan_result(generation, index, Some(count), Some(bboxes));
