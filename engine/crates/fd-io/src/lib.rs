@@ -2,6 +2,7 @@
 
 mod buf;
 mod png_jpeg;
+mod tiff_io;
 
 pub use buf::{ImageBuf, PixelData};
 
@@ -27,6 +28,7 @@ fn ext_of(path: &Path) -> String {
 pub fn decode(path: &Path) -> Result<ImageBuf, IoError> {
     match ext_of(path).as_str() {
         "png" | "jpg" | "jpeg" => png_jpeg::decode(path),
+        "tif" | "tiff" => tiff_io::decode(path),
         other => Err(IoError::Unsupported(other.to_string())),
     }
 }
@@ -34,6 +36,7 @@ pub fn decode(path: &Path) -> Result<ImageBuf, IoError> {
 pub fn encode(path: &Path, img: &ImageBuf) -> Result<(), IoError> {
     match ext_of(path).as_str() {
         "png" | "jpg" | "jpeg" => png_jpeg::encode(path, img),
+        "tif" | "tiff" => tiff_io::encode(path, img),
         other => Err(IoError::Unsupported(other.to_string())),
     }
 }
