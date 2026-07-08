@@ -20,6 +20,8 @@ pub struct Frame {
     #[serde(default)]
     pub approved: bool,
     #[serde(default)]
+    pub exported: bool,
+    #[serde(default)]
     pub defect_count: Option<usize>,
     #[serde(default)]
     pub bboxes: Option<Vec<[u32; 4]>>,
@@ -40,6 +42,7 @@ impl Frame {
             file_name,
             threshold: default_threshold(),
             approved: false,
+            exported: false,
             defect_count: None,
             bboxes: None,
             image_id: None,
@@ -247,6 +250,7 @@ pub struct FrameInfo {
     pub file_name: String,
     pub threshold: f32,
     pub approved: bool,
+    pub exported: bool,
     pub defect_count: Option<usize>,
     pub bboxes: Option<Vec<[u32; 4]>>,
 }
@@ -258,6 +262,7 @@ impl Frame {
             file_name: self.file_name.clone(),
             threshold: self.threshold,
             approved: self.approved,
+            exported: self.exported,
             defect_count: self.defect_count,
             bboxes: self.bboxes.clone(),
         }
@@ -292,6 +297,10 @@ pub struct RollState {
     /// Guards against double-spawning the background scan task if `scan_roll`
     /// is invoked twice (e.g. a second "Open roll" or an eager retry).
     pub scanning: AtomicBool,
+    /// Guards against double-spawning the export queue task if
+    /// `export_approved` is invoked twice (e.g. a second click before the
+    /// first export finished).
+    pub exporting: AtomicBool,
     /// Incremented on every `open` and `close` (i.e. every roll swap/
     /// teardown). `scan_roll` captures this value when it spawns its
     /// background queue task and re-checks it before processing each frame
@@ -442,6 +451,25 @@ impl RollState {
         Ok(roll.dir.join(&frame.file_name))
     }
 
+    /// Path, file name, and stored threshold for a frame, read under a single
+    /// lock acquisition: the transient export pipeline needs all three
+    /// together (path to decode, file name to name the destination file,
+    /// threshold to build the mask), and reading them separately would risk
+    /// observing an inconsistent frame across two lock windows.
+    pub fn export_frame_meta(&self, index: usize) -> Result<(PathBuf, String, f32), String> {
+        let guard = self.roll.lock().map_err(|e| e.to_string())?;
+        let roll = guard.as_ref().ok_or("no roll open")?;
+        let frame = roll
+            .frames
+            .get(index)
+            .ok_or_else(|| format!("no frame {index}"))?;
+        Ok((
+            roll.dir.join(&frame.file_name),
+            frame.file_name.clone(),
+            frame.threshold,
+        ))
+    }
+
     pub fn set_threshold(&self, index: usize, threshold: f32) -> Result<(), String> {
         if !(0.0..=1.0).contains(&threshold) {
             return Err(format!(
@@ -482,6 +510,21 @@ impl RollState {
             .collect())
     }
 
+    /// Approved frame indices, in order. Exported frames are INCLUDED:
+    /// pressing "Export approved" again re-exports all approved work,
+    /// predictably overwriting whatever landed before.
+    pub fn frames_to_export(&self) -> Result<Vec<usize>, String> {
+        let guard = self.roll.lock().map_err(|e| e.to_string())?;
+        let roll = guard.as_ref().ok_or("no roll open")?;
+        Ok(roll
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.approved)
+            .map(|(i, _)| i)
+            .collect())
+    }
+
     /// Records a queue result, but only if the roll the scan started against
     /// is still the live one: a frame decoded against roll A must never land
     /// in roll B's sidecar when a swap happens mid-decode. The generation is
@@ -508,6 +551,24 @@ impl RollState {
         roll.save()
     }
 
+    /// Records that a frame was exported, but only if the roll the export
+    /// started against is still the live one: mirrors `record_scan_result`'s
+    /// generation re-check under the same lock that guards the write, so a
+    /// frame exported against roll A never marks roll B's sidecar done.
+    pub fn set_exported(&self, generation: u64, index: usize) -> Result<(), String> {
+        let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return Err("roll changed during export; result discarded".to_string());
+        }
+        let roll = guard.as_mut().ok_or("no roll open")?;
+        let frame = roll
+            .frames
+            .get_mut(index)
+            .ok_or_else(|| format!("no frame {index}"))?;
+        frame.exported = true;
+        roll.save()
+    }
+
     pub fn dir(&self) -> Result<PathBuf, String> {
         let guard = self.roll.lock().map_err(|e| e.to_string())?;
         Ok(guard.as_ref().ok_or("no roll open")?.dir.clone())
@@ -518,6 +579,13 @@ impl RollState {
     /// -- one line, called unconditionally (including on panic unwind).
     pub fn clear_scanning(&self) {
         self.scanning.store(false, Ordering::SeqCst);
+    }
+
+    /// Clears the in-progress export flag. Mirrors `clear_scanning`: a single,
+    /// testable reset authority for the `export_approved` task's drop guard,
+    /// called unconditionally (including on panic unwind).
+    pub fn clear_exporting(&self) {
+        self.exporting.store(false, Ordering::SeqCst);
     }
 
     /// Current roll generation. `scan_roll` snapshots this when its queue
@@ -706,6 +774,38 @@ mod state_tests {
         let state = opened_state(dir.path(), 1);
         assert_eq!(state.frame_path(0).unwrap(), dir.path().join("f00.tif"));
         assert!(state.frame_path(5).is_err());
+    }
+
+    #[test]
+    fn frames_to_export_lists_approved_in_order_including_exported() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in ["a.png", "b.png", "c.png"] {
+            std::fs::write(dir.path().join(n), b"x").unwrap();
+        }
+        let state = RollState::default();
+        state.open(dir.path()).unwrap();
+        state.set_approved(0, true).unwrap();
+        state.set_approved(2, true).unwrap();
+        state.set_exported(state.generation(), 0).unwrap();
+        assert_eq!(state.frames_to_export().unwrap(), vec![0, 2]);
+    }
+
+    #[test]
+    fn set_exported_rejects_a_stale_generation_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"x").unwrap();
+        let state = RollState::default();
+        state.open(dir.path()).unwrap();
+        let stale = state.generation();
+        state.set_exported(state.generation(), 0).unwrap();
+        state.open(dir.path()).unwrap(); // bumps generation, reloads sidecar
+        assert!(state
+            .set_exported(stale, 0)
+            .unwrap_err()
+            .contains("roll changed"));
+        // persisted across the reopen:
+        let info = state.open(dir.path()).unwrap().0;
+        assert!(info.frames[0].exported);
     }
 
     #[test]

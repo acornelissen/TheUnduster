@@ -20,6 +20,7 @@
     file_name: string;
     threshold: number;
     approved: boolean;
+    exported: boolean;
     defect_count: number | null;
     bboxes: [number, number, number, number][] | null;
   }
@@ -42,6 +43,7 @@
   let roll: RollInfo | null = $state(null);
   let currentIndex = $state(0);
   let scanDone = $state(false);
+  let exporting = $state(false);
   let thresholdSaveTimer: ReturnType<typeof setTimeout> | undefined;
   // Monotonically increasing activation sequence number. Rapid ,/. presses
   // can fire overlapping `activate_frame` invokes whose resolutions race;
@@ -92,6 +94,35 @@
   $effect(() => {
     const un = listen("roll-done", () => {
       scanDone = true;
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  $effect(() => {
+    const un = listen<{ index: number }>("export-progress", (e) => {
+      if (!roll) return;
+      roll.frames[e.payload.index].exported = true;
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  $effect(() => {
+    const un = listen<{ index: number; message: string }>("export-frame-error", (e) => {
+      if (!roll) return;
+      error = `Frame ${roll.frames[e.payload.index].file_name}: ${e.payload.message}`;
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  $effect(() => {
+    const un = listen("export-done", () => {
+      exporting = false;
     });
     return () => {
       un.then((f) => f());
@@ -184,6 +215,20 @@
       await invoke("scan_roll");
     } catch (e) {
       error = String(e);
+    }
+  }
+
+  async function exportApproved() {
+    if (!roll || exporting) return;
+    error = null;
+    const dir = await open({ directory: true });
+    if (typeof dir !== "string") return;
+    exporting = true;
+    try {
+      await invoke("export_approved", { destDir: dir });
+    } catch (e) {
+      error = String(e);
+      exporting = false;
     }
   }
 
@@ -356,6 +401,14 @@
   <header>
     <button onclick={openScan} disabled={loading !== null}>Open scan</button>
     <button onclick={openRoll} disabled={loading !== null}>Open roll</button>
+    {#if roll}
+      <button
+        onclick={exportApproved}
+        disabled={exporting || roll.frames.every((f) => !f.approved)}
+      >
+        {exporting ? "Exporting..." : "Export approved"}
+      </button>
+    {/if}
     {#if info}
       <button onclick={requestDetect} disabled={loading !== null || detecting}>
         {detecting ? "Detecting..." : "Detect"}
@@ -399,6 +452,11 @@
           {#if !scanDone}
             &mdash; scanning ({roll.frames.filter((f) => f.defect_count !== null).length}/{roll
               .frames.length})
+          {/if}
+          {#if exporting}
+            &mdash; exporting ({roll.frames.filter((f) => f.exported).length}/{roll.frames.filter(
+              (f) => f.approved,
+            ).length})
           {/if}
         {/if}
       </p>

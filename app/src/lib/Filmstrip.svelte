@@ -4,6 +4,7 @@
     file_name: string;
     threshold: number;
     approved: boolean;
+    exported: boolean;
     defect_count: number | null;
     bboxes: [number, number, number, number][] | null;
   }
@@ -90,6 +91,9 @@
         {#if frame.approved}
           <span class="check" aria-hidden="true">&#10003;</span>
         {/if}
+        {#if frame.exported}
+          <span class="exported" aria-hidden="true">out</span>
+        {/if}
       </div>
       <span class="name">{frame.file_name}</span>
     </div>
@@ -169,6 +173,19 @@
     left: 2px;
     color: #7CFC00;
     font-size: 0.9rem;
+  }
+  .exported {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    background: rgba(0, 0, 0, 0.75);
+    color: #6ab0ff;
+    font-size: 0.6rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    padding: 0.05rem 0.25rem;
+    border-radius: 3px;
+    text-transform: uppercase;
   }
   .name {
     font-size: 0.65rem;

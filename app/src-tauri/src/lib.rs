@@ -677,6 +677,145 @@ fn scan_roll(
     Ok(())
 }
 
+#[derive(serde::Serialize, Clone)]
+struct ExportProgress {
+    index: usize,
+}
+
+#[derive(serde::Serialize, Clone)]
+struct ExportFrameError {
+    index: usize,
+    message: String,
+}
+
+/// Clears the roll-export flag when dropped, including on unwind, so a panic
+/// anywhere in the `export_approved` queue task can never wedge exporting
+/// permanently. Mirrors `ScanFlagGuard`.
+struct ExportFlagGuard(tauri::AppHandle);
+
+impl Drop for ExportFlagGuard {
+    fn drop(&mut self) {
+        self.0.state::<roll::RollState>().clear_exporting();
+    }
+}
+
+#[tauri::command]
+fn export_approved(
+    app: tauri::AppHandle,
+    roll: State<'_, roll::RollState>,
+    detector: State<'_, detect::DetectorState>,
+    inpainter: State<'_, detect::InpainterState>,
+    dest_dir: String,
+) -> Result<(), String> {
+    if roll
+        .exporting
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(()); // already running; idempotent from the caller's view
+    }
+    // The flag is set; if the lookup fails (no roll open) it must be cleared
+    // here, since the task carrying the drop guard never spawns.
+    let indices = match roll.frames_to_export() {
+        Ok(v) => v,
+        Err(e) => {
+            roll.clear_exporting();
+            return Err(e);
+        }
+    };
+    let dest_dir = std::path::PathBuf::from(dest_dir);
+    let detector = detector.inner().clone();
+    let inpainter = inpainter.inner().clone();
+    let app_for_task = app.clone();
+    // Snapshot the generation this export is running against; see
+    // `scan_roll`'s identical comment for why this matters.
+    let generation = roll.generation();
+    tauri::async_runtime::spawn(async move {
+        let _export_flag_guard = ExportFlagGuard(app_for_task.clone());
+        for index in indices {
+            let roll_state = app_for_task.state::<roll::RollState>();
+            // Enforcement point: see scan_roll's identical check.
+            if roll_state.generation() != generation {
+                break;
+            }
+            let (path, file_name, frame_threshold) = match roll_state.export_frame_meta(index) {
+                Ok(meta) => meta,
+                Err(e) => {
+                    let _ = app_for_task
+                        .emit("export-frame-error", ExportFrameError { index, message: e });
+                    continue;
+                }
+            };
+
+            // Prefer already-healed registry data (the operator reviewed it).
+            let registry_export = {
+                let roll_state = app_for_task.state::<roll::RollState>();
+                let images_state = app_for_task.state::<Mutex<Images>>();
+                match roll_state.image_id(index) {
+                    Ok(Some(id)) => {
+                        let images = match images_state.lock() {
+                            Ok(g) => g,
+                            Err(_) => continue,
+                        };
+                        images.healed_parts(id)
+                    }
+                    _ => None,
+                }
+            };
+            let dest = dest_dir.join(&file_name);
+            let outcome = if let Some((original, healed, mask)) = registry_export {
+                tauri::async_runtime::spawn_blocking(move || {
+                    export::export_healed(&original, &healed, &mask, &dest).map(|_| ())
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r)
+            } else {
+                // Transient pipeline: decode, detect, heal, export -- one
+                // frame's pixels at a time, dropped at the closure's end.
+                let detector = detector.clone();
+                let inpainter = inpainter.clone();
+                let threshold = frame_threshold;
+                tauri::async_runtime::spawn_blocking(move || {
+                    let prepared = images::Images::prepare(&path)?;
+                    let probs = detector.detect(&prepared.image)?;
+                    let mask = {
+                        let raw: Vec<bool> = probs.iter().map(|&p| p > threshold).collect();
+                        fd_heal::dilate(
+                            &raw,
+                            prepared.image.width,
+                            prepared.image.height,
+                            HEAL_DILATE_RADIUS,
+                        )
+                    };
+                    let mut copy = (*prepared.image).clone();
+                    inpainter
+                        .with_inpainter(|inp| fd_heal::heal(&mut copy, &mask, inp))?
+                        .map_err(|e| e.to_string())?;
+                    export::export_healed(&prepared.image, &copy, &mask, &dest).map(|_| ())
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r)
+            };
+            match outcome {
+                Ok(()) => {
+                    let _ = app_for_task
+                        .state::<roll::RollState>()
+                        .set_exported(generation, index);
+                    let _ = app_for_task.emit("export-progress", ExportProgress { index });
+                }
+                Err(message) => {
+                    let _ = app_for_task
+                        .emit("export-frame-error", ExportFrameError { index, message });
+                }
+            }
+        }
+        let _ = app_for_task.emit("export-done", ());
+    });
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -700,7 +839,8 @@ pub fn run() {
             set_frame_threshold,
             approve_frame,
             export_frame,
-            scan_roll
+            scan_roll,
+            export_approved
         ])
         .register_uri_scheme_protocol("tiles", |ctx, request| {
             let images = ctx.app_handle().state::<Mutex<Images>>();
