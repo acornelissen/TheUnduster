@@ -12,6 +12,7 @@ dependencies = [
     "torch>=2.3",
     "onnx>=1.16",
     "onnxruntime>=1.18",
+    "onnxscript>=0.1",
 ]
 
 [dependency-groups]
