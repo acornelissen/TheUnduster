@@ -14,3 +14,22 @@ version = "0.1.0"
 
 [workspace.dependencies]
 thiserror = "2"
+
+# tauri dev runs the dev profile; unoptimized pixel loops make a 96MP
+# detection take minutes instead of seconds. Optimize dependencies and the
+# engine crates even in dev; only the app shell stays unoptimized for fast
+# rebuild cycles.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.fd-io]
+opt-level = 3
+
+[profile.dev.package.fd-tiles]
+opt-level = 3
+
+[profile.dev.package.fd-infer]
+opt-level = 3
+
+[profile.dev.package.fd-heal]
+opt-level = 3
