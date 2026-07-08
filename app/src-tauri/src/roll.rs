@@ -298,6 +298,9 @@ pub struct RollState {
     /// via `generation()` -- see that function's doc comment for where the
     /// enforcement actually happens.
     pub generation: AtomicU64,
+    /// Frame view recency (most recent last), driving byte-budget eviction:
+    /// least-recently-viewed frames release their pixels first.
+    lru: Mutex<Vec<usize>>,
 }
 
 impl RollState {
@@ -322,6 +325,9 @@ impl RollState {
             .unwrap_or_default();
         *guard = Some(roll);
         drop(guard);
+        if let Ok(mut lru) = self.lru.lock() {
+            lru.clear();
+        }
         self.generation.fetch_add(1, Ordering::SeqCst);
         Ok((info, stale_ids))
     }
@@ -342,6 +348,9 @@ impl RollState {
             })
             .unwrap_or_default();
         drop(guard);
+        if let Ok(mut lru) = self.lru.lock() {
+            lru.clear();
+        }
         self.generation.fetch_add(1, Ordering::SeqCst);
         Ok(stale_ids)
     }
@@ -355,20 +364,34 @@ impl RollState {
         start..end
     }
 
-    /// Ids to evict (frame index, image_id) so the caller can close them via
-    /// `Images::close` outside this lock -- eviction never touches the
-    /// `Images` registry itself; `RollState` only owns frame bookkeeping.
-    pub fn ids_to_evict(&self, keep: usize) -> Result<Vec<(usize, u64)>, String> {
+    /// Activated frames (index, image_id) ordered least-recently-viewed
+    /// first, excluding the keep window around `keep`. The caller pairs this
+    /// with per-image sizes from `Images` and a byte budget to decide what
+    /// actually gets closed -- eviction never touches the registry from
+    /// here; `RollState` only owns frame bookkeeping.
+    pub fn eviction_candidates(&self, keep: usize) -> Result<Vec<(usize, u64)>, String> {
         let guard = self.roll.lock().map_err(|e| e.to_string())?;
         let roll = guard.as_ref().ok_or("no roll open")?;
         let window = Self::keep_window(roll.frames.len(), keep);
-        Ok(roll
+        let lru = self.lru.lock().map_err(|e| e.to_string())?;
+        let recency = |i: &usize| lru.iter().position(|x| x == i).unwrap_or(0);
+        let mut out: Vec<(usize, u64)> = roll
             .frames
             .iter()
             .enumerate()
             .filter(|(i, f)| !window.contains(i) && f.image_id.is_some())
             .map(|(i, f)| (i, f.image_id.unwrap()))
-            .collect())
+            .collect();
+        out.sort_by_key(|(i, _)| recency(i));
+        Ok(out)
+    }
+
+    /// Records that `index` was just viewed (most recent last).
+    pub fn touch(&self, index: usize) -> Result<(), String> {
+        let mut lru = self.lru.lock().map_err(|e| e.to_string())?;
+        lru.retain(|&i| i != index);
+        lru.push(index);
+        Ok(())
     }
 
     pub fn clear_image_id(&self, index: usize) -> Result<(), String> {
@@ -598,6 +621,40 @@ mod state_tests {
     }
 
     #[test]
+    fn eviction_candidates_order_least_recently_viewed_first() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in ["a.png", "b.png", "c.png", "d.png", "e.png"] {
+            std::fs::write(dir.path().join(n), b"x").unwrap();
+        }
+        let state = RollState::default();
+        state.open(dir.path()).unwrap();
+        for (i, id) in [(0, 10), (1, 11), (3, 13), (4, 14)] {
+            state.set_image_id(i, id).unwrap();
+        }
+        // view order: 0, 4, 3, 1 -> among candidates outside window(1)={0,1,2},
+        // frame 4 was viewed before 3, but 0 is oldest... 0 is inside window.
+        for i in [0, 4, 3, 1] {
+            state.touch(i).unwrap();
+        }
+        let candidates = state.eviction_candidates(1).unwrap();
+        // outside window {0,1,2}: frames 4 and 3; 4 viewed before 3
+        assert_eq!(candidates, vec![(4, 14), (3, 13)]);
+    }
+
+    #[test]
+    fn lru_clears_on_roll_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"x").unwrap();
+        let state = RollState::default();
+        state.open(dir.path()).unwrap();
+        state.touch(0).unwrap();
+        state.open(dir.path()).unwrap(); // swap clears recency
+        state.set_image_id(0, 5).unwrap();
+        // frame 0 activated but inside every window; no candidates, no panic
+        assert!(state.eviction_candidates(0).unwrap().is_empty());
+    }
+
+    #[test]
     fn ids_to_evict_only_returns_activated_frames_outside_the_window() {
         let dir = tempfile::tempdir().unwrap();
         let state = opened_state(dir.path(), 5);
@@ -607,7 +664,7 @@ mod state_tests {
         state.set_image_id(4, 14).unwrap();
         // window around 2 is {1,2,3}: frame 0 and frame 4 are activated but
         // outside it, frame 3 is inside the window but was never activated.
-        let mut evict = state.ids_to_evict(2).unwrap();
+        let mut evict = state.eviction_candidates(2).unwrap();
         evict.sort();
         assert_eq!(evict, vec![(0, 10), (4, 14)]);
     }
@@ -655,7 +712,10 @@ mod state_tests {
     fn operations_before_open_error_clearly() {
         let state = RollState::default();
         assert!(state.set_threshold(0, 0.5).unwrap_err().contains("no roll"));
-        assert!(state.ids_to_evict(0).unwrap_err().contains("no roll"));
+        assert!(state
+            .eviction_candidates(0)
+            .unwrap_err()
+            .contains("no roll"));
     }
 
     #[test]

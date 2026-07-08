@@ -232,6 +232,29 @@ impl Images {
         )
     }
 
+    /// Approximate resident pixel bytes for an activated image: native
+    /// pixels + display pyramid RGBA + (after detect) f32 probs and their u8
+    /// pyramid. Drives byte-budget eviction in `activate_frame`.
+    pub fn retained_bytes(&self, id: u64) -> Option<usize> {
+        let entry = self.entries.get(&id)?;
+        let px = (entry.image.width as usize) * (entry.image.height as usize);
+        let depth = match entry.image.data {
+            fd_io::PixelData::U8(_) => 1,
+            fd_io::PixelData::U16(_) => 2,
+        };
+        let mut total = px * entry.image.channels as usize * depth;
+        for l in &entry.pyramid.levels {
+            total += (l.width as usize) * (l.height as usize) * 4;
+        }
+        if let Some((probs, pyr)) = &entry.probs {
+            total += probs.len() * 4;
+            for l in &pyr.levels {
+                total += l.data.len();
+            }
+        }
+        Some(total)
+    }
+
     pub fn tile(&mut self, id: u64, level: u8, tx: u32, ty: u32) -> Option<Arc<Tile>> {
         let key = TileKey {
             image_id: id,

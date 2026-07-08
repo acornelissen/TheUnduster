@@ -198,6 +198,66 @@ fn close_roll(
     Ok(())
 }
 
+/// Retained-pixel budget for activated roll frames. Frames stay decoded
+/// until this is exceeded, then the least-recently-viewed release first
+/// (never the current frame or its immediate neighbors). Big-memory
+/// machines keep whole small rolls warm; an 8GB machine degrades to
+/// re-decoding old frames rather than swapping or crashing. Override with
+/// UNDUSTER_PIXEL_BUDGET_GB for unusual setups.
+fn pixel_budget_bytes() -> usize {
+    const DEFAULT_GB: usize = 6;
+    std::env::var("UNDUSTER_PIXEL_BUDGET_GB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&gb| gb > 0)
+        .unwrap_or(DEFAULT_GB)
+        * 1024
+        * 1024
+        * 1024
+}
+
+/// Closes least-recently-viewed activated frames until retained pixel bytes
+/// fit the budget. The keep window around `current` is never evicted, so
+/// the window's worst case (three very large frames) may exceed the budget;
+/// that degrades to OS paging, never to a crash.
+fn evict_over_budget(
+    images: &State<'_, Mutex<Images>>,
+    roll: &State<'_, roll::RollState>,
+    current: usize,
+) -> Result<(), String> {
+    let candidates = roll.eviction_candidates(current)?; // LRU first
+    let mut sized: Vec<(usize, u64, usize)> = Vec::new();
+    let mut total: usize = 0;
+    {
+        let images = images.lock().map_err(|e| e.to_string())?;
+        // Total includes protected frames: the budget bounds overall
+        // retained memory, not just the evictable share.
+        for id in images.known_ids() {
+            total += images.retained_bytes(id).unwrap_or(0);
+        }
+        for (idx, id) in candidates {
+            sized.push((idx, id, images.retained_bytes(id).unwrap_or(0)));
+        }
+    }
+    let budget = pixel_budget_bytes();
+    for (idx, id, bytes) in sized {
+        if total <= budget {
+            break;
+        }
+        let mut images = images.lock().map_err(|e| e.to_string())?;
+        images.close(id);
+        drop(images);
+        roll.clear_image_id(idx)?;
+        total = total.saturating_sub(bytes);
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[evict] frame {idx} (id {id}, {}MB) released",
+            bytes / (1024 * 1024)
+        );
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn activate_frame(
     app: tauri::AppHandle,
@@ -236,6 +296,7 @@ async fn activate_frame(
             let _ = app.emit("app-progress", Progress { id, stage: "ready" });
             #[cfg(debug_assertions)]
             eprintln!("[activate] frame {index} reused id {id}");
+            roll.touch(index)?; // recency drives byte-budget eviction
             return Ok(info);
         }
     }
@@ -278,12 +339,8 @@ async fn activate_frame(
         images.close(superseded);
     }
 
-    for (evict_index, evict_id) in roll.ids_to_evict(index)? {
-        let mut images = images.lock().map_err(|e| e.to_string())?;
-        images.close(evict_id);
-        drop(images);
-        roll.clear_image_id(evict_index)?;
-    }
+    roll.touch(index)?;
+    evict_over_budget(&images, &roll, index)?;
 
     let _ = app.emit(
         "app-progress",
