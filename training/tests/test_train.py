@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from unduster_training.model import UNet
@@ -31,3 +32,9 @@ def test_checkpoint_round_trip(tmp_path):
     x = torch.rand(1, 1, 32, 32)
     model.eval(), back.eval()
     assert torch.allclose(model(x), back(x), atol=1e-6)
+
+
+def test_empty_batches_raises_clear_error():
+    model = UNet(in_ch=1, base=8, depth=2)
+    with pytest.raises(ValueError, match="empty"):
+        train_steps(model, [], steps=1, lr=1e-3, device="cpu")
