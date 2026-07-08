@@ -755,7 +755,16 @@ fn export_approved(
                     Ok(Some(id)) => {
                         let images = match images_state.lock() {
                             Ok(g) => g,
-                            Err(_) => continue,
+                            Err(_) => {
+                                let _ = app_for_task.emit(
+                                    "export-frame-error",
+                                    ExportFrameError {
+                                        index,
+                                        message: "image registry lock poisoned".to_string(),
+                                    },
+                                );
+                                continue;
+                            }
                         };
                         images.healed_parts(id)
                     }
@@ -777,22 +786,17 @@ fn export_approved(
                 let inpainter = inpainter.clone();
                 let threshold = frame_threshold;
                 tauri::async_runtime::spawn_blocking(move || {
-                    let prepared = images::Images::prepare(&path)?;
-                    let probs = detector.detect(&prepared.image)?;
+                    let image = images::Images::decode_stage(&path)?;
+                    let probs = detector.detect(&image)?;
                     let mask = {
                         let raw: Vec<bool> = probs.iter().map(|&p| p > threshold).collect();
-                        fd_heal::dilate(
-                            &raw,
-                            prepared.image.width,
-                            prepared.image.height,
-                            HEAL_DILATE_RADIUS,
-                        )
+                        fd_heal::dilate(&raw, image.width, image.height, HEAL_DILATE_RADIUS)
                     };
-                    let mut copy = (*prepared.image).clone();
+                    let mut copy = (*image).clone();
                     inpainter
                         .with_inpainter(|inp| fd_heal::heal(&mut copy, &mask, inp))?
                         .map_err(|e| e.to_string())?;
-                    export::export_healed(&prepared.image, &copy, &mask, &dest).map(|_| ())
+                    export::export_healed(&image, &copy, &mask, &dest).map(|_| ())
                 })
                 .await
                 .map_err(|e| e.to_string())
