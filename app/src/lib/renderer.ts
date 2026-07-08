@@ -98,6 +98,13 @@ export class TextureStore<T> {
       this.onEvict(e.value);
     }
   }
+
+  /** Evict everything, running onEvict for each so GPU textures are freed. */
+  clear(): void {
+    for (const e of this.entries.values()) this.onEvict(e.value);
+    this.entries.clear();
+    this.used = 0;
+  }
 }
 
 function compile(gl: WebGL2RenderingContext, type: number, src: string): WebGLShader {
@@ -312,5 +319,21 @@ export class TileRenderer {
       gl.drawArrays(gl.TRIANGLES, 0, 6);
     }
     gl.disable(gl.BLEND);
+  }
+
+  /** Release every GL resource and force the context to be dropped. The
+   * Viewer is remounted per frame switch via `{#key info.id}`; without this,
+   * each remount leaks a WebGL context (WebKit caps live contexts at ~16),
+   * and once the cap is hit new contexts come back lost -- a blank canvas,
+   * then a webview crash on the next remount. */
+  dispose(): void {
+    const gl = this.gl;
+    this.textures.clear();
+    gl.deleteTexture(this.zeroTex);
+    gl.deleteBuffer(this.buf);
+    gl.deleteBuffer(this.ringBuf);
+    gl.deleteProgram(this.program);
+    gl.deleteProgram(this.ringProgram);
+    gl.getExtension("WEBGL_lose_context")?.loseContext();
   }
 }

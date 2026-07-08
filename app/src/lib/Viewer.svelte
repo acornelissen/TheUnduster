@@ -37,6 +37,8 @@
   let centerY = info.height / 2;
   let dragging = false;
   let needsFrame = true;
+  let running = true;
+  let rafId = 0;
 
   let detections: [number, number, number, number][] = $state([]);
   let current = -1;
@@ -113,6 +115,7 @@
   }
 
   function frame() {
+    if (!running) return; // stopped on unmount; do not re-arm the rAF loop
     if (renderer && needsFrame) {
       needsFrame = false;
       renderer.draw(tilePaths(), canvas.width, canvas.height, overlay);
@@ -126,7 +129,7 @@
         renderer.drawRings(rings, canvas.width, canvas.height);
       }
     }
-    requestAnimationFrame(frame);
+    rafId = requestAnimationFrame(frame);
   }
 
   function clampCenter() {
@@ -211,8 +214,18 @@
     renderer.onTileLoaded = requestFrame;
     zoom = fitZoom(info.levels[0], canvas.width, canvas.height);
     requestFrame();
-    requestAnimationFrame(frame);
-    return () => ro.disconnect();
+    rafId = requestAnimationFrame(frame);
+    return () => {
+      // {#key info.id} remounts this component on every frame switch. Without
+      // stopping the render loop and dropping the GL context here, each switch
+      // leaks a WebGL context and an orphaned rAF loop driving a detached
+      // canvas -- which exhausts WebKit's context cap and crashes the webview.
+      running = false;
+      cancelAnimationFrame(rafId);
+      ro.disconnect();
+      renderer?.dispose();
+      renderer = undefined;
+    };
   });
 </script>
 
