@@ -20,8 +20,11 @@ Rust workspace with the four core crates the desktop app is built on.
 
 ## Build and test
 
+The workspace root is the repo root, not engine/, so run tests from
+there scoped to the engine crates:
+
     mise install
-    cargo test
+    cargo test -p fd-io -p fd-tiles -p fd-infer -p fd-heal
 
 Tests use the CPU execution provider. The app selects CoreML at runtime
 via fd_infer::Ep::CoreML.
