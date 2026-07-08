@@ -198,6 +198,8 @@ async fn activate_frame(
     roll: State<'_, roll::RollState>,
     index: usize,
 ) -> Result<ImageInfo, String> {
+    #[cfg(debug_assertions)]
+    eprintln!("[activate] frame {index} requested");
     // Reuse path: already activated and the registry still has it.
     if let Some(id) = roll.image_id(index)? {
         let known = {
@@ -225,6 +227,8 @@ async fn activate_frame(
             // this emit, reactivating a cached frame wedges the loader
             // forever since no terminal event ever arrives.
             let _ = app.emit("app-progress", Progress { id, stage: "ready" });
+            #[cfg(debug_assertions)]
+            eprintln!("[activate] frame {index} reused id {id}");
             return Ok(info);
         }
     }
@@ -274,6 +278,8 @@ async fn activate_frame(
             stage: "ready",
         },
     );
+    #[cfg(debug_assertions)]
+    eprintln!("[activate] frame {index} decoded as id {}", info.id);
     Ok(info)
 }
 
@@ -403,6 +409,8 @@ fn scan_roll(
             // stage 2. `prepared` crosses the await into stage 2 and drops at
             // its end, so the "at most 1 queue frame in memory" bound holds.
             let thumb_path = roll::thumb_path(&roll_dir, &file_name);
+            #[cfg(debug_assertions)]
+            eprintln!("[queue] frame {index} decode starting");
             let staged = tauri::async_runtime::spawn_blocking(move || {
                 let prepared = images::Images::prepare(&path)?;
                 let coarsest = prepared
@@ -448,6 +456,8 @@ fn scan_roll(
                 }
             };
 
+            #[cfg(debug_assertions)]
+            eprintln!("[queue] frame {index} detect starting");
             // Stage 2: detection on the already-decoded frame.
             let detector = detector.clone();
             let outcome = tauri::async_runtime::spawn_blocking(move || {
