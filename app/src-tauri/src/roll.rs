@@ -453,13 +453,22 @@ impl RollState {
             .collect())
     }
 
+    /// Records a queue result, but only if the roll the scan started against
+    /// is still the live one: a frame decoded against roll A must never land
+    /// in roll B's sidecar when a swap happens mid-decode. The generation is
+    /// re-checked under the same lock that guards the write, closing the
+    /// window between the queue loop's top-of-iteration check and this write.
     pub fn record_scan_result(
         &self,
+        generation: u64,
         index: usize,
         count: Option<usize>,
         bboxes: Option<Vec<[u32; 4]>>,
     ) -> Result<(), String> {
         let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return Err("roll changed during scan; result discarded".to_string());
+        }
         let roll = guard.as_mut().ok_or("no roll open")?;
         let frame = roll
             .frames

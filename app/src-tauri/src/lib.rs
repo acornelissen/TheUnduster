@@ -377,7 +377,7 @@ fn scan_roll(
             let path = match roll_state.frame_path(index) {
                 Ok(p) => p,
                 Err(e) => {
-                    let _ = roll_state.record_scan_result(index, None, None);
+                    let _ = roll_state.record_scan_result(generation, index, None, None);
                     let _ =
                         app_for_task.emit("roll-frame-error", RollFrameError { index, message: e });
                     continue;
@@ -433,7 +433,8 @@ fn scan_roll(
                         );
                     }
                     let count = bboxes.len();
-                    let _ = roll_state.record_scan_result(index, Some(count), Some(bboxes));
+                    let _ =
+                        roll_state.record_scan_result(generation, index, Some(count), Some(bboxes));
                     let _ = app_for_task.emit(
                         "roll-progress",
                         RollProgress {
@@ -443,7 +444,7 @@ fn scan_roll(
                     );
                 }
                 Err(message) => {
-                    let _ = roll_state.record_scan_result(index, None, None);
+                    let _ = roll_state.record_scan_result(generation, index, None, None);
                     let _ =
                         app_for_task.emit("roll-frame-error", RollFrameError { index, message });
                 }
@@ -515,8 +516,29 @@ mod roll_queue_tests {
         std::fs::write(dir.path().join("b.png"), b"x").unwrap();
         let state = roll::RollState::default();
         state.open(dir.path()).unwrap();
-        state.record_scan_result(0, Some(2), Some(vec![])).unwrap();
+        state
+            .record_scan_result(state.generation(), 0, Some(2), Some(vec![]))
+            .unwrap();
         assert_eq!(state.frames_to_scan().unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn scan_result_from_a_replaced_roll_is_discarded() {
+        // A frame decoded against roll A must never land in roll B's sidecar
+        // when the operator swaps rolls mid-decode.
+        let dir_a = tempfile::tempdir().unwrap();
+        std::fs::write(dir_a.path().join("a.png"), b"x").unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        std::fs::write(dir_b.path().join("b.png"), b"x").unwrap();
+        let state = roll::RollState::default();
+        state.open(dir_a.path()).unwrap();
+        let stale_generation = state.generation();
+        state.open(dir_b.path()).unwrap();
+        let err = state
+            .record_scan_result(stale_generation, 0, Some(9), Some(vec![]))
+            .unwrap_err();
+        assert!(err.contains("roll changed"));
+        assert_eq!(state.frames_to_scan().unwrap(), vec![0]); // B untouched
     }
 
     #[test]
