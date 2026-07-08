@@ -11,6 +11,8 @@ def load_image(path: str | Path) -> np.ndarray:
     path = Path(path)
     if path.suffix.lower() == ".png":
         raw = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if raw is None:
+            raise ValueError(f"cannot read image: {path}")
         if raw.ndim == 3 and raw.shape[2] >= 3:
             raw = raw[..., :3][..., ::-1]
     else:

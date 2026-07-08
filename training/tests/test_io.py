@@ -40,6 +40,13 @@ def test_gray_round_trip(tmp_path):
     assert np.abs(back - img).max() <= 1 / 65535 + 1e-6
 
 
+def test_load_image_rejects_corrupt_png(tmp_path):
+    path = tmp_path / "x.png"
+    path.write_bytes(b"not a real png")
+    with pytest.raises(ValueError, match="x.png"):
+        load_image(path)
+
+
 def test_to_gray():
     img = np.zeros((4, 4, 3), np.float32)
     img[..., 1] = 1.0

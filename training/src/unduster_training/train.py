@@ -45,7 +45,7 @@ def train_steps(model, batches, steps: int, lr: float, device: str) -> list[floa
             it = iter(batches)
             try:
                 x, y = next(it)
-            except StopIteration as e:
+            except StopIteration:
                 raise ValueError("batches is empty") from None
         x, y = x.to(device), y.to(device)
         opt.zero_grad()

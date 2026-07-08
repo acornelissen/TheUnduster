@@ -1,6 +1,8 @@
 import json
 
+import imageio.v3 as iio
 import numpy as np
+import pytest
 
 from unduster_training.benchmark import run_benchmark, write_report
 from unduster_training.io import save_image
@@ -63,6 +65,29 @@ def test_report_renders_none_cells(tmp_path):
     assert row.count("|") == 9  # header has 8 columns + edges: table stays well-formed
     data = json.loads((tmp_path / "report.json").read_text())
     assert data["classical"]["recall_hair"] is None
+
+
+def test_benchmark_rejects_rgb_label(tmp_path):
+    root = _make_roll(tmp_path)
+    from unduster_training.detectors import classical_detect
+
+    rgb_label = np.zeros((200, 200, 3), np.uint8)
+    iio.imwrite(root / "labels" / "0000.png", rgb_label)
+
+    with pytest.raises(ValueError, match="0000"):
+        run_benchmark(root / "frames", root / "labels", {"classical": classical_detect})
+
+
+def test_benchmark_rejects_out_of_palette_label(tmp_path):
+    root = _make_roll(tmp_path)
+    from unduster_training.detectors import classical_detect
+
+    bad_label = np.zeros((200, 200), np.uint8)
+    bad_label[10, 10] = 200
+    iio.imwrite(root / "labels" / "0000.png", bad_label)
+
+    with pytest.raises(ValueError, match="0000"):
+        run_benchmark(root / "frames", root / "labels", {"classical": classical_detect})
 
 
 def test_competitor_detector_scores_partial_heal(tmp_path):

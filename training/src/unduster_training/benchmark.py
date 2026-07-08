@@ -43,12 +43,31 @@ def competitor_detector(frames_dir, after_dir):
     return detect
 
 
+def _load_label(labels_dir: Path, stem: str) -> np.ndarray:
+    label_path = labels_dir / f"{stem}.png"
+    gt = iio.imread(label_path).astype(np.uint8)
+    if gt.ndim != 2:
+        raise ValueError(
+            f"invalid label file {label_path}: labels must be single-channel "
+            f"(got array with ndim={gt.ndim}, shape={gt.shape})"
+        )
+    valid = {0, 1, 2, 3}
+    present = set(np.unique(gt).tolist())
+    bad = sorted(present - valid)
+    if bad:
+        raise ValueError(
+            f"invalid label file {label_path}: found values {bad} not in the "
+            f"label palette (0 background, 1 dust, 2 scratch, 3 hair)"
+        )
+    return gt
+
+
 def run_benchmark(frames_dir, labels_dir, detectors: dict) -> dict:
     frames_dir, labels_dir = Path(frames_dir), Path(labels_dir)
     per_detector: dict[str, list[dict]] = {name: [] for name in detectors}
     for frame_path in _frames(frames_dir):
         img = load_image(frame_path)
-        gt = iio.imread(labels_dir / f"{frame_path.stem}.png").astype(np.uint8)
+        gt = _load_label(labels_dir, frame_path.stem)
         for name, det in detectors.items():
             per_detector[name].append(score_masks(det(img), gt))
     results = {}
