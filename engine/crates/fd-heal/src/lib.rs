@@ -2,12 +2,14 @@
 
 mod classical;
 mod components;
+mod dilate;
 mod grain;
 mod heal;
 mod inpaint;
 
 pub use classical::classical_fill;
 pub use components::{components, Bbox, Defect};
+pub use dilate::dilate;
 pub use grain::add_grain;
 pub use heal::{heal, HealReport, TINY_MAX_DIM};
 pub use inpaint::Inpainter;
