@@ -985,7 +985,9 @@ git add app/src-tauri
 git commit -m "Export healed files atomically with the untouched-pixel check"
 ```
 
----### Task 7: Roll export queue and UI
+---
+
+### Task 7: Roll export queue and UI
 
 **Files:**
 - Modify: `app/src-tauri/src/roll.rs` (Frame.exported, exporting flag, set_exported, frames_to_export)
