@@ -3,6 +3,7 @@
 mod detect;
 mod images;
 mod protocol;
+mod roll;
 
 use std::sync::Mutex;
 
