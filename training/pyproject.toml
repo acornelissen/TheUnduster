@@ -27,3 +27,14 @@ packages = ["src/unduster_training"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# CI runs on linux and only needs CPU inference; the default PyPI torch
+# wheel drags the full CUDA stack (multi-GB) with it there. macOS wheels
+# are already CPU/MPS-only, so this pin is linux-scoped.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
