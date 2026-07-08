@@ -99,7 +99,20 @@ pub struct ImageInfo {
     pub width: u32,
     pub height: u32,
     pub levels: Vec<LevelInfo>,
+    pub healed: bool,
 }
+
+/// A frame's healed pixels: a deep copy of the original with defects filled,
+/// its own display pyramid, and the mask that was healed (needed again at
+/// export time for the outside-mask verification).
+pub struct HealedData {
+    pub(crate) image: Arc<fd_io::ImageBuf>,
+    pub(crate) pyramid: Pyramid,
+    pub(crate) mask: Arc<Vec<bool>>,
+}
+
+/// (original, healed, mask) returned by [`Images::healed_parts`].
+type HealedParts = (Arc<fd_io::ImageBuf>, Arc<fd_io::ImageBuf>, Arc<Vec<bool>>);
 
 struct Entry {
     image: Arc<fd_io::ImageBuf>,
@@ -107,6 +120,7 @@ struct Entry {
     /// Native-res f32 probabilities plus their max-pooled display pyramid.
     /// None until `detect` has run for this image.
     probs: Option<(Vec<f32>, ProbPyramid)>,
+    healed: Option<HealedData>,
 }
 
 /// Heavy half of open: decoded image plus its built pyramid, no registry access yet.
@@ -187,6 +201,7 @@ impl Images {
             width: prepared.image.width,
             height: prepared.image.height,
             levels,
+            healed: false,
         };
         self.entries.insert(
             id,
@@ -194,6 +209,7 @@ impl Images {
                 image: prepared.image,
                 pyramid: prepared.pyramid,
                 probs: None,
+                healed: None,
             },
         );
         info
@@ -252,18 +268,92 @@ impl Images {
                 total += l.data.len();
             }
         }
+        if let Some(healed) = &entry.healed {
+            let hpx = (healed.image.width as usize) * (healed.image.height as usize);
+            total += hpx * healed.image.channels as usize * depth;
+            for l in &healed.pyramid.levels {
+                total += (l.width as usize) * (l.height as usize) * 4;
+            }
+            total += healed.mask.len();
+        }
         Some(total)
     }
 
     pub fn tile(&mut self, id: u64, level: u8, tx: u32, ty: u32) -> Option<Arc<Tile>> {
         let key = TileKey {
             image_id: id,
+            layer: 0,
             level,
             tx,
             ty,
         };
         let entry = self.entries.get(&id)?;
         let pyramid = &entry.pyramid;
+        self.cache
+            .get_or_insert(key, || pyramid.tile(level, tx, ty))
+    }
+
+    /// Stores a healed copy. Returns false when the id is unknown, the
+    /// healed dims do not match the original, or the mask length is wrong --
+    /// mirrors set_probs_built's validate-at-the-boundary posture.
+    // Exercised by tests; the heal command that populates this wires up in a
+    // later task.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_healed(
+        &mut self,
+        id: u64,
+        image: Arc<fd_io::ImageBuf>,
+        pyramid: Pyramid,
+        mask: Arc<Vec<bool>>,
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return false;
+        };
+        if image.width != entry.image.width
+            || image.height != entry.image.height
+            || image.channels != entry.image.channels
+            || mask.len() != (image.width as usize) * (image.height as usize)
+        {
+            return false;
+        }
+        entry.healed = Some(HealedData {
+            image,
+            pyramid,
+            mask,
+        });
+        true
+    }
+
+    pub fn has_healed(&self, id: u64) -> bool {
+        self.entries.get(&id).is_some_and(|e| e.healed.is_some())
+    }
+
+    /// (original, healed, mask) for export verification and encoding.
+    // Exercised by tests; the export path that consumes this wires up in a
+    // later task.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn healed_parts(&self, id: u64) -> Option<HealedParts> {
+        let entry = self.entries.get(&id)?;
+        let healed = entry.healed.as_ref()?;
+        Some((
+            entry.image.clone(),
+            healed.image.clone(),
+            healed.mask.clone(),
+        ))
+    }
+
+    // Exercised by tests; the tile protocol wires this up in a later task.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn healed_tile(&mut self, id: u64, level: u8, tx: u32, ty: u32) -> Option<Arc<Tile>> {
+        let key = TileKey {
+            image_id: id,
+            layer: 1,
+            level,
+            tx,
+            ty,
+        };
+        let entry = self.entries.get(&id)?;
+        let pyramid = &entry.healed.as_ref()?.pyramid;
         self.cache
             .get_or_insert(key, || pyramid.tile(level, tx, ty))
     }
@@ -507,6 +597,64 @@ mod tests {
         assert_eq!(direct.len(), 1);
         assert_eq!(direct[0], [200, 100, 205, 104]);
         assert!(components_from_probs(&probs, 600, 400, 0.9).is_empty());
+    }
+
+    #[test]
+    fn healed_storage_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_png(&dir, 600, 400);
+        let mut images = Images::default();
+        let info = images.open(&path).unwrap();
+        assert!(!info.healed);
+        assert!(!images.has_healed(info.id));
+        assert!(images.healed_tile(info.id, 0, 0, 0).is_none());
+
+        let original = images.image(info.id).unwrap();
+        let mut healed_buf = (*original).clone();
+        // change one pixel so healed tiles are distinguishable
+        if let fd_io::PixelData::U8(v) = &mut healed_buf.data {
+            v[0] = 255;
+        }
+        let healed = std::sync::Arc::new(healed_buf);
+        let pyramid = fd_tiles::Pyramid::build(&healed);
+        let mask = std::sync::Arc::new(vec![false; 600 * 400]);
+        let base_bytes = images.retained_bytes(info.id).unwrap();
+        assert!(images.set_healed(info.id, healed.clone(), pyramid, mask.clone()));
+
+        assert!(images.has_healed(info.id));
+        let t = images.healed_tile(info.id, 0, 0, 0).unwrap();
+        assert_eq!(t.rgba[0], 255); // healed pixels, not original
+        let (orig, heal, m) = images.healed_parts(info.id).unwrap();
+        assert_eq!(orig.width, heal.width);
+        assert_eq!(m.len(), 600 * 400);
+
+        // healed image + pyramid must count against the eviction budget
+        assert!(images.retained_bytes(info.id).unwrap() > base_bytes + 600 * 400);
+
+        images.close(info.id);
+        assert!(images.healed_tile(info.id, 0, 0, 0).is_none());
+        assert!(!images.has_healed(info.id));
+    }
+
+    #[test]
+    fn set_healed_rejects_mismatched_dims_and_unknown_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_png(&dir, 600, 400);
+        let mut images = Images::default();
+        let info = images.open(&path).unwrap();
+        let wrong = std::sync::Arc::new(fd_io::ImageBuf {
+            width: 100,
+            height: 100,
+            channels: 1,
+            data: fd_io::PixelData::U8(vec![0; 100 * 100]),
+            icc: None,
+            exif: None,
+        });
+        let pyr = fd_tiles::Pyramid::build(&wrong);
+        let mask = std::sync::Arc::new(vec![false; 100 * 100]);
+        assert!(!images.set_healed(info.id, wrong.clone(), pyr, mask.clone()));
+        let pyr2 = fd_tiles::Pyramid::build(&wrong);
+        assert!(!images.set_healed(999, wrong, pyr2, mask));
     }
 
     #[test]

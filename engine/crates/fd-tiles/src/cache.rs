@@ -7,6 +7,9 @@ use crate::Tile;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TileKey {
     pub image_id: u64,
+    /// Which pixel source this tile came from: 0 = original rgba pyramid,
+    /// 1 = healed pyramid. Same image id, different pixels.
+    pub layer: u8,
     pub level: u8,
     pub tx: u32,
     pub ty: u32,

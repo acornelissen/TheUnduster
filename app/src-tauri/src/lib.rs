@@ -274,11 +274,12 @@ async fn activate_frame(
             images.image(id)
         };
         if let Some(image) = known {
-            let levels = {
+            let (levels, healed) = {
                 let images = images.lock().map_err(|e| e.to_string())?;
-                images
+                let levels = images
                     .level_dims(id)
-                    .ok_or_else(|| format!("no image {id}"))?
+                    .ok_or_else(|| format!("no image {id}"))?;
+                (levels, images.has_healed(id))
             };
             let info = ImageInfo {
                 id,
@@ -288,6 +289,7 @@ async fn activate_frame(
                     .into_iter()
                     .map(|(width, height)| images::LevelInfo { width, height })
                     .collect(),
+                healed,
             };
             // Reuse path never emits "decoding"/"building-pyramid", but the
             // frontend's loading state is only cleared on "ready" -- without

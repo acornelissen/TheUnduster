@@ -12,6 +12,7 @@ fn tile_of_bytes(n: u32) -> Tile {
 fn key(image: u64, tx: u32) -> TileKey {
     TileKey {
         image_id: image,
+        layer: 0,
         level: 0,
         tx,
         ty: 0,
