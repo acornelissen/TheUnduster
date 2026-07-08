@@ -414,7 +414,8 @@ pub fn run() {
         ])
         .register_uri_scheme_protocol("tiles", |ctx, request| {
             let images = ctx.app_handle().state::<Mutex<Images>>();
-            protocol::tile_response(&images, request.uri().path())
+            let roll = ctx.app_handle().state::<roll::RollState>();
+            protocol::tile_response(&images, &roll.roll, request.uri().path())
         })
         .setup(|app| {
             #[cfg(debug_assertions)]
