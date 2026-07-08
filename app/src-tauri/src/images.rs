@@ -29,7 +29,6 @@ pub fn build_prob_pyramid(probs: &[f32], level_dims: &[(u32, u32)]) -> ProbPyram
         .iter()
         .map(|p| (p.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
         .collect();
-    debug_assert_eq!(base.len(), (w0 * h0) as usize);
     levels.push(ProbLevel {
         width: w0,
         height: h0,
@@ -214,6 +213,9 @@ impl Images {
         let Some(entry) = self.entries.get_mut(&id) else {
             return false;
         };
+        if probs.len() != (entry.image.width * entry.image.height) as usize {
+            return false;
+        }
         let level_dims: Vec<(u32, u32)> = entry
             .pyramid
             .levels
@@ -371,5 +373,15 @@ mod tests {
         assert_eq!((b[0], b[1], b[2], b[3]), (200, 100, 205, 104));
         assert!(images.prob_tile(999, 0, 0, 0).is_none());
         assert!(images.components(info.id, 0.9).unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_probs_rejects_wrong_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_png(&dir, 600, 400);
+        let mut images = Images::default();
+        let info = images.open(&path).unwrap();
+        assert!(!images.set_probs(info.id, vec![0.0; 10]));
+        assert!(images.components(info.id, 0.5).is_none()); // nothing stored
     }
 }

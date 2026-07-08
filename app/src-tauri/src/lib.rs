@@ -107,7 +107,9 @@ async fn detect(
     let report = {
         let mut images = images.lock().map_err(|e| e.to_string())?;
         if !images.set_probs(id, probs) {
-            return Err(format!("image {id} closed during detection"));
+            return Err(format!(
+                "image {id} closed during detection or detector output size mismatch"
+            ));
         }
         DetectReport {
             id,
