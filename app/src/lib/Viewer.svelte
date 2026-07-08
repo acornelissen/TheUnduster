@@ -2,13 +2,14 @@
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { fitZoom, visibleTiles, ringsFor, TILE, type Level } from "./viewport";
-  import { TileRenderer } from "./renderer";
+  import { TileRenderer, probPathFor } from "./renderer";
 
   interface ImageInfo {
     id: number;
     width: number;
     height: number;
     levels: Level[];
+    healed: boolean;
   }
 
   interface Overlay {
@@ -20,13 +21,17 @@
     info,
     overlay,
     detected,
+    healedAvailable,
     onRequestDetect,
+    onRequestHeal,
     bboxes = null,
   }: {
     info: ImageInfo;
     overlay: Overlay;
     detected: boolean;
+    healedAvailable: boolean;
     onRequestDetect: () => void;
+    onRequestHeal: () => void;
     bboxes?: [number, number, number, number][] | null;
   } = $props();
 
@@ -42,6 +47,7 @@
 
   let detections: [number, number, number, number][] = $state([]);
   let current = -1;
+  let showHealed = $state(false);
 
   function requestFrame() {
     needsFrame = true;
@@ -58,12 +64,18 @@
     lastInfoId = info.id;
     detections = [];
     current = -1;
+    showHealed = false;
     centerX = info.width / 2;
     centerY = info.height / 2;
     if (canvas && canvas.width > 0) {
       zoom = fitZoom(info.levels[0], canvas.width, canvas.height);
     }
     requestFrame();
+  });
+
+  $effect(() => {
+    // If healed data vanishes (frame evicted and re-decoded), drop the toggle.
+    if (!healedAvailable) showHealed = false;
   });
 
   export async function refreshDetections(threshold: number) {
@@ -129,8 +141,10 @@
         const l = info.levels[t.level];
         const tileW = Math.min(l.width - t.tx * TILE, TILE);
         const tileH = Math.min(l.height - t.ty * TILE, TILE);
+        const base = `/${info.id}/${t.level}/${t.tx}/${t.ty}`;
         return {
-          path: `/${info.id}/${t.level}/${t.tx}/${t.ty}`,
+          path: showHealed ? `/healed${base}` : base,
+          probPath: probPathFor(base),
           screenX: t.screenX,
           screenY: t.screenY,
           screenW: t.screenW,
@@ -210,6 +224,17 @@
       e.preventDefault();
       cycleDetection(e.key === "z" ? 1 : -1);
       return;
+    } else if (e.key === "h") {
+      e.preventDefault();
+      onRequestHeal();
+      return;
+    } else if (e.key === " ") {
+      if (healedAvailable) {
+        e.preventDefault();
+        showHealed = !showHealed;
+        requestFrame();
+      }
+      return;
     }
     const pan = 64 / zoom;
     if (e.key === "ArrowLeft") centerX -= pan;
@@ -274,7 +299,7 @@
 <canvas
   bind:this={canvas}
   role="application"
-  aria-label="Scan viewer: arrows pan, plus and minus zoom, 0 fits, 1 is 100%, d detects, m toggles overlay, z and shift-z cycle defects"
+  aria-label="Scan viewer: arrows pan, plus and minus zoom, 0 fits, 1 is 100%, d detects, m toggles overlay, z and shift-z cycle defects, h heals, space toggles before and after"
   tabindex="0"
   onwheel={onWheel}
   onpointerdown={(e) => {

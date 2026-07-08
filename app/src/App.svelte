@@ -12,6 +12,7 @@
     width: number;
     height: number;
     levels: Level[];
+    healed: boolean;
   }
 
   interface FrameInfo {
@@ -36,6 +37,7 @@
   let detected = $state(false);
   let componentsAtHalf: number | null = $state(null);
   let detecting = $state(false);
+  let healing = $state(false);
 
   let roll: RollInfo | null = $state(null);
   let currentIndex = $state(0);
@@ -296,6 +298,30 @@
     }
   }
 
+  async function requestHeal() {
+    if (!info || healing || detecting) return;
+    if (!detected && !(roll && roll.frames[currentIndex].defect_count !== null)) {
+      error = "Run detection before healing";
+      return;
+    }
+    // Healing needs live probabilities; if only queue results exist, run
+    // detect first so the mask reflects the current threshold.
+    if (!detected) {
+      await requestDetect();
+      if (!detected) return; // detect failed; its error is already shown
+    }
+    error = null;
+    healing = true;
+    try {
+      await invoke("heal_frame", { id: info.id, threshold: overlay.threshold });
+      info = { ...info, healed: true };
+    } catch (e) {
+      error = String(e);
+    } finally {
+      healing = false;
+    }
+  }
+
   function isTypingTarget(target: EventTarget | null): boolean {
     if (!(target instanceof HTMLElement)) return false;
     const tag = target.tagName;
@@ -334,6 +360,9 @@
       <button onclick={requestDetect} disabled={loading !== null || detecting}>
         {detecting ? "Detecting..." : "Detect"}
       </button>
+      <button onclick={requestHeal} disabled={loading !== null || detecting || healing || !info}>
+        {healing ? "Healing..." : "Heal"}
+      </button>
       <label>
         Sensitivity
         <input
@@ -359,6 +388,12 @@
         {#if detecting}
           &mdash; Detecting...
         {/if}
+        {#if healing}
+          &mdash; Healing...
+        {/if}
+        {#if info?.healed}
+          &mdash; space toggles before/after
+        {/if}
         {#if roll}
           &mdash; {roll.frames.filter((f) => f.approved).length}/{roll.frames.length} approved
           {#if !scanDone}
@@ -380,7 +415,9 @@
         {info}
         {overlay}
         {detected}
+        healedAvailable={info.healed ?? false}
         onRequestDetect={requestDetect}
+        onRequestHeal={requestHeal}
         bboxes={roll ? roll.frames[currentIndex].bboxes : null}
       />
     {:else if !showLoader}

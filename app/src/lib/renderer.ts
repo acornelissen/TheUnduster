@@ -240,6 +240,7 @@ export class TileRenderer {
   draw(
     tiles: {
       path: string;
+      probPath: string;
       screenX: number;
       screenY: number;
       screenW: number;
@@ -289,7 +290,7 @@ export class TileRenderer {
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, tex);
       const probTex = overlay.enabled
-        ? this.ensure(probPathFor(t.path), t.tileW, t.tileH, { single: true })
+        ? this.ensure(t.probPath, t.tileW, t.tileH, { single: true })
         : undefined;
       gl.activeTexture(gl.TEXTURE1);
       gl.bindTexture(gl.TEXTURE_2D, probTex ?? this.zeroTex);
