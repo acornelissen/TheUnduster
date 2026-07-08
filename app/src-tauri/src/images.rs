@@ -28,8 +28,8 @@ struct Entry {
 
 /// Heavy half of open: decoded image plus its built pyramid, no registry access yet.
 pub struct Prepared {
-    image: Arc<fd_io::ImageBuf>,
-    pyramid: Pyramid,
+    pub(crate) image: Arc<fd_io::ImageBuf>,
+    pub(crate) pyramid: Pyramid,
 }
 
 pub struct Images {
@@ -49,11 +49,20 @@ impl Default for Images {
 }
 
 impl Images {
+    /// First heavy half of open: decode only. Blocking.
+    pub fn decode_stage(path: &Path) -> Result<Arc<fd_io::ImageBuf>, String> {
+        Ok(Arc::new(fd_io::decode(path).map_err(|e| e.to_string())?))
+    }
+
+    /// Second heavy half of open: pyramid build. Blocking.
+    pub fn pyramid_stage(image: &Arc<fd_io::ImageBuf>) -> Pyramid {
+        Pyramid::build(image)
+    }
+
     /// Heavy half of open: decode + pyramid, no registry access. Blocking.
     pub fn prepare(path: &Path) -> Result<Prepared, String> {
-        let img = fd_io::decode(path).map_err(|e| e.to_string())?;
-        let image = Arc::new(img);
-        let pyramid = Pyramid::build(&image);
+        let image = Self::decode_stage(path)?;
+        let pyramid = Self::pyramid_stage(&image);
         Ok(Prepared { image, pyramid })
     }
 

@@ -58,7 +58,7 @@
 
 <div class="shell">
   <header>
-    <button onclick={openScan}>Open scan</button>
+    <button onclick={openScan} disabled={loading !== null}>Open scan</button>
     {#if error}<p role="alert">{error}</p>{/if}
   </header>
   <section class="stage">

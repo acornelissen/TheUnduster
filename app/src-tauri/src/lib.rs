@@ -5,7 +5,7 @@ mod protocol;
 
 use std::sync::Mutex;
 
-use images::{ImageInfo, Images};
+use images::{ImageInfo, Images, Prepared};
 use tauri::{Emitter, Manager, State};
 
 #[derive(serde::Serialize, Clone)]
@@ -27,10 +27,11 @@ async fn open_image(
             stage: "decoding",
         },
     );
-    let prepared =
-        tauri::async_runtime::spawn_blocking(move || Images::prepare(std::path::Path::new(&path)))
-            .await
-            .map_err(|e| e.to_string())??;
+    let image = tauri::async_runtime::spawn_blocking(move || {
+        Images::decode_stage(std::path::Path::new(&path))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     let _ = app.emit(
         "app-progress",
         Progress {
@@ -38,6 +39,13 @@ async fn open_image(
             stage: "building-pyramid",
         },
     );
+    let pyramid = {
+        let image = image.clone();
+        tauri::async_runtime::spawn_blocking(move || Images::pyramid_stage(&image))
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    let prepared = Prepared { image, pyramid };
     let info = {
         let mut images = state.lock().map_err(|e| e.to_string())?;
         images.insert(prepared)
