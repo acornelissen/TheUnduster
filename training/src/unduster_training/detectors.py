@@ -5,7 +5,7 @@
   segmentation model (the published-weights baseline path).
 - implied_mask: recover a competitor's effective mask from before/after pairs.
 
-The tiling here (512px, 64 overlap, reflect-padded edges, averaged overlaps)
+The tiling here (512px, 64 overlap, edge-padded borders, averaged overlaps)
 is the reference behaviour for the Rust fd-infer crate.
 """
 
