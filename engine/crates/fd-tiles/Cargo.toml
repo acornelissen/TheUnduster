@@ -5,3 +5,4 @@ version.workspace = true
 
 [dependencies]
 fd-io = { path = "../fd-io" }
+lru = "0.12"
