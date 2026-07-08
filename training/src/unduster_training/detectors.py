@@ -39,7 +39,13 @@ class OnnxDetector:
         self.sess = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
         inp = self.sess.get_inputs()[0]
         self.input_name = inp.name
-        self.in_ch = int(inp.shape[1])
+        ch = inp.shape[1]
+        if not isinstance(ch, int) or ch not in (1, 3):
+            raise ValueError(
+                f"model {path} has channel dimension {ch!r}; detectors need a "
+                f"fixed 1- or 3-channel input"
+            )
+        self.in_ch = ch
         self.threshold = threshold
 
     def _prep(self, img: np.ndarray) -> np.ndarray:

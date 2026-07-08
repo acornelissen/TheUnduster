@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 
 from unduster_training.detectors import OnnxDetector, classical_detect, implied_mask
@@ -47,3 +48,23 @@ def test_implied_mask():
     after[10:14, 10:14] = 0.6  # the competitor healed here
     m = implied_mask(before, after)
     assert m[11, 11] and not m[40, 40]
+
+
+def test_dynamic_channel_model_gets_clear_error(tmp_path):
+    class AnyChannels(torch.nn.Module):
+        def forward(self, x):
+            return torch.relu(x)
+
+    path = tmp_path / "dyn.onnx"
+    torch.onnx.export(
+        AnyChannels().eval(),
+        (torch.zeros(1, 3, 16, 16),),
+        str(path),
+        input_names=["image"],
+        output_names=["logits"],
+        dynamic_shapes={"x": {1: "c", 2: "h", 3: "w"}},
+        opset_version=17,
+        dynamo=True,
+    )
+    with pytest.raises(ValueError, match="channel"):
+        OnnxDetector(path)
