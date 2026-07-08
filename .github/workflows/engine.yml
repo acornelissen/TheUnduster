@@ -4,26 +4,28 @@ on:
   push:
     paths:
       - "engine/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - ".github/workflows/engine.yml"
   pull_request:
     paths:
       - "engine/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - ".github/workflows/engine.yml"
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: engine
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: engine
+      # The cargo workspace root moved to the repo root when the app crate
+      # joined it; this workflow stays scoped to the engine crates so it
+      # does not need the Tauri linux system deps.
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo clippy -p fd-io -p fd-tiles -p fd-infer -p fd-heal --all-targets -- -D warnings
+      - run: cargo test -p fd-io -p fd-tiles -p fd-infer -p fd-heal
