@@ -52,7 +52,10 @@ void main() {
 }`;
 
 const RING_FRAG = `#version 300 es
-precision mediump float;
+// highp to match the vertex stage: 'radius' is declared in both shaders and
+// GLSL ES 300 requires identical precision, or the program fails to link
+// (vertex-stage floats default to highp). WebGL2 guarantees fragment highp.
+precision highp float;
 in vec2 vCorner;
 out vec4 color;
 uniform float radius;
