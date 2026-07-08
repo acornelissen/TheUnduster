@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { TextureStore } from "./renderer";
+import { probPathFor, TextureStore } from "./renderer";
 
 describe("TextureStore", () => {
   it("evicts least-recently-used past the budget", () => {
@@ -13,5 +13,11 @@ describe("TextureStore", () => {
     expect(store.get("b")).toBeUndefined();
     expect(store.get("a")).toBe(1);
     expect(dropped).toEqual([2]);
+  });
+});
+
+describe("probPathFor", () => {
+  it("prefixes the layer and preserves the tile path", () => {
+    expect(probPathFor("/3/0/1/2")).toBe("/probs/3/0/1/2");
   });
 });

@@ -15,6 +15,11 @@
   let info: ImageInfo | null = $state(null);
   let error: string | null = $state(null);
   let loading: string | null = $state(null);
+  let viewer: Viewer | undefined = $state();
+  let overlay = $state({ enabled: true, threshold: 0.5 });
+  let detected = $state(false);
+  let componentsAtHalf: number | null = $state(null);
+  let detecting = $state(false);
 
   $effect(() => {
     const un = listen<{ id: number; stage: string }>("app-progress", (e) => {
@@ -46,6 +51,8 @@
       loading = null;
       return;
     }
+    detected = false;
+    componentsAtHalf = null;
     if (previousId !== undefined) {
       try {
         await invoke("close_image", { id: previousId });
@@ -54,11 +61,53 @@
       }
     }
   }
+
+  async function requestDetect() {
+    if (!info || detecting) return;
+    error = null;
+    detecting = true;
+    try {
+      const report = await invoke<{ id: number; components_at_half: number }>("detect", {
+        id: info.id,
+      });
+      detected = true;
+      componentsAtHalf = report.components_at_half;
+      await viewer?.refreshDetections(overlay.threshold);
+    } catch (e) {
+      error = String(e);
+    } finally {
+      detecting = false;
+    }
+  }
 </script>
 
 <div class="shell">
   <header>
     <button onclick={openScan} disabled={loading !== null}>Open scan</button>
+    {#if info}
+      <button onclick={requestDetect} disabled={loading !== null || detecting}>
+        {detecting ? "Detecting..." : "Detect"}
+      </button>
+      <label>
+        Sensitivity
+        <input
+          type="range"
+          min="0.05"
+          max="0.95"
+          step="0.01"
+          bind:value={overlay.threshold}
+        />
+      </label>
+      <p class="status" role="status">
+        {#if detecting}
+          Detecting...
+        {:else if detected && componentsAtHalf !== null}
+          {componentsAtHalf} defect{componentsAtHalf === 1 ? "" : "s"} at 50%
+        {:else}
+          Not yet detected
+        {/if}
+      </p>
+    {/if}
     {#if error}<p role="alert">{error}</p>{/if}
   </header>
   <section class="stage">
@@ -66,7 +115,7 @@
       <p class="hint" role="status" aria-busy="true">{loading}...</p>
     {:else if info}
       {#key info.id}
-        <Viewer {info} />
+        <Viewer bind:this={viewer} {info} {overlay} onRequestDetect={requestDetect} />
       {/key}
     {:else}
       <p class="hint">Open a scan to begin.</p>
@@ -98,6 +147,20 @@
   }
   button:focus-visible {
     outline: 3px solid #6ab0ff;
+  }
+  label {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.9rem;
+  }
+  input[type="range"]:focus-visible {
+    outline: 3px solid #6ab0ff;
+  }
+  .status {
+    margin: 0;
+    color: #bbb;
+    font-size: 0.9rem;
   }
   .stage {
     flex: 1;

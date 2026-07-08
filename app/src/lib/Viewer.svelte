@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { invoke } from "@tauri-apps/api/core";
   import { fitZoom, visibleTiles, TILE, type Level } from "./viewport";
   import { TileRenderer } from "./renderer";
 
@@ -10,7 +11,16 @@
     levels: Level[];
   }
 
-  let { info }: { info: ImageInfo } = $props();
+  interface Overlay {
+    enabled: boolean;
+    threshold: number;
+  }
+
+  let {
+    info,
+    overlay,
+    onRequestDetect,
+  }: { info: ImageInfo; overlay: Overlay; onRequestDetect: () => void } = $props();
 
   let canvas: HTMLCanvasElement;
   let renderer: TileRenderer | undefined;
@@ -20,9 +30,49 @@
   let dragging = false;
   let needsFrame = true;
 
+  let detections: [number, number, number, number][] = $state([]);
+  let current = -1;
+
   function requestFrame() {
     needsFrame = true;
   }
+
+  export async function refreshDetections(threshold: number) {
+    try {
+      detections = await invoke("components", { id: info.id, threshold });
+    } catch {
+      // no detection run yet; leave detections empty until `detect` succeeds
+      detections = [];
+    }
+    current = -1;
+  }
+
+  function cycleDetection(dir: 1 | -1) {
+    if (!detections.length) return;
+    current = (current + dir + detections.length) % detections.length;
+    const [x0, y0, x1, y1] = detections[current];
+    zoom = 1;
+    centerX = (x0 + x1) / 2;
+    centerY = (y0 + y1) / 2;
+    clampCenter();
+    requestFrame();
+  }
+
+  let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+
+  $effect(() => {
+    // Read both fields so the effect reruns on either change; a slider drag
+    // redraws immediately (uniform-only, no refetch) and, debounced, syncs
+    // the component list used by z/Z so cycling targets stay current.
+    const threshold = overlay.threshold;
+    void overlay.enabled;
+    requestFrame();
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(() => {
+      refreshDetections(threshold);
+    }, 250);
+    return () => clearTimeout(refreshTimer);
+  });
 
   function tilePaths() {
     return visibleTiles(info.levels, zoom, centerX, centerY, canvas.width, canvas.height).map(
@@ -46,7 +96,7 @@
   function frame() {
     if (renderer && needsFrame) {
       needsFrame = false;
-      renderer.draw(tilePaths(), canvas.width, canvas.height);
+      renderer.draw(tilePaths(), canvas.width, canvas.height, overlay);
     }
     requestAnimationFrame(frame);
   }
@@ -87,6 +137,20 @@
   }
 
   function onKey(e: KeyboardEvent) {
+    if (e.key === "d") {
+      e.preventDefault();
+      onRequestDetect();
+      return;
+    } else if (e.key === "m") {
+      e.preventDefault();
+      overlay.enabled = !overlay.enabled;
+      requestFrame();
+      return;
+    } else if (e.key === "z" || e.key === "Z") {
+      e.preventDefault();
+      cycleDetection(e.key === "z" ? 1 : -1);
+      return;
+    }
     const pan = 64 / zoom;
     if (e.key === "ArrowLeft") centerX -= pan;
     else if (e.key === "ArrowRight") centerX += pan;
@@ -127,7 +191,7 @@
 <canvas
   bind:this={canvas}
   role="application"
-  aria-label="Scan viewer: arrows pan, plus and minus zoom, 0 fits, 1 is 100%"
+  aria-label="Scan viewer: arrows pan, plus and minus zoom, 0 fits, 1 is 100%, d detects, m toggles overlay, z and shift-z cycle defects"
   tabindex="0"
   onwheel={onWheel}
   onpointerdown={(e) => {

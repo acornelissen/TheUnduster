@@ -16,9 +16,20 @@ precision mediump float;
 in vec2 vUv;
 out vec4 color;
 uniform sampler2D tile;
+uniform sampler2D probs;
+uniform float threshold;
+uniform float overlayOn;
 void main() {
-  color = texture(tile, vUv);
+  vec4 base = texture(tile, vUv);
+  float p = texture(probs, vUv).r;
+  float hit = overlayOn * step(threshold, p) * step(0.004, p); // never tint p==0
+  color = mix(base, vec4(1.0, 0.25, 0.25, 1.0), hit * 0.55);
 }`;
+
+/** Maps a tile's rgba path to its probability-layer counterpart. */
+export function probPathFor(path: string): string {
+  return "/probs" + path;
+}
 
 /** Byte-budgeted LRU keyed by tile URL path. Generic over the texture type
  * so the eviction logic is unit-testable without a GL context. */
@@ -69,6 +80,7 @@ export class TileRenderer {
   private buf: WebGLBuffer;
   private textures = new TextureStore<WebGLTexture>(256 * 1024 * 1024);
   private pending = new Set<string>();
+  private zeroTex: WebGLTexture;
   onTileLoaded: () => void = () => {};
 
   constructor(canvas: HTMLCanvasElement) {
@@ -85,10 +97,25 @@ export class TileRenderer {
     this.program = p;
     this.buf = gl.createBuffer()!;
     this.textures.onEvict = (t) => gl.deleteTexture(t);
+
+    // Static 1x1 zero texture so the "probs" sampler is always bound, even
+    // when overlay is off or no prob tile has loaded yet (404 pre-detection).
+    const zeroTex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, zeroTex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, 1, 1, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array([0]));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    this.zeroTex = zeroTex;
   }
 
-  /** Fetch a tile via tiles:// and upload it; no-op if cached or in flight. */
-  private ensure(path: string): WebGLTexture | undefined {
+  /** Fetch a tile via tiles:// and upload it; no-op if cached or in flight.
+   * `single` uploads as a single-channel R8 probability texture instead of
+   * RGBA; a 404 (no detection yet) is simply not cached, so a later detect
+   * can retry the same path (the pending guard clears in finally either way). */
+  private ensure(path: string, opts: { single?: boolean } = {}): WebGLTexture | undefined {
     const hit = this.textures.get(path);
     if (hit) return hit;
     if (!this.pending.has(path)) {
@@ -98,17 +125,21 @@ export class TileRenderer {
           if (!r.ok) return;
           const w = Number(r.headers.get("x-tile-width"));
           const h = Number(r.headers.get("x-tile-height"));
-          const rgba = new Uint8Array(await r.arrayBuffer());
+          const bytes = new Uint8Array(await r.arrayBuffer());
           const gl = this.gl;
           const tex = gl.createTexture()!;
           gl.bindTexture(gl.TEXTURE_2D, tex);
           gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+          if (opts.single) {
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, w, h, 0, gl.RED, gl.UNSIGNED_BYTE, bytes);
+          } else {
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, bytes);
+          }
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-          this.textures.put(path, tex, w * h * 4);
+          this.textures.put(path, tex, w * h * (opts.single ? 1 : 4));
           this.onTileLoaded();
         })
         .finally(() => this.pending.delete(path));
@@ -116,7 +147,9 @@ export class TileRenderer {
     return undefined;
   }
 
-  /** Draw one frame. tiles come from visibleTiles(), coarse first. */
+  /** Draw one frame. tiles come from visibleTiles(), coarse first.
+   * overlay.enabled/threshold drive uniforms only — never triggers a fetch;
+   * prob textures already hold raw probabilities fetched via ensure(). */
   draw(
     tiles: {
       path: string;
@@ -129,6 +162,7 @@ export class TileRenderer {
     }[],
     canvasW: number,
     canvasH: number,
+    overlay: { enabled: boolean; threshold: number },
   ): void {
     const gl = this.gl;
     gl.viewport(0, 0, canvasW, canvasH);
@@ -136,6 +170,10 @@ export class TileRenderer {
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.useProgram(this.program);
     gl.uniform2f(gl.getUniformLocation(this.program, "viewport"), canvasW, canvasH);
+    gl.uniform1f(gl.getUniformLocation(this.program, "threshold"), overlay.threshold);
+    gl.uniform1f(gl.getUniformLocation(this.program, "overlayOn"), overlay.enabled ? 1 : 0);
+    gl.uniform1i(gl.getUniformLocation(this.program, "tile"), 0);
+    gl.uniform1i(gl.getUniformLocation(this.program, "probs"), 1);
     const posLoc = gl.getAttribLocation(this.program, "pos");
     const uvLoc = gl.getAttribLocation(this.program, "uv");
     gl.bindBuffer(gl.ARRAY_BUFFER, this.buf);
@@ -161,7 +199,11 @@ export class TileRenderer {
         x0, y0 + h, 0, 1,
       ]);
       gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STREAM_DRAW);
+      gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, tex);
+      const probTex = overlay.enabled ? this.ensure(probPathFor(t.path), { single: true }) : undefined;
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, probTex ?? this.zeroTex);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
     }
   }
