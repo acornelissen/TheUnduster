@@ -22,9 +22,6 @@ impl DetectorState {
         Ok(())
     }
 
-    // Consumed by Task 3's detect command; exercised here by tests in the
-    // meantime.
-    #[allow(dead_code)]
     pub fn detect(&self, img: &ImageBuf) -> Result<Vec<f32>, String> {
         let mut guard = self.0.lock().map_err(|e| e.to_string())?;
         match guard.as_mut() {
