@@ -2,7 +2,7 @@
 //! Tauri commands in `lib.rs` drive.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -424,6 +424,13 @@ impl RollState {
         let guard = self.roll.lock().map_err(|e| e.to_string())?;
         Ok(guard.as_ref().ok_or("no roll open")?.dir.clone())
     }
+
+    /// Clears the in-progress scan flag. Pulled out as its own method so the
+    /// `scan_roll` task's drop guard has a single, testable reset authority
+    /// -- one line, called unconditionally (including on panic unwind).
+    pub fn clear_scanning(&self) {
+        self.scanning.store(false, Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
@@ -509,6 +516,14 @@ mod state_tests {
         let state = RollState::default();
         assert!(state.set_threshold(0, 0.5).unwrap_err().contains("no roll"));
         assert!(state.ids_to_evict(0).unwrap_err().contains("no roll"));
+    }
+
+    #[test]
+    fn clear_scanning_resets_the_flag() {
+        let state = RollState::default();
+        state.scanning.store(true, Ordering::SeqCst);
+        state.clear_scanning();
+        assert!(!state.scanning.load(Ordering::SeqCst));
     }
 }
 

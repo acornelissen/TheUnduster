@@ -278,6 +278,17 @@ struct RollFrameError {
     message: String,
 }
 
+/// Clears the roll-scan flag when dropped, including on unwind, so a panic
+/// anywhere in the `scan_roll` queue task (outer async body, not just the
+/// `spawn_blocking` closures) can never wedge scanning permanently.
+struct ScanFlagGuard(tauri::AppHandle);
+
+impl Drop for ScanFlagGuard {
+    fn drop(&mut self) {
+        self.0.state::<roll::RollState>().clear_scanning();
+    }
+}
+
 #[tauri::command]
 fn scan_roll(
     app: tauri::AppHandle,
@@ -299,6 +310,7 @@ fn scan_roll(
     let detector = detector.inner().clone();
     let app_for_task = app.clone();
     tauri::async_runtime::spawn(async move {
+        let _scan_flag_guard = ScanFlagGuard(app_for_task.clone());
         for index in indices {
             let roll_state = app_for_task.state::<roll::RollState>();
             let path = match roll_state.frame_path(index) {
@@ -368,10 +380,6 @@ fn scan_roll(
                 }
             }
         }
-        app_for_task
-            .state::<roll::RollState>()
-            .scanning
-            .store(false, Ordering::SeqCst);
         let _ = app_for_task.emit("roll-done", ());
     });
     Ok(())
