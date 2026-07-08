@@ -2,6 +2,20 @@
 
 mod classical;
 mod components;
+mod grain;
+mod heal;
+mod inpaint;
 
 pub use classical::classical_fill;
 pub use components::{components, Bbox, Defect};
+pub use grain::add_grain;
+pub use heal::{heal, HealReport, TINY_MAX_DIM};
+pub use inpaint::Inpainter;
+
+#[derive(Debug, thiserror::Error)]
+pub enum HealError {
+    #[error("inpaint model error: {0}")]
+    Model(String),
+    #[error("mask size {got} does not match image size {want}")]
+    MaskSize { got: usize, want: usize },
+}

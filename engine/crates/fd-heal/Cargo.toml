@@ -4,3 +4,8 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+fd-io = { path = "../fd-io" }
+fd-infer = { path = "../fd-infer" }
+thiserror.workspace = true
+ort = { version = "2.0.0-rc.10", features = ["coreml"] }
+ndarray = "0.17"
