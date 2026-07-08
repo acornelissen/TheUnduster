@@ -31,6 +31,34 @@ impl DetectorState {
     }
 }
 
+/// Cheaply cloneable handle to the (optional) inpainting model, mirroring
+/// DetectorState. None means heal_frame falls back to classical fill only.
+#[derive(Clone)]
+pub struct InpainterState(Arc<Mutex<Option<fd_heal::Inpainter>>>);
+
+impl Default for InpainterState {
+    fn default() -> Self {
+        InpainterState(Arc::new(Mutex::new(None)))
+    }
+}
+
+impl InpainterState {
+    pub fn load(&self, path: &Path) -> Result<(), String> {
+        let inp = fd_heal::Inpainter::load(path, fd_infer::Ep::Cpu).map_err(|e| e.to_string())?;
+        *self.0.lock().map_err(|e| e.to_string())? = Some(inp);
+        Ok(())
+    }
+
+    /// Runs `f` with mutable access to the loaded inpainter (or None).
+    pub fn with_inpainter<R>(
+        &self,
+        f: impl FnOnce(Option<&mut fd_heal::Inpainter>) -> R,
+    ) -> Result<R, String> {
+        let mut guard = self.0.lock().map_err(|e| e.to_string())?;
+        Ok(f(guard.as_mut()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,5 +107,25 @@ mod tests {
             .load(Path::new("/nonexistent/model.onnx"))
             .unwrap_err();
         assert!(err.contains("model.onnx"));
+    }
+
+    #[test]
+    fn inpainter_state_loads_fixture_and_runs() {
+        let state = InpainterState::default();
+        state
+            .load(
+                &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../engine/fixtures/tiny-inpaint.onnx"),
+            )
+            .unwrap();
+        let has = state.with_inpainter(|i| i.is_some()).unwrap();
+        assert!(has);
+    }
+
+    #[test]
+    fn inpainter_state_defaults_to_none() {
+        let state = InpainterState::default();
+        assert!(!state.with_inpainter(|i| i.is_some()).unwrap());
+        assert!(state.load(Path::new("/nonexistent/x.onnx")).is_err());
     }
 }

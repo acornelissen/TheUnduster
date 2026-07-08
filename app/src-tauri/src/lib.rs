@@ -150,6 +150,89 @@ async fn detect(
     result
 }
 
+/// Dilation applied to the thresholded mask before healing: model masks
+/// cover a defect's confident core, and healing an under-covering mask
+/// leaves a visible rim (3b-1 field notes / issue TheUnduster-0s4).
+const HEAL_DILATE_RADIUS: u32 = 2;
+
+#[derive(serde::Serialize, Clone)]
+struct HealSummary {
+    id: u64,
+    defects: usize,
+    tiny: usize,
+    inpainted: usize,
+}
+
+/// Runs the fallible body of `heal_frame`. Split out so `heal_frame` can
+/// guarantee a terminal "ready" emit on every exit path, mirroring
+/// `run_detect`/`detect`.
+async fn run_heal(
+    images: &State<'_, Mutex<Images>>,
+    inpainter: &State<'_, detect::InpainterState>,
+    id: u64,
+    threshold: f32,
+) -> Result<HealSummary, String> {
+    if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+        return Err(format!("threshold {threshold} out of range"));
+    }
+    let (image, mask) = {
+        let images = images.lock().map_err(|e| e.to_string())?;
+        let image = images.image(id).ok_or_else(|| format!("no image {id}"))?;
+        let mask = images
+            .threshold_mask(id, threshold)
+            .ok_or_else(|| format!("no detection for image {id}"))?;
+        (image, mask)
+    };
+    let inpainter = inpainter.inner().clone();
+    let (healed, pyramid, mask, report) = tauri::async_runtime::spawn_blocking(move || {
+        let mask = fd_heal::dilate(&mask, image.width, image.height, HEAL_DILATE_RADIUS);
+        let mut copy = (*image).clone(); // the original Arc stays pristine
+        let report = inpainter
+            .with_inpainter(|inp| fd_heal::heal(&mut copy, &mask, inp))?
+            .map_err(|e| e.to_string())?;
+        let healed = std::sync::Arc::new(copy);
+        let pyramid = fd_tiles::Pyramid::build(&healed);
+        Ok::<_, String>((healed, pyramid, std::sync::Arc::new(mask), report))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let mut images = images.lock().map_err(|e| e.to_string())?;
+    if !images.set_healed(id, healed, pyramid, mask) {
+        return Err(format!("image {id} closed during healing"));
+    }
+    Ok(HealSummary {
+        id,
+        defects: report.defects,
+        tiny: report.tiny,
+        inpainted: report.inpainted,
+    })
+}
+
+#[tauri::command]
+async fn heal_frame(
+    app: tauri::AppHandle,
+    images: State<'_, Mutex<Images>>,
+    inpainter: State<'_, detect::InpainterState>,
+    id: u64,
+    threshold: f32,
+) -> Result<HealSummary, String> {
+    let _ = app.emit(
+        "app-progress",
+        Progress {
+            id,
+            stage: "healing",
+        },
+    );
+    let result = run_heal(&images, &inpainter, id, threshold).await;
+    let _ = app.emit("app-progress", Progress { id, stage: "ready" });
+    result
+}
+
+#[tauri::command]
+fn load_inpainter(state: State<'_, detect::InpainterState>, path: String) -> Result<(), String> {
+    state.load(std::path::Path::new(&path))
+}
+
 #[tauri::command]
 fn components(
     images: State<'_, Mutex<Images>>,
@@ -579,6 +662,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(Mutex::new(Images::default()))
         .manage(detect::DetectorState::default())
+        .manage(detect::InpainterState::default())
         .manage(roll::RollState::default())
         .invoke_handler(tauri::generate_handler![
             log_js_error,
@@ -586,6 +670,8 @@ pub fn run() {
             close_image,
             load_detector,
             detect,
+            load_inpainter,
+            heal_frame,
             components,
             open_roll,
             close_roll,
@@ -612,6 +698,9 @@ pub fn run() {
                 if state.load(&fixtures.join("demo-detector.onnx")).is_err() {
                     let _ = state.load(&fixtures.join("tiny-detector.onnx"));
                 }
+                let _ = app
+                    .state::<detect::InpainterState>()
+                    .load(&fixtures.join("tiny-inpaint.onnx"));
             }
             Ok(())
         })

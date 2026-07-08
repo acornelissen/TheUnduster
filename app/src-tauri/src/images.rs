@@ -294,11 +294,9 @@ impl Images {
     }
 
     /// Stores a healed copy. Returns false when the id is unknown, the
-    /// healed dims do not match the original, or the mask length is wrong --
-    /// mirrors set_probs_built's validate-at-the-boundary posture.
-    // Exercised by tests; the heal command that populates this wires up in a
-    // later task.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// healed dims/channels/bit-depth do not match the original, or the mask
+    /// length is wrong -- mirrors set_probs_built's validate-at-the-boundary
+    /// posture.
     pub fn set_healed(
         &mut self,
         id: u64,
@@ -309,9 +307,12 @@ impl Images {
         let Some(entry) = self.entries.get_mut(&id) else {
             return false;
         };
+        let same_depth =
+            std::mem::discriminant(&image.data) == std::mem::discriminant(&entry.image.data);
         if image.width != entry.image.width
             || image.height != entry.image.height
             || image.channels != entry.image.channels
+            || !same_depth
             || mask.len() != (image.width as usize) * (image.height as usize)
         {
             return false;
@@ -322,6 +323,14 @@ impl Images {
             mask,
         });
         true
+    }
+
+    /// Boolean mask of probs > threshold at native resolution; None until a
+    /// detection has stored probabilities for this image.
+    pub fn threshold_mask(&self, id: u64, threshold: f32) -> Option<Vec<bool>> {
+        let entry = self.entries.get(&id)?;
+        let (probs, _) = entry.probs.as_ref()?;
+        Some(probs.iter().map(|&p| p > threshold).collect())
     }
 
     pub fn has_healed(&self, id: u64) -> bool {
@@ -655,6 +664,48 @@ mod tests {
         assert!(!images.set_healed(info.id, wrong.clone(), pyr, mask.clone()));
         let pyr2 = fd_tiles::Pyramid::build(&wrong);
         assert!(!images.set_healed(999, wrong, pyr2, mask));
+    }
+
+    #[test]
+    fn set_healed_rejects_bit_depth_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_png(&dir, 600, 400);
+        let mut images = Images::default();
+        let info = images.open(&path).unwrap();
+        // Same dims/channels as the original (U8), but U16 pixel data.
+        let wrong_depth = std::sync::Arc::new(fd_io::ImageBuf {
+            width: 600,
+            height: 400,
+            channels: 1,
+            data: fd_io::PixelData::U16(vec![0; 600 * 400]),
+            icc: None,
+            exif: None,
+        });
+        let pyr = fd_tiles::Pyramid::build(&wrong_depth);
+        let mask = std::sync::Arc::new(vec![false; 600 * 400]);
+        assert!(!images.set_healed(info.id, wrong_depth, pyr, mask));
+    }
+
+    #[test]
+    fn threshold_mask_matches_probs_above_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_png(&dir, 600, 400);
+        let mut images = Images::default();
+        let info = images.open(&path).unwrap();
+        assert!(images.threshold_mask(info.id, 0.5).is_none());
+
+        let mut probs = vec![0.0f32; 600 * 400];
+        for y in 100..104 {
+            for x in 200..205 {
+                probs[y * 600 + x] = 0.8;
+            }
+        }
+        images.set_probs(info.id, probs);
+
+        let mask = images.threshold_mask(info.id, 0.5).unwrap();
+        assert_eq!(mask.iter().filter(|&&b| b).count(), 4 * 5);
+        let none = images.threshold_mask(info.id, 0.9).unwrap();
+        assert!(none.iter().all(|&b| !b));
     }
 
     #[test]
