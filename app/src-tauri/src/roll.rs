@@ -392,15 +392,21 @@ impl RollState {
             .image_id)
     }
 
-    pub fn set_image_id(&self, index: usize, id: u64) -> Result<(), String> {
+    /// Records the frame's live registry id, returning the id it replaces
+    /// (if any) so the caller can close it: concurrent activations of the
+    /// same frame each decode independently, and the superseded image would
+    /// otherwise be orphaned in the registry -- roughly a gigabyte of leaked
+    /// pixels per rapid re-click on a large scan.
+    pub fn set_image_id(&self, index: usize, id: u64) -> Result<Option<u64>, String> {
         let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
         let roll = guard.as_mut().ok_or("no roll open")?;
         let frame = roll
             .frames
             .get_mut(index)
             .ok_or_else(|| format!("no frame {index}"))?;
+        let previous = frame.image_id.filter(|&old| old != id);
         frame.image_id = Some(id);
-        Ok(())
+        Ok(previous)
     }
 
     pub fn frame_path(&self, index: usize) -> Result<PathBuf, String> {
@@ -650,6 +656,18 @@ mod state_tests {
         let state = RollState::default();
         assert!(state.set_threshold(0, 0.5).unwrap_err().contains("no roll"));
         assert!(state.ids_to_evict(0).unwrap_err().contains("no roll"));
+    }
+
+    #[test]
+    fn set_image_id_returns_the_id_it_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"x").unwrap();
+        let state = RollState::default();
+        state.open(dir.path()).unwrap();
+        assert_eq!(state.set_image_id(0, 7).unwrap(), None);
+        assert_eq!(state.set_image_id(0, 9).unwrap(), Some(7)); // superseded
+        assert_eq!(state.set_image_id(0, 9).unwrap(), None); // same id: nothing to close
+        assert_eq!(state.image_id(0).unwrap(), Some(9));
     }
 
     #[test]

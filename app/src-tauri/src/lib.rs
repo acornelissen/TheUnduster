@@ -269,7 +269,14 @@ async fn activate_frame(
         let mut images = images.lock().map_err(|e| e.to_string())?;
         images.insert(prepared)
     };
-    roll.set_image_id(index, info.id)?;
+    // Concurrent activations of the same frame each decode independently;
+    // whichever lands later replaces the frame's id, and the superseded
+    // image must be closed or it is orphaned in the registry (about a
+    // gigabyte of leaked pixels per rapid re-click on a 168MP scan).
+    if let Some(superseded) = roll.set_image_id(index, info.id)? {
+        let mut images = images.lock().map_err(|e| e.to_string())?;
+        images.close(superseded);
+    }
 
     for (evict_index, evict_id) in roll.ids_to_evict(index)? {
         let mut images = images.lock().map_err(|e| e.to_string())?;
