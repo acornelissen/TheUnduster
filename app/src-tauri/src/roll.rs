@@ -2,6 +2,7 @@
 //! Tauri commands in `lib.rs` drive.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -68,10 +69,50 @@ fn sidecar_path(dir: &Path) -> PathBuf {
     sidecar_dir(dir).join(SIDECAR_FILE)
 }
 
-/// Not yet consumed: reserved for a future thumbnail-generation task.
-#[allow(dead_code)]
 pub fn thumbs_dir(dir: &Path) -> PathBuf {
     sidecar_dir(dir).join("thumbs")
+}
+
+/// Downscales an already-built RGBA level (coarsest pyramid level, typically
+/// already small) to at most 128px on its longest edge via repeated 2x2
+/// box-average downsampling, then writes it as an RGB PNG thumbnail. Alpha
+/// is dropped (tiles are always opaque -- see fd_tiles::pyramid::base_rgba).
+pub fn write_thumbnail(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    out_path: &Path,
+) -> Result<(), String> {
+    const MAX_EDGE: u32 = 128;
+    let (mut w, mut h) = (width, height);
+    let mut buf = rgba.to_vec();
+    while w.max(h) > MAX_EDGE {
+        let (next, nw, nh) = fd_tiles::downsample_2x(&buf, w, h);
+        buf = next;
+        w = nw;
+        h = nh;
+    }
+    let n = (w * h) as usize;
+    let mut rgb = Vec::with_capacity(n * 3);
+    for px in buf.chunks_exact(4).take(n) {
+        rgb.extend_from_slice(&px[..3]);
+    }
+    let img = fd_io::ImageBuf {
+        width: w,
+        height: h,
+        channels: 3,
+        data: fd_io::PixelData::U8(rgb),
+        icc: None,
+        exif: None,
+    };
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    fd_io::encode(out_path, &img).map_err(|e| e.to_string())
+}
+
+pub fn thumb_path(dir: &Path, index: usize) -> PathBuf {
+    thumbs_dir(dir).join(format!("{index:04}.png"))
 }
 
 fn list_image_files(dir: &Path) -> Result<Vec<String>, String> {
@@ -240,13 +281,18 @@ impl Roll {
 /// Shared roll handle managed by Tauri; commands lock it for the duration of
 /// a single frame mutation only (never across a decode).
 #[derive(Default)]
-pub struct RollState(pub Mutex<Option<Roll>>);
+pub struct RollState {
+    pub roll: Mutex<Option<Roll>>,
+    /// Guards against double-spawning the background scan task if `scan_roll`
+    /// is invoked twice (e.g. a second "Open roll" or an eager retry).
+    pub scanning: AtomicBool,
+}
 
 impl RollState {
     pub fn open(&self, dir: &Path) -> Result<RollInfo, String> {
         let roll = Roll::open(dir)?;
         let info = roll.info();
-        *self.0.lock().map_err(|e| e.to_string())? = Some(roll);
+        *self.roll.lock().map_err(|e| e.to_string())? = Some(roll);
         Ok(info)
     }
 
@@ -263,7 +309,7 @@ impl RollState {
     /// `Images::close` outside this lock -- eviction never touches the
     /// `Images` registry itself; `RollState` only owns frame bookkeeping.
     pub fn ids_to_evict(&self, keep: usize) -> Result<Vec<(usize, u64)>, String> {
-        let guard = self.0.lock().map_err(|e| e.to_string())?;
+        let guard = self.roll.lock().map_err(|e| e.to_string())?;
         let roll = guard.as_ref().ok_or("no roll open")?;
         let window = Self::keep_window(roll.frames.len(), keep);
         Ok(roll
@@ -276,7 +322,7 @@ impl RollState {
     }
 
     pub fn clear_image_id(&self, index: usize) -> Result<(), String> {
-        let mut guard = self.0.lock().map_err(|e| e.to_string())?;
+        let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
         let roll = guard.as_mut().ok_or("no roll open")?;
         let frame = roll
             .frames
@@ -287,7 +333,7 @@ impl RollState {
     }
 
     pub fn image_id(&self, index: usize) -> Result<Option<u64>, String> {
-        let guard = self.0.lock().map_err(|e| e.to_string())?;
+        let guard = self.roll.lock().map_err(|e| e.to_string())?;
         let roll = guard.as_ref().ok_or("no roll open")?;
         Ok(roll
             .frames
@@ -297,7 +343,7 @@ impl RollState {
     }
 
     pub fn set_image_id(&self, index: usize, id: u64) -> Result<(), String> {
-        let mut guard = self.0.lock().map_err(|e| e.to_string())?;
+        let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
         let roll = guard.as_mut().ok_or("no roll open")?;
         let frame = roll
             .frames
@@ -308,7 +354,7 @@ impl RollState {
     }
 
     pub fn frame_path(&self, index: usize) -> Result<PathBuf, String> {
-        let guard = self.0.lock().map_err(|e| e.to_string())?;
+        let guard = self.roll.lock().map_err(|e| e.to_string())?;
         let roll = guard.as_ref().ok_or("no roll open")?;
         let frame = roll
             .frames
@@ -318,7 +364,12 @@ impl RollState {
     }
 
     pub fn set_threshold(&self, index: usize, threshold: f32) -> Result<(), String> {
-        let mut guard = self.0.lock().map_err(|e| e.to_string())?;
+        if !(0.0..=1.0).contains(&threshold) {
+            return Err(format!(
+                "threshold must be finite and within [0, 1], got {threshold}"
+            ));
+        }
+        let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
         let roll = guard.as_mut().ok_or("no roll open")?;
         let frame = roll
             .frames
@@ -329,7 +380,7 @@ impl RollState {
     }
 
     pub fn set_approved(&self, index: usize, approved: bool) -> Result<(), String> {
-        let mut guard = self.0.lock().map_err(|e| e.to_string())?;
+        let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
         let roll = guard.as_mut().ok_or("no roll open")?;
         let frame = roll
             .frames
@@ -337,6 +388,41 @@ impl RollState {
             .ok_or_else(|| format!("no frame {index}"))?;
         frame.approved = approved;
         roll.save()
+    }
+
+    /// Frame indices still missing a defect count, in order.
+    pub fn frames_to_scan(&self) -> Result<Vec<usize>, String> {
+        let guard = self.roll.lock().map_err(|e| e.to_string())?;
+        let roll = guard.as_ref().ok_or("no roll open")?;
+        Ok(roll
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.defect_count.is_none())
+            .map(|(i, _)| i)
+            .collect())
+    }
+
+    pub fn record_scan_result(
+        &self,
+        index: usize,
+        count: Option<usize>,
+        bboxes: Option<Vec<[u32; 4]>>,
+    ) -> Result<(), String> {
+        let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
+        let roll = guard.as_mut().ok_or("no roll open")?;
+        let frame = roll
+            .frames
+            .get_mut(index)
+            .ok_or_else(|| format!("no frame {index}"))?;
+        frame.defect_count = count;
+        frame.bboxes = bboxes;
+        roll.save()
+    }
+
+    pub fn dir(&self) -> Result<PathBuf, String> {
+        let guard = self.roll.lock().map_err(|e| e.to_string())?;
+        Ok(guard.as_ref().ok_or("no roll open")?.dir.clone())
     }
 }
 
@@ -391,6 +477,26 @@ mod state_tests {
     }
 
     #[test]
+    fn set_threshold_rejects_non_finite_or_out_of_range_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = opened_state(dir.path(), 1);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 1.01] {
+            let err = state.set_threshold(0, bad).unwrap_err();
+            assert!(err.contains("threshold"), "error was: {err}");
+        }
+        // Valid boundary values are accepted.
+        state.set_threshold(0, 0.0).unwrap();
+        state.set_threshold(0, 1.0).unwrap();
+    }
+
+    #[test]
+    fn dir_returns_the_open_rolls_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = opened_state(dir.path(), 1);
+        assert_eq!(state.dir().unwrap(), dir.path());
+    }
+
+    #[test]
     fn frame_path_joins_roll_dir() {
         let dir = tempfile::tempdir().unwrap();
         let state = opened_state(dir.path(), 1);
@@ -412,6 +518,20 @@ mod tests {
 
     fn touch(dir: &Path, name: &str) {
         std::fs::write(dir.join(name), b"not a real image, just a marker").unwrap();
+    }
+
+    #[test]
+    fn write_thumbnail_downscales_below_max_edge_and_is_a_valid_png() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (600u32, 400u32);
+        let rgba = vec![128u8; (w * h * 4) as usize];
+        let out = thumb_path(dir.path(), 7);
+        write_thumbnail(&rgba, w, h, &out).unwrap();
+        assert!(out.exists());
+        assert_eq!(out.file_name().unwrap(), "0007.png");
+        let decoded = fd_io::decode(&out).unwrap();
+        assert!(decoded.width <= 128 && decoded.height <= 128);
+        assert_eq!(decoded.channels, 3);
     }
 
     #[test]

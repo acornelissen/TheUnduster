@@ -5,6 +5,7 @@ mod images;
 mod protocol;
 mod roll;
 
+use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
 use images::{build_prob_pyramid, ImageInfo, Images, Prepared};
@@ -257,6 +258,125 @@ fn approve_frame(
     state.set_approved(index, approved)
 }
 
+/// Fixed threshold for the background queue's stored bboxes/count. The
+/// operator's per-frame sensitivity slider (Task 2's `set_frame_threshold`)
+/// only affects live overlay/z-navigation on the activated frame; the queue
+/// runs once per roll at a stable threshold so counts are comparable across
+/// frames regardless of what the operator was looking at when the queue
+/// reached them.
+const SCAN_THRESHOLD: f32 = 0.5;
+
+#[derive(serde::Serialize, Clone)]
+struct RollProgress {
+    index: usize,
+    count: Option<usize>,
+}
+
+#[derive(serde::Serialize, Clone)]
+struct RollFrameError {
+    index: usize,
+    message: String,
+}
+
+#[tauri::command]
+fn scan_roll(
+    app: tauri::AppHandle,
+    roll: State<'_, roll::RollState>,
+    detector: State<'_, detect::DetectorState>,
+) -> Result<(), String> {
+    if roll
+        .scanning
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(()); // already running; idempotent from the caller's view
+    }
+    let roll_dir = roll.dir()?;
+    let indices = roll.frames_to_scan()?;
+    // RollState is managed (lives for the app's lifetime), so re-fetching the
+    // `State` via `app.state()` inside the task avoids needing RollState to
+    // be Clone or the borrowed `State` to outlive this function.
+    let detector = detector.inner().clone();
+    let app_for_task = app.clone();
+    tauri::async_runtime::spawn(async move {
+        for index in indices {
+            let roll_state = app_for_task.state::<roll::RollState>();
+            let path = match roll_state.frame_path(index) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = roll_state.record_scan_result(index, None, None);
+                    let _ =
+                        app_for_task.emit("roll-frame-error", RollFrameError { index, message: e });
+                    continue;
+                }
+            };
+            let detector = detector.clone();
+            let outcome = tauri::async_runtime::spawn_blocking(move || {
+                let prepared = images::Images::prepare(&path)?;
+                let probs = detector.detect(&prepared.image)?;
+                let counted = images::components_from_probs(
+                    &probs,
+                    prepared.image.width,
+                    prepared.image.height,
+                    SCAN_THRESHOLD,
+                );
+                let coarsest = prepared
+                    .pyramid
+                    .levels
+                    .last()
+                    .expect("pyramid always has at least one level");
+                Ok::<_, String>((
+                    counted,
+                    coarsest.rgba.clone(),
+                    coarsest.width,
+                    coarsest.height,
+                ))
+                // `prepared` (and its full-res pixels) drops here, at the end
+                // of the blocking closure, before the task moves to the next
+                // frame -- this is the "at most 1 queue frame" memory bound.
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r);
+
+            match outcome {
+                Ok((bboxes, thumb_rgba, tw, th)) => {
+                    let thumb_path = roll::thumb_path(&roll_dir, index);
+                    if let Err(e) = roll::write_thumbnail(&thumb_rgba, tw, th, &thumb_path) {
+                        let _ = app_for_task.emit(
+                            "roll-frame-error",
+                            RollFrameError {
+                                index,
+                                message: format!("thumbnail: {e}"),
+                            },
+                        );
+                    }
+                    let count = bboxes.len();
+                    let _ = roll_state.record_scan_result(index, Some(count), Some(bboxes));
+                    let _ = app_for_task.emit(
+                        "roll-progress",
+                        RollProgress {
+                            index,
+                            count: Some(count),
+                        },
+                    );
+                }
+                Err(message) => {
+                    let _ = roll_state.record_scan_result(index, None, None);
+                    let _ =
+                        app_for_task.emit("roll-frame-error", RollFrameError { index, message });
+                }
+            }
+        }
+        app_for_task
+            .state::<roll::RollState>()
+            .scanning
+            .store(false, Ordering::SeqCst);
+        let _ = app_for_task.emit("roll-done", ());
+    });
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -273,7 +393,8 @@ pub fn run() {
             open_roll,
             activate_frame,
             set_frame_threshold,
-            approve_frame
+            approve_frame,
+            scan_roll
         ])
         .register_uri_scheme_protocol("tiles", |ctx, request| {
             let images = ctx.app_handle().state::<Mutex<Images>>();
@@ -297,4 +418,44 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod roll_queue_tests {
+    use super::*;
+
+    fn fixture_detector() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../engine/fixtures/tiny-detector.onnx")
+    }
+
+    #[test]
+    fn frames_to_scan_lists_only_uncounted_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"x").unwrap();
+        std::fs::write(dir.path().join("b.png"), b"x").unwrap();
+        let state = roll::RollState::default();
+        state.open(dir.path()).unwrap();
+        state.record_scan_result(0, Some(2), Some(vec![])).unwrap();
+        assert_eq!(state.frames_to_scan().unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn detector_state_clone_shares_the_loaded_model() {
+        // Guards the scan_roll assumption that `detector.inner().clone()`
+        // yields a handle that still resolves after the original `State`
+        // borrow is gone (used across an async task boundary).
+        let state = detect::DetectorState::default();
+        state.load(&fixture_detector()).unwrap();
+        let cloned = state.clone();
+        let img = fd_io::ImageBuf {
+            width: 8,
+            height: 8,
+            channels: 1,
+            data: fd_io::PixelData::U8(vec![0; 64]),
+            icc: None,
+            exif: None,
+        };
+        assert!(cloned.detect(&img).is_ok());
+    }
 }

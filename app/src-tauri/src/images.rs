@@ -115,6 +115,26 @@ pub struct Prepared {
     pub(crate) pyramid: Pyramid,
 }
 
+/// Connected-component bounding boxes from a thresholded probability map,
+/// capped at [`MAX_COMPONENTS`]: a pathological mask (bad model or
+/// threshold) can otherwise produce hundreds of thousands of boxes that are
+/// useless for navigation and expensive to serialize. Free function so the
+/// roll background queue (which never inserts its frame into the `Images`
+/// registry -- see `scan_roll`) can compute bboxes without a registry entry.
+pub fn components_from_probs(
+    probs: &[f32],
+    width: u32,
+    height: u32,
+    threshold: f32,
+) -> Vec<[u32; 4]> {
+    let mask: Vec<bool> = probs.iter().map(|&p| p > threshold).collect();
+    fd_heal::components(&mask, width, height)
+        .into_iter()
+        .take(MAX_COMPONENTS)
+        .map(|d| [d.bbox.x0, d.bbox.y0, d.bbox.x1, d.bbox.y1])
+        .collect()
+}
+
 pub struct Images {
     next_id: u64,
     entries: HashMap<u64, Entry>,
@@ -294,15 +314,8 @@ impl Images {
     pub fn components(&self, id: u64, threshold: f32) -> Option<Vec<[u32; 4]>> {
         let entry = self.entries.get(&id)?;
         let (probs, _) = entry.probs.as_ref()?;
-        let mask: Vec<bool> = probs.iter().map(|&p| p > threshold).collect();
         let (w, h) = (entry.image.width, entry.image.height);
-        Some(
-            fd_heal::components(&mask, w, h)
-                .into_iter()
-                .take(MAX_COMPONENTS)
-                .map(|d| [d.bbox.x0, d.bbox.y0, d.bbox.x1, d.bbox.y1])
-                .collect(),
-        )
+        Some(components_from_probs(probs, w, h, threshold))
     }
 
     pub fn close(&mut self, id: u64) {
@@ -457,6 +470,20 @@ mod tests {
         let info = images.open(&path).unwrap();
         assert!(!images.set_probs(info.id, vec![0.0; 10]));
         assert!(images.components(info.id, 0.5).is_none()); // nothing stored
+    }
+
+    #[test]
+    fn components_from_probs_matches_the_method_it_replaces() {
+        let mut probs = vec![0.0f32; 600 * 400];
+        for y in 100..104 {
+            for x in 200..205 {
+                probs[y * 600 + x] = 0.8;
+            }
+        }
+        let direct = components_from_probs(&probs, 600, 400, 0.5);
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0], [200, 100, 205, 104]);
+        assert!(components_from_probs(&probs, 600, 400, 0.9).is_empty());
     }
 
     #[test]
