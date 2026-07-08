@@ -35,7 +35,10 @@ pub fn tile_response(images: &Mutex<Images>, path: &str) -> tauri::http::Respons
             .header("Access-Control-Allow-Origin", "*")
             // Without this, cross-origin JS sees the custom headers as null
             // and uploads 0x0 textures: a blank canvas with no errors.
-            .header("Access-Control-Expose-Headers", "x-tile-width, x-tile-height");
+            .header(
+                "Access-Control-Expose-Headers",
+                "x-tile-width, x-tile-height",
+            );
         if status == 200 {
             builder = builder
                 .header("x-tile-width", w.to_string())
