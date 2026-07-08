@@ -17,7 +17,17 @@ fn drop_alpha<T: Copy>(data: &[T]) -> Vec<T> {
 
 pub fn decode(path: &Path) -> Result<ImageBuf, IoError> {
     let file = File::open(path).map_err(|e| decode_err(path, e))?;
-    let mut d = Decoder::new(file).map_err(|e| decode_err(path, e))?;
+    // Scanner software often writes the whole image as ONE strip; a 100MP
+    // 16-bit scan then needs a ~600MB decode buffer, far past the tiff
+    // crate's defaults. Bounded (not unlimited) so a hostile file cannot
+    // demand arbitrary allocations: 2GB covers 250MP 16-bit RGB with room.
+    let mut limits = tiff::decoder::Limits::default();
+    limits.decoding_buffer_size = 2 * 1024 * 1024 * 1024;
+    limits.intermediate_buffer_size = 2 * 1024 * 1024 * 1024;
+    limits.ifd_value_size = 8 * 1024 * 1024;
+    let mut d = Decoder::new(file)
+        .map_err(|e| decode_err(path, e))?
+        .with_limits(limits);
     let (width, height) = d.dimensions().map_err(|e| decode_err(path, e))?;
     let color = d.colortype().map_err(|e| decode_err(path, e))?;
     // The tiff crate may hand the ICC tag back as bytes or as a list of

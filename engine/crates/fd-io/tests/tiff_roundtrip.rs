@@ -63,3 +63,25 @@ fn tiff_rgba_input_drops_alpha() {
         _ => panic!("expected 8-bit"),
     }
 }
+
+#[test]
+fn tiff_single_strip_100mp_scan_decodes() {
+    // Scanner software (and tifffile) often writes the whole image as one
+    // strip; a 96MP grey u16 strip is 192MB, past the tiff crate's default
+    // decode limits. The spec requires ~100MP scans, so decode raises them.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.tif");
+    let (w, h) = (12000u32, 8000u32);
+    {
+        let file = std::fs::File::create(&path).unwrap();
+        let mut t = tiff::encoder::TiffEncoder::new(file).unwrap();
+        let mut image = t
+            .new_image::<tiff::encoder::colortype::Gray16>(w, h)
+            .unwrap();
+        image.rows_per_strip(h).unwrap(); // everything in one strip
+        let data: Vec<u16> = (0..(w * h) as usize).map(|i| (i % 65521) as u16).collect();
+        image.write_data(&data).unwrap();
+    }
+    let back = decode(&path).unwrap();
+    assert_eq!((back.width, back.height), (w, h));
+}
