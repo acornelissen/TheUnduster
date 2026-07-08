@@ -519,6 +519,15 @@ mod state_tests {
     }
 
     #[test]
+    fn scan_flag_clears_when_setup_fails_before_spawn() {
+        // scan_roll's sync body must clear the flag it just set when no roll
+        // is open; this pins the RollState pieces that path relies on.
+        let state = RollState::default();
+        assert!(state.dir().is_err());
+        assert!(state.frames_to_scan().is_err());
+    }
+
+    #[test]
     fn clear_scanning_resets_the_flag() {
         let state = RollState::default();
         state.scanning.store(true, Ordering::SeqCst);

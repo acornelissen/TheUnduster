@@ -302,8 +302,16 @@ fn scan_roll(
     {
         return Ok(()); // already running; idempotent from the caller's view
     }
-    let roll_dir = roll.dir()?;
-    let indices = roll.frames_to_scan()?;
+    // The flag is set; if either lookup fails (no roll open) it must be
+    // cleared here, since the task carrying the drop guard never spawns.
+    let setup = roll.dir().and_then(|dir| Ok((dir, roll.frames_to_scan()?)));
+    let (roll_dir, indices) = match setup {
+        Ok(v) => v,
+        Err(e) => {
+            roll.clear_scanning();
+            return Err(e);
+        }
+    };
     // RollState is managed (lives for the app's lifetime), so re-fetching the
     // `State` via `app.state()` inside the task avoids needing RollState to
     // be Clone or the borrowed `State` to outlive this function.
