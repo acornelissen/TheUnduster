@@ -70,13 +70,18 @@
 
   function onWheel(e: WheelEvent) {
     e.preventDefault();
-    zoomAt(e.deltaY < 0 ? 1.15 : 1 / 1.15, e.offsetX, e.offsetY);
+    const dpr = window.devicePixelRatio || 1;
+    zoomAt(e.deltaY < 0 ? 1.15 : 1 / 1.15, e.offsetX * dpr, e.offsetY * dpr);
   }
 
   function onPointerMove(e: PointerEvent) {
     if (!dragging) return;
-    centerX -= e.movementX / zoom;
-    centerY -= e.movementY / zoom;
+    // e.movementX/Y are CSS px but zoom relates image px to device px
+    // (canvas.width is device px, see resize()), so convert to device px
+    // here too or panning under-shoots by 1/dpr on HiDPI displays.
+    const dpr = window.devicePixelRatio || 1;
+    centerX -= (e.movementX * dpr) / zoom;
+    centerY -= (e.movementY * dpr) / zoom;
     clampCenter();
     requestFrame();
   }

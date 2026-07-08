@@ -36,6 +36,9 @@ export class TextureStore<T> {
   }
 
   put(key: string, value: T, bytes: number): void {
+    // Invariant: a single entry larger than the whole budget is never evicted
+    // (the `entries.size <= 1` guard below keeps it), which is safe only
+    // because max tile bytes (512*512*4 = 1MB) stays far below the budget.
     this.entries.set(key, { value, bytes });
     this.used += bytes;
     for (const [k, e] of this.entries) {
