@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 
 from unduster_training.dataset import SyntheticDefects
@@ -42,3 +43,12 @@ def test_deterministic_per_index(tmp_path):
     xa, ya = a[3]
     xb, yb = b[3]
     assert torch.equal(xa, xb) and torch.equal(ya, yb)
+
+
+def test_small_clean_image_raises(tmp_path):
+    root = _setup(tmp_path)
+    save_image(root / "tiny.png", np.full((100, 150, 3), 0.5, np.float32), bit_depth=8)
+    ds = SyntheticDefects(root, root / "lib", patch=256, length=8, seed=0)
+    with pytest.raises(ValueError, match="tiny.png"):
+        for i in range(len(ds)):
+            ds[i]  # tiny.png will be picked within a few draws

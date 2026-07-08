@@ -40,8 +40,14 @@ class SyntheticDefects(Dataset):
 
     def __getitem__(self, i: int) -> tuple[torch.Tensor, torch.Tensor]:
         rng = np.random.default_rng((self.seed << 32) + i)
-        img = load_image(self.files[int(rng.integers(len(self.files)))])
+        file_idx = int(rng.integers(len(self.files)))
+        img = load_image(self.files[file_idx])
         p = self.patch
+        if img.shape[0] < p or img.shape[1] < p:
+            raise ValueError(
+                f"clean image {self.files[file_idx].name} is {img.shape[1]}x{img.shape[0]}, "
+                f"smaller than patch size {p}; remove it or use a smaller --patch"
+            )
         y0 = int(rng.integers(0, max(img.shape[0] - p, 1)))
         x0 = int(rng.integers(0, max(img.shape[1] - p, 1)))
         crop = img[y0 : y0 + p, x0 : x0 + p]
