@@ -2,9 +2,21 @@ use std::sync::Mutex;
 
 use crate::images::Images;
 
-/// Parse "/{id}/{level}/{tx}/{ty}" (leading slash optional).
-pub fn parse_tile_path(path: &str) -> Option<(u64, u8, u32, u32)> {
-    let mut parts = path.trim_start_matches('/').split('/');
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Layer {
+    Rgba,
+    Probs,
+}
+
+/// Parse "/{id}/{level}/{tx}/{ty}" or "/probs/{id}/{level}/{tx}/{ty}" (leading slash optional).
+/// Returns (Layer, id, level, tx, ty).
+pub fn parse_tile_path(path: &str) -> Option<(Layer, u64, u8, u32, u32)> {
+    let trimmed = path.trim_start_matches('/');
+    let (layer, rest) = match trimmed.strip_prefix("probs/") {
+        Some(rest) => (Layer::Probs, rest),
+        None => (Layer::Rgba, trimmed),
+    };
+    let mut parts = rest.split('/');
     let id = parts.next()?.parse().ok()?;
     let level = parts.next()?.parse().ok()?;
     let tx = parts.next()?.parse().ok()?;
@@ -12,7 +24,7 @@ pub fn parse_tile_path(path: &str) -> Option<(u64, u8, u32, u32)> {
     if parts.next().is_some() {
         return None;
     }
-    Some((id, level, tx, ty))
+    Some((layer, id, level, tx, ty))
 }
 
 pub fn tile_response(images: &Mutex<Images>, path: &str) -> tauri::http::Response<Vec<u8>> {
@@ -30,15 +42,21 @@ pub fn tile_response(images: &Mutex<Images>, path: &str) -> tauri::http::Respons
             .body(body)
             .expect("static response headers are valid")
     };
-    let Some((id, level, tx, ty)) = parse_tile_path(path) else {
+    let Some((layer, id, level, tx, ty)) = parse_tile_path(path) else {
         return respond(400, Vec::new(), 0, 0);
     };
     let Ok(mut images) = images.lock() else {
         return respond(500, Vec::new(), 0, 0);
     };
-    match images.tile(id, level, tx, ty) {
-        Some(tile) => respond(200, tile.rgba.clone(), tile.width, tile.height),
-        None => respond(404, Vec::new(), 0, 0),
+    match layer {
+        Layer::Rgba => match images.tile(id, level, tx, ty) {
+            Some(tile) => respond(200, tile.rgba.clone(), tile.width, tile.height),
+            None => respond(404, Vec::new(), 0, 0),
+        },
+        Layer::Probs => match images.prob_tile(id, level, tx, ty) {
+            Some((w, h, bytes)) => respond(200, bytes, w, h),
+            None => respond(404, Vec::new(), 0, 0),
+        },
     }
 }
 
@@ -48,8 +66,8 @@ mod tests {
 
     #[test]
     fn parses_valid_paths() {
-        assert_eq!(parse_tile_path("/3/1/7/2"), Some((3, 1, 7, 2)));
-        assert_eq!(parse_tile_path("3/1/7/2"), Some((3, 1, 7, 2)));
+        assert_eq!(parse_tile_path("/3/1/7/2"), Some((Layer::Rgba, 3, 1, 7, 2)));
+        assert_eq!(parse_tile_path("3/1/7/2"), Some((Layer::Rgba, 3, 1, 7, 2)));
     }
 
     #[test]
@@ -62,9 +80,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_probs_layer() {
+        assert_eq!(
+            parse_tile_path("/probs/3/1/7/2"),
+            Some((Layer::Probs, 3, 1, 7, 2))
+        );
+        assert_eq!(parse_tile_path("/3/1/7/2"), Some((Layer::Rgba, 3, 1, 7, 2)));
+        assert_eq!(parse_tile_path("/probs/3/1/7"), None);
+        assert_eq!(parse_tile_path("/unknown/3/1/7/2"), None);
+    }
+
+    #[test]
     fn missing_tile_is_404_and_malformed_is_400() {
         let images = Mutex::new(Images::default());
         assert_eq!(tile_response(&images, "/1/0/0/0").status(), 404);
         assert_eq!(tile_response(&images, "/nope").status(), 400);
+    }
+
+    #[test]
+    fn probs_tile_404_before_detection() {
+        let images = Mutex::new(Images::default());
+        assert_eq!(tile_response(&images, "/probs/1/0/0/0").status(), 404);
     }
 }

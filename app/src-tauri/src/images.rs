@@ -14,8 +14,6 @@ pub struct ProbLevel {
 }
 
 pub struct ProbPyramid {
-    // Read by `prob_tile`, consumed by Task 4's prob-layer protocol route.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub levels: Vec<ProbLevel>,
 }
 
@@ -62,8 +60,6 @@ pub fn build_prob_pyramid(probs: &[f32], level_dims: &[(u32, u32)]) -> ProbPyram
 
 /// Extract a single-channel tile from a level's data, mirroring
 /// `Pyramid::tile`'s grid/edge-size logic.
-// Consumed by `prob_tile`, which Task 4's protocol route wires up.
-#[cfg_attr(not(test), allow(dead_code))]
 fn level_tile(
     width: u32,
     height: u32,
