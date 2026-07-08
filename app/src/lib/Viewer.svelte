@@ -61,10 +61,19 @@
     requestFrame();
   }
 
+  /** One source of truth for defect markers, shared by z/Z navigation and
+   * the ring pass: live detections once a detect has run (even when empty --
+   * raising the threshold to zero components must not resurrect stale
+   * boxes), otherwise the roll queue's stored 0.5-threshold bboxes. */
+  function markerSource(): [number, number, number, number][] {
+    return detected ? detections : (bboxes ?? []);
+  }
+
   function cycleDetection(dir: 1 | -1) {
-    if (!detections.length) return;
-    current = (current + dir + detections.length) % detections.length;
-    const [x0, y0, x1, y1] = detections[current];
+    const source = markerSource();
+    if (!source.length) return;
+    current = (current + dir + source.length) % source.length;
+    const [x0, y0, x1, y1] = source[current];
     zoom = 1;
     centerX = (x0 + x1) / 2;
     centerY = (y0 + y1) / 2;
@@ -119,12 +128,13 @@
     if (renderer && needsFrame) {
       needsFrame = false;
       renderer.draw(tilePaths(), canvas.width, canvas.height, overlay);
-      // A live detect that legitimately finds zero components must not fall
-      // back to the (possibly stale, 0.5-threshold) sidecar boxes -- only
-      // fall back when no live detect has happened at all (`detected` is
-      // false), not merely when the live result happens to be empty.
-      const source = detected ? detections : (bboxes ?? []);
-      if (zoom < 0.5 && source.length > 0) {
+      // Rings mark defects whenever the red probability tint cannot: always
+      // for queue bboxes (no prob tiles exist before a live detect, at any
+      // zoom), and below 50% zoom for live detections, where the tint is
+      // sub-pixel. Past that, the tint takes over and rings would clutter.
+      const source = markerSource();
+      const ringsVisible = !detected || zoom < 0.5;
+      if (ringsVisible && source.length > 0) {
         const rings = ringsFor(source, zoom, centerX, centerY, canvas.width, canvas.height, 12);
         renderer.drawRings(rings, canvas.width, canvas.height);
       }

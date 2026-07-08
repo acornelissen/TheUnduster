@@ -333,6 +333,11 @@
       <p class="status" role="status">
         {#if detected && componentsAtHalf !== null}
           {componentsAtHalf} defect{componentsAtHalf === 1 ? "" : "s"} at 50%
+        {:else if roll && roll.frames[currentIndex].defect_count !== null}
+          {roll.frames[currentIndex].defect_count} defect{roll.frames[currentIndex]
+            .defect_count === 1
+            ? ""
+            : "s"} at 50% (scanned)
         {:else}
           Not yet detected
         {/if}
@@ -352,7 +357,21 @@
   </header>
   <section class="stage">
     {#if loading}
-      <p class="hint" role="status" aria-busy="true">{loading}...</p>
+      {#if roll}
+        <!-- Full decode of a large frame takes tens of seconds; show the
+             cached queue thumbnail scaled up so the operator sees WHAT is
+             loading, not just that something is. -->
+        <div class="stage-preview" role="status" aria-busy="true">
+          <img
+            src={`tiles://localhost/thumb/${currentIndex}?v=${thumbVersions[currentIndex] ?? 0}`}
+            alt=""
+            onerror={(e) => ((e.currentTarget as HTMLImageElement).style.display = "none")}
+          />
+          <p class="hint">{loading}...</p>
+        </div>
+      {:else}
+        <p class="hint" role="status" aria-busy="true">{loading}...</p>
+      {/if}
     {:else if info}
       {#key info.id}
         <Viewer
@@ -416,6 +435,25 @@
     flex: 1;
     min-height: 0;
   }
+  .stage-preview {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+  }
+  .stage-preview img {
+    max-height: 70%;
+    max-width: 80%;
+    image-rendering: auto;
+    filter: blur(2px) brightness(0.8);
+    border-radius: 4px;
+  }
+  .stage-preview .hint {
+    margin: 0;
+  }
+
   .hint {
     text-align: center;
     color: #999;
