@@ -174,9 +174,15 @@ pub fn run() {
             #[cfg(debug_assertions)]
             {
                 use tauri::Manager;
-                let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../engine/fixtures/tiny-detector.onnx");
-                let _ = app.state::<detect::DetectorState>().load(&fixture);
+                // Prefer the trained demo model; the random-weight tiny
+                // detector exists only for protocol tests and fires on
+                // everything when pointed at real scans.
+                let fixtures =
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../engine/fixtures");
+                let state = app.state::<detect::DetectorState>();
+                if state.load(&fixtures.join("demo-detector.onnx")).is_err() {
+                    let _ = state.load(&fixtures.join("tiny-detector.onnx"));
+                }
             }
             Ok(())
         })

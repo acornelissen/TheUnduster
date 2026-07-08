@@ -7,6 +7,9 @@ use serde::Serialize;
 
 const CACHE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
+/// Upper bound on defect bboxes returned to the UI; see [`Images::components`].
+pub const MAX_COMPONENTS: usize = 2000;
+
 pub struct ProbLevel {
     pub width: u32,
     pub height: u32,
@@ -278,7 +281,9 @@ impl Images {
     }
 
     /// Connected-component bounding boxes from the native-res thresholded
-    /// probability map.
+    /// probability map, capped at [`MAX_COMPONENTS`]: a pathological mask
+    /// (bad model or threshold) can otherwise produce hundreds of thousands
+    /// of boxes that are useless for navigation and expensive to serialize.
     pub fn components(&self, id: u64, threshold: f32) -> Option<Vec<[u32; 4]>> {
         let entry = self.entries.get(&id)?;
         let (probs, _) = entry.probs.as_ref()?;
@@ -287,6 +292,7 @@ impl Images {
         Some(
             fd_heal::components(&mask, w, h)
                 .into_iter()
+                .take(MAX_COMPONENTS)
                 .map(|d| [d.bbox.x0, d.bbox.y0, d.bbox.x1, d.bbox.y1])
                 .collect(),
         )
@@ -407,6 +413,33 @@ mod tests {
         assert_eq!((b[0], b[1], b[2], b[3]), (200, 100, 205, 104));
         assert!(images.prob_tile(999, 0, 0, 0).is_none());
         assert!(images.components(info.id, 0.9).unwrap().is_empty());
+    }
+
+    #[test]
+    fn components_list_is_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_png(&dir, 600, 400);
+        let mut images = Images::default();
+        let info = images.open(&path).unwrap();
+        // 2500 isolated single-pixel defects on an 8px grid
+        let mut probs = vec![0.0f32; 600 * 400];
+        let mut painted = 0;
+        'outer: for gy in 0..50 {
+            for gx in 0..50 {
+                let (x, y) = (gx * 8 + 4, gy * 8 + 4);
+                if x < 600 && y < 400 {
+                    probs[y * 600 + x] = 0.9;
+                    painted += 1;
+                    if painted == 2500 {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        assert!(painted > MAX_COMPONENTS);
+        assert!(images.set_probs(info.id, probs));
+        let comps = images.components(info.id, 0.5).unwrap();
+        assert_eq!(comps.len(), MAX_COMPONENTS);
     }
 
     #[test]
