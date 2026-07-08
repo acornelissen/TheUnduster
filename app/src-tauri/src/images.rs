@@ -78,8 +78,6 @@ impl Images {
             .get_or_insert(key, || pyramid.tile(level, tx, ty))
     }
 
-    /// Consumed by a later task that wires image lifecycle cleanup to the UI.
-    #[allow(dead_code)]
     pub fn close(&mut self, id: u64) {
         self.entries.remove(&id);
         self.cache.evict_image(id);

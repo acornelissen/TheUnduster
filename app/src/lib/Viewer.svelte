@@ -126,7 +126,7 @@
 
 <canvas
   bind:this={canvas}
-  role="img"
+  role="application"
   aria-label="Scan viewer: arrows pan, plus and minus zoom, 0 fits, 1 is 100%"
   tabindex="0"
   onwheel={onWheel}
@@ -135,6 +135,7 @@
     canvas.setPointerCapture(e.pointerId);
   }}
   onpointerup={() => (dragging = false)}
+  onpointercancel={() => (dragging = false)}
   onpointermove={onPointerMove}
   onkeydown={onKey}
 ></canvas>

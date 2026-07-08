@@ -14,12 +14,19 @@ fn open_image(state: State<'_, Mutex<Images>>, path: String) -> Result<ImageInfo
     images.open(std::path::Path::new(&path))
 }
 
+#[tauri::command]
+fn close_image(state: State<'_, Mutex<Images>>, id: u64) -> Result<(), String> {
+    let mut images = state.lock().map_err(|e| e.to_string())?;
+    images.close(id);
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Mutex::new(Images::default()))
-        .invoke_handler(tauri::generate_handler![open_image])
+        .invoke_handler(tauri::generate_handler![open_image, close_image])
         .register_uri_scheme_protocol("tiles", |ctx, request| {
             let images = ctx.app_handle().state::<Mutex<Images>>();
             protocol::tile_response(&images, request.uri().path())

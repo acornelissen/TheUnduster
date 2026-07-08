@@ -21,10 +21,19 @@
       filters: [{ name: "Scans", extensions: ["tif", "tiff", "png", "jpg", "jpeg"] }],
     });
     if (typeof path !== "string") return;
+    const previousId = info?.id;
     try {
       info = await invoke<ImageInfo>("open_image", { path });
     } catch (e) {
       error = String(e);
+      return;
+    }
+    if (previousId !== undefined) {
+      try {
+        await invoke("close_image", { id: previousId });
+      } catch {
+        // best effort cleanup; the replaced image just lingers in the cache
+      }
     }
   }
 </script>
@@ -36,7 +45,9 @@
   </header>
   <section class="stage">
     {#if info}
-      <Viewer {info} />
+      {#key info.id}
+        <Viewer {info} />
+      {/key}
     {:else}
       <p class="hint">Open a scan to begin.</p>
     {/if}

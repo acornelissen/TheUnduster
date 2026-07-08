@@ -1,3 +1,5 @@
+import { TILE } from "./viewport";
+
 const VERT = `#version 300 es
 in vec2 pos;
 in vec2 uv;
@@ -146,8 +148,8 @@ export class TileRenderer {
       if (!tex) continue;
       // edge tiles are smaller than 512: scale the drawn quad by the real
       // tile fraction so partial tiles are not stretched
-      const w = t.screenW * (t.tileW / 512);
-      const h = t.screenH * (t.tileH / 512);
+      const w = t.screenW * (t.tileW / TILE);
+      const h = t.screenH * (t.tileH / TILE);
       const x0 = t.screenX;
       const y0 = t.screenY;
       const verts = new Float32Array([
