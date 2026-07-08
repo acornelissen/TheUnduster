@@ -187,6 +187,13 @@ impl Images {
         Ok(self.insert(prepared))
     }
 
+    /// Ids currently in the registry; dev-build tile-404 diagnostics only.
+    pub fn known_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self.entries.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
     pub fn image(&self, id: u64) -> Option<Arc<fd_io::ImageBuf>> {
         self.entries.get(&id).map(|e| e.image.clone())
     }

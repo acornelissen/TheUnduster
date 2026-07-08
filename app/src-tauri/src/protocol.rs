@@ -43,6 +43,8 @@ pub fn tile_response(images: &Mutex<Images>, path: &str) -> tauri::http::Respons
             .expect("static response headers are valid")
     };
     let Some((layer, id, level, tx, ty)) = parse_tile_path(path) else {
+        #[cfg(debug_assertions)]
+        eprintln!("[tiles] 400 malformed path: {path}");
         return respond(400, Vec::new(), 0, 0);
     };
     let Ok(mut images) = images.lock() else {
@@ -51,11 +53,24 @@ pub fn tile_response(images: &Mutex<Images>, path: &str) -> tauri::http::Respons
     match layer {
         Layer::Rgba => match images.tile(id, level, tx, ty) {
             Some(tile) => respond(200, tile.rgba.clone(), tile.width, tile.height),
-            None => respond(404, Vec::new(), 0, 0),
+            None => {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[tiles] 404 rgba {path}: known image ids {:?}",
+                    images.known_ids()
+                );
+                respond(404, Vec::new(), 0, 0)
+            }
         },
         Layer::Probs => match images.prob_tile(id, level, tx, ty) {
             Some((w, h, bytes)) => respond(200, bytes, w, h),
-            None => respond(404, Vec::new(), 0, 0),
+            None => {
+                // Expected pre-detection; still logged in dev so blank-canvas
+                // sessions can tell harmless probs 404s from real rgba ones.
+                #[cfg(debug_assertions)]
+                eprintln!("[tiles] 404 probs {path} (no detection yet is normal)");
+                respond(404, Vec::new(), 0, 0)
+            }
         },
     }
 }
