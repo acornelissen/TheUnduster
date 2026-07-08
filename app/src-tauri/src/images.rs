@@ -224,8 +224,6 @@ impl Images {
     }
 
     /// Single-channel probability tile, edge-sized like RGBA tiles.
-    // Consumed by Task 4's prob-layer protocol route.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn prob_tile(
         &mut self,
         id: u64,
