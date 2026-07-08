@@ -14,15 +14,18 @@ def export_onnx(ckpt_path: str | Path, onnx_path: str | Path) -> None:
     model, meta = load_checkpoint(ckpt_path)
     model.eval()
     dummy = torch.zeros(1, meta["in_ch"], 512, 512)
+    n = torch.export.Dim("n")
+    h = torch.export.Dim("h")
+    w = torch.export.Dim("w")
     torch.onnx.export(
         model,
-        dummy,
+        (dummy,),
         str(onnx_path),
         input_names=["image"],
         output_names=["logits"],
-        dynamic_axes={"image": {0: "n", 2: "h", 3: "w"}, "logits": {0: "n", 2: "h", 3: "w"}},
+        dynamic_shapes={"x": {0: n, 2: h, 3: w}},
         opset_version=17,
-        dynamo=False,
+        dynamo=True,
     )
 
 
