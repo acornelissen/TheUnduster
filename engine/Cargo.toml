@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crates/fd-io", "crates/fd-tiles", "crates/fd-infer", "crates/fd-heal"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+thiserror = "2"

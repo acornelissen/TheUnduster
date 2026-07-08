@@ -1,0 +1,6 @@
+[package]
+name = "fd-tiles"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]

@@ -1,0 +1,13 @@
+[package]
+name = "fd-io"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+tiff = "0.9"
+img-parts = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

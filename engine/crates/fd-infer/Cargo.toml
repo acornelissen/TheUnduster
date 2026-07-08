@@ -1,0 +1,6 @@
+[package]
+name = "fd-infer"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
