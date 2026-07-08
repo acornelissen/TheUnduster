@@ -377,7 +377,7 @@
     if (!roll) return;
     // Roll navigation keys must not fire while the operator is typing in a
     // form control (e.g. the sensitivity slider has focus via keyboard, or
-    // any future text input) -- "," "." and "A" are ordinary characters.
+    // any future text input) -- "," "." and "a" are ordinary characters.
     if (isTypingTarget(e.target)) return;
     // Only handle roll-navigation keys; everything else (arrows, d/m/z/Z)
     // stays owned by the canvas via its own onkeydown so focus there keeps
@@ -388,7 +388,7 @@
     } else if (e.key === ".") {
       e.preventDefault();
       stepFrame(1);
-    } else if (e.key === "A") {
+    } else if (e.key === "a" || e.key === "A") {
       e.preventDefault();
       void approveAndAdvance();
     }
@@ -402,6 +402,12 @@
     <button onclick={openScan} disabled={loading !== null}>Open scan</button>
     <button onclick={openRoll} disabled={loading !== null}>Open roll</button>
     {#if roll}
+      <button
+        onclick={approveAndAdvance}
+        disabled={roll.frames[currentIndex].approved}
+      >
+        {roll.frames[currentIndex].approved ? "Approved" : "Approve"}
+      </button>
       <button
         onclick={exportApproved}
         disabled={exporting || roll.frames.every((f) => !f.approved)}
