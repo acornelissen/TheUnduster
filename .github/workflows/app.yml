@@ -1,0 +1,47 @@
+name: app
+
+on:
+  push:
+    paths:
+      - "app/**"
+      - "engine/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/app.yml"
+  pull_request:
+    paths:
+      - "app/**"
+      - "engine/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/app.yml"
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run check
+      - run: npm run test
+
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Tauri linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - run: cargo test -p unduster-app
+      - run: cargo clippy -p unduster-app --all-targets -- -D warnings
