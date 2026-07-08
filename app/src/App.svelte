@@ -4,6 +4,7 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import Viewer from "./lib/Viewer.svelte";
   import Filmstrip from "./lib/Filmstrip.svelte";
+  import { nextUnapprovedIndex } from "./lib/roll-nav";
   import type { Level } from "./lib/viewport";
 
   interface ImageInfo {
@@ -177,7 +178,12 @@
       error = String(e);
       return;
     }
-    const next = roll.frames.findIndex((f, i) => i > currentIndex && !f.approved);
+    // Wrapping search: an operator may approve out of order, and A should
+    // always land on remaining work anywhere in the roll until none is left.
+    const next = nextUnapprovedIndex(
+      roll.frames.map((f) => f.approved),
+      currentIndex,
+    );
     if (next !== -1) {
       currentIndex = next;
       await activateCurrentFrame();
@@ -227,7 +233,7 @@
   function isTypingTarget(target: EventTarget | null): boolean {
     if (!(target instanceof HTMLElement)) return false;
     const tag = target.tagName;
-    return tag === "INPUT" || tag === "TEXTAREA" || target.isContentEditable;
+    return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target.isContentEditable;
   }
 
   function onWindowKey(e: KeyboardEvent) {

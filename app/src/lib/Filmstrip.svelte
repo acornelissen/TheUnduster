@@ -59,7 +59,6 @@
   class="filmstrip"
   role="listbox"
   aria-label="Roll frames"
-  aria-activedescendant={`frame-${focusIndex}`}
 >
   {#each frames as frame (frame.index)}
     <div
