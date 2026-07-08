@@ -156,8 +156,39 @@ fn components(
 }
 
 #[tauri::command]
-fn open_roll(state: State<'_, roll::RollState>, dir: String) -> Result<roll::RollInfo, String> {
-    state.open(std::path::Path::new(&dir))
+fn open_roll(
+    roll: State<'_, roll::RollState>,
+    images: State<'_, Mutex<Images>>,
+    dir: String,
+) -> Result<roll::RollInfo, String> {
+    let (info, stale_ids) = roll.open(std::path::Path::new(&dir))?;
+    if !stale_ids.is_empty() {
+        let mut images = images.lock().map_err(|e| e.to_string())?;
+        for id in stale_ids {
+            images.close(id);
+        }
+    }
+    Ok(info)
+}
+
+/// Closes whatever roll is currently open (if any), releasing its live
+/// activated frames from `Images`. Used when the operator opens a single
+/// scan while a roll was open: `App.svelte`'s `openScan` previously just
+/// nulled the client-side `roll` reference, leaking any activated frame ids
+/// server-side.
+#[tauri::command]
+fn close_roll(
+    roll: State<'_, roll::RollState>,
+    images: State<'_, Mutex<Images>>,
+) -> Result<(), String> {
+    let stale_ids = roll.close()?;
+    if !stale_ids.is_empty() {
+        let mut images = images.lock().map_err(|e| e.to_string())?;
+        for id in stale_ids {
+            images.close(id);
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -180,7 +211,7 @@ async fn activate_frame(
                     .level_dims(id)
                     .ok_or_else(|| format!("no image {id}"))?
             };
-            return Ok(ImageInfo {
+            let info = ImageInfo {
                 id,
                 width: image.width,
                 height: image.height,
@@ -188,7 +219,13 @@ async fn activate_frame(
                     .into_iter()
                     .map(|(width, height)| images::LevelInfo { width, height })
                     .collect(),
-            });
+            };
+            // Reuse path never emits "decoding"/"building-pyramid", but the
+            // frontend's loading state is only cleared on "ready" -- without
+            // this emit, reactivating a cached frame wedges the loader
+            // forever since no terminal event ever arrives.
+            let _ = app.emit("app-progress", Progress { id, stage: "ready" });
+            return Ok(info);
         }
     }
 
@@ -317,10 +354,26 @@ fn scan_roll(
     // be Clone or the borrowed `State` to outlive this function.
     let detector = detector.inner().clone();
     let app_for_task = app.clone();
+    // Snapshot the generation this scan is running against. `RollState::open`
+    // and `close` each bump it, so if the roll is replaced or torn down
+    // mid-scan the loop below detects the mismatch and bails before touching
+    // the (now wrong) roll_dir/sidecar -- see the generation check just
+    // inside the loop for the actual enforcement point.
+    let generation = roll.generation();
     tauri::async_runtime::spawn(async move {
         let _scan_flag_guard = ScanFlagGuard(app_for_task.clone());
         for index in indices {
             let roll_state = app_for_task.state::<roll::RollState>();
+            // Enforcement point: a roll swap/close bumped the generation
+            // counter since this task spawned, so `roll_dir`/`indices`
+            // (captured once, above) no longer describe the roll that's
+            // open now. Stop rather than writing this frame's thumbnail
+            // into the old roll's directory or its result into the new
+            // roll's sidecar. `ScanFlagGuard` clears the scanning flag on
+            // the way out, so a fresh scan of the new roll can start.
+            if roll_state.generation() != generation {
+                break;
+            }
             let path = match roll_state.frame_path(index) {
                 Ok(p) => p,
                 Err(e) => {
@@ -330,6 +383,14 @@ fn scan_roll(
                     continue;
                 }
             };
+            // Thumbnails are keyed by file name, not index (see
+            // `roll::thumb_path`), so indices that shift across sessions
+            // never pair a frame with another image's stale thumbnail.
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
             let detector = detector.clone();
             let outcome = tauri::async_runtime::spawn_blocking(move || {
                 let prepared = images::Images::prepare(&path)?;
@@ -361,7 +422,7 @@ fn scan_roll(
 
             match outcome {
                 Ok((bboxes, thumb_rgba, tw, th)) => {
-                    let thumb_path = roll::thumb_path(&roll_dir, index);
+                    let thumb_path = roll::thumb_path(&roll_dir, &file_name);
                     if let Err(e) = roll::write_thumbnail(&thumb_rgba, tw, th, &thumb_path) {
                         let _ = app_for_task.emit(
                             "roll-frame-error",
@@ -407,6 +468,7 @@ pub fn run() {
             detect,
             components,
             open_roll,
+            close_roll,
             activate_frame,
             set_frame_threshold,
             approve_frame,

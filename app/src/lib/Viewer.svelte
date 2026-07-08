@@ -116,7 +116,11 @@
     if (renderer && needsFrame) {
       needsFrame = false;
       renderer.draw(tilePaths(), canvas.width, canvas.height, overlay);
-      const source = detections.length > 0 ? detections : bboxes ?? [];
+      // A live detect that legitimately finds zero components must not fall
+      // back to the (possibly stale, 0.5-threshold) sidecar boxes -- only
+      // fall back when no live detect has happened at all (`detected` is
+      // false), not merely when the live result happens to be empty.
+      const source = detected ? detections : (bboxes ?? []);
       if (zoom < 0.5 && source.length > 0) {
         const rings = ringsFor(source, zoom, centerX, centerY, canvas.width, canvas.height, 12);
         renderer.drawRings(rings, canvas.width, canvas.height);

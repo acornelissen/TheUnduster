@@ -2,7 +2,7 @@
 //! Tauri commands in `lib.rs` drive.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -111,8 +111,14 @@ pub fn write_thumbnail(
     fd_io::encode(out_path, &img).map_err(|e| e.to_string())
 }
 
-pub fn thumb_path(dir: &Path, index: usize) -> PathBuf {
-    thumbs_dir(dir).join(format!("{index:04}.png"))
+/// Thumbnail path for a frame, keyed by its full file name (including
+/// extension, e.g. `raw0001.tiff.png`) rather than its index -- indices shift
+/// when files are added/removed between sessions (`merge` in this module),
+/// which would otherwise silently pair a frame with a stale thumbnail for a
+/// different image. The extension is kept in the key (not stripped to the
+/// stem) to avoid collisions between same-stem files of different formats.
+pub fn thumb_path(dir: &Path, file_name: &str) -> PathBuf {
+    thumbs_dir(dir).join(format!("{file_name}.png"))
 }
 
 fn list_image_files(dir: &Path) -> Result<Vec<String>, String> {
@@ -286,14 +292,58 @@ pub struct RollState {
     /// Guards against double-spawning the background scan task if `scan_roll`
     /// is invoked twice (e.g. a second "Open roll" or an eager retry).
     pub scanning: AtomicBool,
+    /// Incremented on every `open` and `close` (i.e. every roll swap/
+    /// teardown). `scan_roll` captures this value when it spawns its
+    /// background queue task and re-checks it before processing each frame
+    /// via `generation()` -- see that function's doc comment for where the
+    /// enforcement actually happens.
+    pub generation: AtomicU64,
 }
 
 impl RollState {
-    pub fn open(&self, dir: &Path) -> Result<RollInfo, String> {
+    /// Opens `dir` as the new roll, replacing whatever roll was previously
+    /// held. Returns the fresh roll's info alongside any `image_id`s that
+    /// were still live on the *old* roll's frames -- the wholesale
+    /// replacement means those ids would otherwise never be closed in
+    /// `Images`, leaking activated frames across roll switches. Callers must
+    /// close the returned ids.
+    pub fn open(&self, dir: &Path) -> Result<(RollInfo, Vec<u64>), String> {
         let roll = Roll::open(dir)?;
         let info = roll.info();
-        *self.roll.lock().map_err(|e| e.to_string())? = Some(roll);
-        Ok(info)
+        let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
+        let stale_ids = guard
+            .take()
+            .map(|old| {
+                old.frames
+                    .iter()
+                    .filter_map(|f| f.image_id)
+                    .collect::<Vec<u64>>()
+            })
+            .unwrap_or_default();
+        *guard = Some(roll);
+        drop(guard);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        Ok((info, stale_ids))
+    }
+
+    /// Closes the current roll (if any), returning any `image_id`s still
+    /// live on its frames so the caller can close them in `Images`. Used for
+    /// the "open a single scan while a roll was open" path, where there is
+    /// no replacement roll to fold the teardown into.
+    pub fn close(&self) -> Result<Vec<u64>, String> {
+        let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
+        let stale_ids = guard
+            .take()
+            .map(|old| {
+                old.frames
+                    .iter()
+                    .filter_map(|f| f.image_id)
+                    .collect::<Vec<u64>>()
+            })
+            .unwrap_or_default();
+        drop(guard);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        Ok(stale_ids)
     }
 
     /// Frame indices whose `image_id` should stay activated around `keep`:
@@ -431,6 +481,15 @@ impl RollState {
     pub fn clear_scanning(&self) {
         self.scanning.store(false, Ordering::SeqCst);
     }
+
+    /// Current roll generation. `scan_roll` snapshots this when its queue
+    /// task spawns and compares against it before processing each frame
+    /// (see `lib.rs::scan_roll`); a mismatch means the roll was replaced or
+    /// closed mid-scan, and the task breaks out rather than writing stale
+    /// thumbnails/results into the wrong roll's directory or sidecar.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
 }
 
 #[cfg(test)]
@@ -448,6 +507,72 @@ mod state_tests {
         let state = RollState::default();
         state.open(dir).unwrap();
         state
+    }
+
+    #[test]
+    fn open_returns_the_previous_rolls_live_ids_and_reflects_the_new_roll() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        touch(dir_b.path(), "g00.tif");
+        let state = opened_state(dir_a.path(), 3);
+        state.set_image_id(0, 100).unwrap();
+        state.set_image_id(1, 101).unwrap();
+        // frame 2 never activated -- must not appear in the stale ids.
+
+        let (info, mut stale_ids) = state.open(dir_b.path()).unwrap();
+        stale_ids.sort();
+        assert_eq!(stale_ids, vec![100, 101]);
+
+        // The state now reflects roll B, not leftover A bookkeeping.
+        assert_eq!(info.dir, dir_b.path().display().to_string());
+        assert_eq!(state.dir().unwrap(), dir_b.path());
+        assert_eq!(state.image_id(0).unwrap(), None);
+    }
+
+    #[test]
+    fn open_on_a_fresh_state_returns_no_stale_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = RollState::default();
+        let (_, stale_ids) = state.open(dir.path()).unwrap();
+        assert!(stale_ids.is_empty());
+    }
+
+    #[test]
+    fn close_returns_live_ids_and_clears_the_roll() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = opened_state(dir.path(), 2);
+        state.set_image_id(0, 5).unwrap();
+
+        let stale_ids = state.close().unwrap();
+        assert_eq!(stale_ids, vec![5]);
+        assert!(state.dir().is_err()); // no roll open anymore
+    }
+
+    #[test]
+    fn close_on_a_fresh_state_returns_no_ids() {
+        let state = RollState::default();
+        assert_eq!(state.close().unwrap(), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn generation_increments_on_open_and_close() {
+        // Pins the enforcement mechanism scan_roll relies on: every roll
+        // swap or teardown must be observable to an in-flight scan task via
+        // a generation bump, so it can detect "the roll I was scanning is
+        // gone" and stop before writing into the wrong roll's files.
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let state = RollState::default();
+        let g0 = state.generation();
+        state.open(dir_a.path()).unwrap();
+        let g1 = state.generation();
+        assert!(g1 > g0);
+        state.open(dir_b.path()).unwrap();
+        let g2 = state.generation();
+        assert!(g2 > g1);
+        state.close().unwrap();
+        let g3 = state.generation();
+        assert!(g3 > g2);
     }
 
     #[test]
@@ -549,13 +674,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (w, h) = (600u32, 400u32);
         let rgba = vec![128u8; (w * h * 4) as usize];
-        let out = thumb_path(dir.path(), 7);
+        let out = thumb_path(dir.path(), "raw0001.tiff");
         write_thumbnail(&rgba, w, h, &out).unwrap();
         assert!(out.exists());
-        assert_eq!(out.file_name().unwrap(), "0007.png");
+        assert_eq!(out.file_name().unwrap(), "raw0001.tiff.png");
         let decoded = fd_io::decode(&out).unwrap();
         assert!(decoded.width <= 128 && decoded.height <= 128);
         assert_eq!(decoded.channels, 3);
+    }
+
+    #[test]
+    fn thumb_path_keeps_extension_to_avoid_stem_collisions() {
+        // Two files with the same stem but different formats must not
+        // collide on the same thumbnail path.
+        let dir = tempfile::tempdir().unwrap();
+        let tiff = thumb_path(dir.path(), "raw0001.tiff");
+        let png = thumb_path(dir.path(), "raw0001.png");
+        assert_ne!(tiff, png);
+        assert_eq!(tiff.file_name().unwrap(), "raw0001.tiff.png");
+        assert_eq!(png.file_name().unwrap(), "raw0001.png.png");
     }
 
     #[test]

@@ -92,15 +92,20 @@ pub fn tile_response(
                 eprintln!("[tiles] 404 thumb {path}: no roll open");
                 return respond_png(404, Vec::new());
             };
-            if index >= roll.frames.len() {
+            let Some(frame) = roll.frames.get(index) else {
                 #[cfg(debug_assertions)]
                 eprintln!(
                     "[tiles] 404 thumb {path}: index out of range ({} frames)",
                     roll.frames.len()
                 );
                 return respond_png(404, Vec::new());
-            }
-            let thumb_path = crate::roll::thumb_path(&roll.dir, index);
+            };
+            let thumb_path = crate::roll::thumb_path(&roll.dir, &frame.file_name);
+            // Drop the roll lock before touching the filesystem: `fs::read`
+            // can block on I/O, and holding the mutex across it would stall
+            // every other roll command (activate_frame, approve, threshold
+            // edits) for the duration of a slow disk read.
+            drop(roll_guard);
             match std::fs::read(&thumb_path) {
                 Ok(bytes) => respond_png(200, bytes),
                 Err(_) => {
@@ -230,7 +235,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.tif"), b"x").unwrap();
         let opened = crate::roll::Roll::open(dir.path()).unwrap();
-        let thumb_path = crate::roll::thumb_path(&opened.dir, 0);
+        let thumb_path = crate::roll::thumb_path(&opened.dir, &opened.frames[0].file_name);
         let rgba = vec![10u8, 20, 30, 255];
         crate::roll::write_thumbnail(&rgba, 1, 1, &thumb_path).unwrap();
         let images = Mutex::new(Images::default());
@@ -239,5 +244,41 @@ mod tests {
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.headers().get("Content-Type").unwrap(), "image/png");
         assert!(!resp.body().is_empty());
+    }
+
+    #[test]
+    fn thumb_stays_matched_to_its_file_after_indices_shift() {
+        // Regression for thumbnails keyed by index: if a file is added
+        // between sessions and shifts every later frame's index by one, an
+        // index-keyed thumbnail would silently serve the wrong image for
+        // every frame after the insertion point. Name-keyed thumbnails must
+        // not have this problem.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("b.tif"), b"x").unwrap();
+        let first_open = crate::roll::Roll::open(dir.path()).unwrap();
+        assert_eq!(first_open.frames[0].file_name, "b.tif");
+        let b_thumb = crate::roll::thumb_path(&first_open.dir, "b.tif");
+        crate::roll::write_thumbnail(&[1, 2, 3, 4], 1, 1, &b_thumb).unwrap();
+
+        // A new file sorts before "b.tif" and shifts it from index 0 to 1.
+        std::fs::write(dir.path().join("a.tif"), b"x").unwrap();
+        let reopened = crate::roll::Roll::open(dir.path()).unwrap();
+        assert_eq!(reopened.frames[1].file_name, "b.tif");
+
+        let images = Mutex::new(Images::default());
+        let roll = Mutex::new(Some(reopened));
+        // Index 1 now resolves to b.tif's thumbnail, not whatever an
+        // index-keyed scheme would have stored under key 1 (nothing, here,
+        // since b.tif was scanned back when it was still index 0).
+        let resp = tile_response(&images, &roll, "/thumb/1");
+        assert_eq!(resp.status(), 200);
+        assert!(!resp.body().is_empty());
+
+        // The new file at index 0 has no thumbnail yet -- 404, not a's
+        // content borrowed from wherever index 0 used to point.
+        let images2 = Mutex::new(Images::default());
+        let roll2_dir = crate::roll::Roll::open(dir.path()).unwrap();
+        let roll2 = Mutex::new(Some(roll2_dir));
+        assert_eq!(tile_response(&images2, &roll2, "/thumb/0").status(), 404);
     }
 }

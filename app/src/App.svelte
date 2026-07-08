@@ -41,6 +41,14 @@
   let currentIndex = $state(0);
   let scanDone = $state(false);
   let thresholdSaveTimer: ReturnType<typeof setTimeout> | undefined;
+  // Monotonically increasing activation sequence number. Rapid ,/. presses
+  // can fire overlapping `activate_frame` invokes whose resolutions race;
+  // each call captures its own `seq` and drops its result if a newer
+  // activation has started by the time it resolves, so the UI always ends
+  // up showing whichever activation was requested last, not whichever
+  // happened to resolve last.
+  let activationSeq = 0;
+  let activating = false;
 
   $effect(() => {
     const un = listen<{ id: number; stage: string }>("app-progress", (e) => {
@@ -96,8 +104,17 @@
     });
     if (typeof path !== "string") return;
     const previousId = info?.id;
+    const hadRoll = roll !== null;
     roll = null;
     loading = "Opening scan";
+    if (hadRoll) {
+      try {
+        await invoke("close_roll", {});
+      } catch {
+        // best effort cleanup; any activated roll frames just linger in the
+        // registry rather than blocking the scan the operator asked to open
+      }
+    }
     try {
       info = await invoke<ImageInfo>("open_image", { path });
     } catch (e) {
@@ -141,15 +158,35 @@
 
   async function activateCurrentFrame() {
     if (!roll) return;
+    // Repeat presses of the same index are already filtered out by the
+    // `index === currentIndex` guards in `selectFrame`/`stepFrame` below, so
+    // `activating` need not gate re-entry itself -- it just tracks in-flight
+    // state. Overlapping activations of *different* indices are allowed to
+    // fire; the sequence number below makes the latest one win.
+    const seq = ++activationSeq;
+    const index = currentIndex;
     loading = "Opening frame";
-    overlay.threshold = roll.frames[currentIndex].threshold;
+    overlay.threshold = roll.frames[index].threshold;
+    activating = true;
+    let result: ImageInfo;
     try {
-      info = await invoke<ImageInfo>("activate_frame", { index: currentIndex });
+      result = await invoke<ImageInfo>("activate_frame", { index });
     } catch (e) {
+      if (seq !== activationSeq) return; // stale: a newer activation is in flight
+      activating = false;
       error = String(e);
       loading = null;
       return;
     }
+    if (seq !== activationSeq) return; // stale: a newer activation superseded this one
+    activating = false;
+    info = result;
+    // Belt and braces: the backend now guarantees a terminal "ready" emit on
+    // both the reuse and fresh-decode paths, which already clears `loading`
+    // via the app-progress listener. Clear it here too so a successful
+    // activation can never be left stuck behind the loader if that
+    // guarantee is ever violated.
+    loading = null;
     detected = false;
     componentsAtHalf = null;
   }
