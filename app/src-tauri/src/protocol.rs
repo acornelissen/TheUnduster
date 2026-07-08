@@ -7,14 +7,16 @@ pub enum Layer {
     Rgba,
     Probs,
     Thumb,
+    Healed,
 }
 
 /// Parses:
 /// - "/{id}/{level}/{tx}/{ty}" (Rgba)
 /// - "/probs/{id}/{level}/{tx}/{ty}" (Probs)
+/// - "/healed/{id}/{level}/{tx}/{ty}" (Healed)
 /// - "/thumb/{index}" (Thumb; level/tx/ty are unused and returned as 0)
 ///
-/// Leading slash optional on all three forms.
+/// Leading slash optional on all four forms.
 pub fn parse_tile_path(path: &str) -> Option<(Layer, u64, u8, u32, u32)> {
     let trimmed = path.trim_start_matches('/');
     if let Some(rest) = trimmed.strip_prefix("thumb/") {
@@ -30,7 +32,10 @@ pub fn parse_tile_path(path: &str) -> Option<(Layer, u64, u8, u32, u32)> {
     }
     let (layer, rest) = match trimmed.strip_prefix("probs/") {
         Some(rest) => (Layer::Probs, rest),
-        None => (Layer::Rgba, trimmed),
+        None => match trimmed.strip_prefix("healed/") {
+            Some(rest) => (Layer::Healed, rest),
+            None => (Layer::Rgba, trimmed),
+        },
     };
     let mut parts = rest.split('/');
     let id = parts.next()?.parse().ok()?;
@@ -118,7 +123,7 @@ pub fn tile_response(
                 }
             }
         }
-        Layer::Rgba | Layer::Probs => {
+        Layer::Rgba | Layer::Probs | Layer::Healed => {
             let Ok(mut images) = images.lock() else {
                 return respond(500, Vec::new(), 0, 0);
             };
@@ -141,6 +146,14 @@ pub fn tile_response(
                         // sessions can tell harmless probs 404s from real rgba ones.
                         #[cfg(debug_assertions)]
                         eprintln!("[tiles] 404 probs {path} (no detection yet is normal)");
+                        respond(404, Vec::new(), 0, 0)
+                    }
+                },
+                Layer::Healed => match images.healed_tile(id, level, tx, ty) {
+                    Some(tile) => respond(200, tile.rgba.clone(), tile.width, tile.height),
+                    None => {
+                        #[cfg(debug_assertions)]
+                        eprintln!("[tiles] 404 healed {path} (no heal yet is normal)");
                         respond(404, Vec::new(), 0, 0)
                     }
                 },
@@ -280,5 +293,25 @@ mod tests {
         let roll2_dir = crate::roll::Roll::open(dir.path()).unwrap();
         let roll2 = Mutex::new(Some(roll2_dir));
         assert_eq!(tile_response(&images2, &roll2, "/thumb/0").status(), 404);
+    }
+
+    #[test]
+    fn parses_healed_layer() {
+        assert_eq!(
+            parse_tile_path("/healed/3/1/7/2"),
+            Some((Layer::Healed, 3, 1, 7, 2))
+        );
+        assert_eq!(parse_tile_path("/healed/3/1/7"), None);
+        assert_eq!(parse_tile_path("/healed/3/1/7/2/9"), None);
+    }
+
+    #[test]
+    fn healed_tile_404_before_heal() {
+        let images = Mutex::new(Images::default());
+        let roll = Mutex::new(None);
+        assert_eq!(
+            tile_response(&images, &roll, "/healed/1/0/0/0").status(),
+            404
+        );
     }
 }

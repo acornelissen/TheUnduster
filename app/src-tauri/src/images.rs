@@ -351,8 +351,7 @@ impl Images {
         ))
     }
 
-    // Exercised by tests; the tile protocol wires this up in a later task.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Served by the tiles:// protocol for the /healed/{id}/{level}/{tx}/{ty} layer.
     pub fn healed_tile(&mut self, id: u64, level: u8, tx: u32, ty: u32) -> Option<Arc<Tile>> {
         let key = TileKey {
             image_id: id,
