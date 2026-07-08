@@ -42,33 +42,45 @@ pub fn decode(path: &Path) -> Result<ImageBuf, IoError> {
 }
 
 pub fn encode(path: &Path, img: &ImageBuf) -> Result<(), IoError> {
-    let file = File::create(path).map_err(|e| encode_err(path, e))?;
-    let w = std::io::BufWriter::new(file);
     let ext = crate::ext_of(path);
-    let color = match (img.channels, &img.data) {
-        (1, PixelData::U8(_)) => ColorType::L8,
-        (3, PixelData::U8(_)) => ColorType::Rgb8,
-        (1, PixelData::U16(_)) => ColorType::L16,
-        (3, PixelData::U16(_)) => ColorType::Rgb16,
-        _ => return Err(IoError::Unsupported(format!("{} channels", img.channels))),
-    };
-    match (ext.as_str(), &img.data) {
-        ("png", PixelData::U8(v)) => image::codecs::png::PngEncoder::new(w)
-            .write_image(v, img.width, img.height, color.into())
-            .map_err(|e| encode_err(path, e)),
-        ("png", PixelData::U16(v)) => {
-            // image's encoders take 16-bit samples as native-endian bytes
-            let bytes: Vec<u8> = v.iter().flat_map(|p| p.to_ne_bytes()).collect();
-            image::codecs::png::PngEncoder::new(w)
-                .write_image(&bytes, img.width, img.height, color.into())
-                .map_err(|e| encode_err(path, e))
-        }
-        ("jpg" | "jpeg", PixelData::U8(v)) => {
-            image::codecs::jpeg::JpegEncoder::new_with_quality(w, 95)
+    let mut raw: Vec<u8> = Vec::new();
+    {
+        let w = std::io::Cursor::new(&mut raw);
+        let color = match (img.channels, &img.data) {
+            (1, PixelData::U8(_)) => ColorType::L8,
+            (3, PixelData::U8(_)) => ColorType::Rgb8,
+            (1, PixelData::U16(_)) => ColorType::L16,
+            (3, PixelData::U16(_)) => ColorType::Rgb16,
+            _ => return Err(IoError::Unsupported(format!("{} channels", img.channels))),
+        };
+        match (ext.as_str(), &img.data) {
+            ("png", PixelData::U8(v)) => image::codecs::png::PngEncoder::new(w)
                 .write_image(v, img.width, img.height, color.into())
-                .map_err(|e| encode_err(path, e))
+                .map_err(|e| encode_err(path, e))?,
+            ("png", PixelData::U16(v)) => {
+                // image's encoders take 16-bit samples as native-endian bytes
+                let bytes: Vec<u8> = v.iter().flat_map(|p| p.to_ne_bytes()).collect();
+                image::codecs::png::PngEncoder::new(w)
+                    .write_image(&bytes, img.width, img.height, color.into())
+                    .map_err(|e| encode_err(path, e))?
+            }
+            ("jpg" | "jpeg", PixelData::U8(v)) => {
+                image::codecs::jpeg::JpegEncoder::new_with_quality(w, 95)
+                    .write_image(v, img.width, img.height, color.into())
+                    .map_err(|e| encode_err(path, e))?
+            }
+            ("jpg" | "jpeg", PixelData::U16(_)) => {
+                return Err(IoError::Unsupported("16-bit JPEG".to_string()))
+            }
+            _ => return Err(IoError::Unsupported(ext)),
         }
-        ("jpg" | "jpeg", PixelData::U16(_)) => Err(IoError::Unsupported("16-bit JPEG".to_string())),
-        _ => Err(IoError::Unsupported(ext)),
     }
+    let final_bytes = match ext.as_str() {
+        "jpg" | "jpeg" if img.icc.is_some() || img.exif.is_some() => {
+            crate::metadata::attach_jpeg(raw, img.icc.as_deref(), img.exif.as_deref())
+        }
+        "png" if img.icc.is_some() => crate::metadata::attach_png(raw, img.icc.as_deref()),
+        _ => raw,
+    };
+    std::fs::write(path, final_bytes).map_err(|e| encode_err(path, e))
 }

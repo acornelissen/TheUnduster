@@ -1,6 +1,7 @@
 //! Image I/O: native-depth pixel buffers, decode/encode, metadata passthrough.
 
 mod buf;
+mod metadata;
 mod png_jpeg;
 mod tiff_io;
 

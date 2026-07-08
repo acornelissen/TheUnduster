@@ -20,7 +20,21 @@ pub fn decode(path: &Path) -> Result<ImageBuf, IoError> {
     let mut d = Decoder::new(file).map_err(|e| decode_err(path, e))?;
     let (width, height) = d.dimensions().map_err(|e| decode_err(path, e))?;
     let color = d.colortype().map_err(|e| decode_err(path, e))?;
-    let icc = d.get_tag_u8_vec(tiff::tags::Tag::Unknown(34675)).ok();
+    // The tiff crate may hand the ICC tag back as bytes or as a list of
+    // unsigned values depending on how it was written; accept both.
+    let icc = d
+        .get_tag_u8_vec(tiff::tags::Tag::Unknown(34675))
+        .ok()
+        .or_else(|| {
+            let value = d.get_tag(tiff::tags::Tag::Unknown(34675)).ok()?;
+            match value {
+                tiff::decoder::ifd::Value::List(vals) => vals
+                    .into_iter()
+                    .map(|v| v.into_u32().ok().map(|u| u as u8))
+                    .collect::<Option<Vec<u8>>>(),
+                other => other.into_u32().ok().map(|u| vec![u as u8]),
+            }
+        });
     let result = d.read_image().map_err(|e| decode_err(path, e))?;
     let (channels, data) = match (color, result) {
         (ColorType::Gray(8), DecodingResult::U8(v)) => (1, PixelData::U8(v)),
@@ -43,23 +57,37 @@ pub fn decode(path: &Path) -> Result<ImageBuf, IoError> {
     })
 }
 
+fn write_with_icc<C: colortype::ColorType>(
+    t: &mut TiffEncoder<File>,
+    path: &Path,
+    w: u32,
+    h: u32,
+    data: &[C::Inner],
+    icc: Option<&[u8]>,
+) -> Result<(), IoError>
+where
+    [C::Inner]: tiff::encoder::TiffValue,
+{
+    let mut image = t.new_image::<C>(w, h).map_err(|e| encode_err(path, e))?;
+    if let Some(icc) = icc {
+        image
+            .encoder()
+            .write_tag(tiff::tags::Tag::Unknown(34675), icc)
+            .map_err(|e| encode_err(path, e))?;
+    }
+    image.write_data(data).map_err(|e| encode_err(path, e))
+}
+
 pub fn encode(path: &Path, img: &ImageBuf) -> Result<(), IoError> {
     let file = File::create(path).map_err(|e| encode_err(path, e))?;
     let mut t = TiffEncoder::new(file).map_err(|e| encode_err(path, e))?;
     let (w, h) = (img.width, img.height);
+    let icc = img.icc.as_deref();
     match (img.channels, &img.data) {
-        (1, PixelData::U8(v)) => t
-            .write_image::<colortype::Gray8>(w, h, v)
-            .map_err(|e| encode_err(path, e)),
-        (1, PixelData::U16(v)) => t
-            .write_image::<colortype::Gray16>(w, h, v)
-            .map_err(|e| encode_err(path, e)),
-        (3, PixelData::U8(v)) => t
-            .write_image::<colortype::RGB8>(w, h, v)
-            .map_err(|e| encode_err(path, e)),
-        (3, PixelData::U16(v)) => t
-            .write_image::<colortype::RGB16>(w, h, v)
-            .map_err(|e| encode_err(path, e)),
+        (1, PixelData::U8(v)) => write_with_icc::<colortype::Gray8>(&mut t, path, w, h, v, icc),
+        (1, PixelData::U16(v)) => write_with_icc::<colortype::Gray16>(&mut t, path, w, h, v, icc),
+        (3, PixelData::U8(v)) => write_with_icc::<colortype::RGB8>(&mut t, path, w, h, v, icc),
+        (3, PixelData::U16(v)) => write_with_icc::<colortype::RGB16>(&mut t, path, w, h, v, icc),
         _ => Err(IoError::Unsupported(format!("{} channels", img.channels))),
     }
 }
