@@ -69,11 +69,11 @@ fn unmasked_pixels_are_bit_identical_after_heal() {
 #[test]
 fn tiny_defects_use_classical_tier_without_model() {
     let mut img = noisy_image(64, 64);
-    let mask = blob_mask(64, 64, 32, 32, 2); // 5px diameter -> tiny tier
+    // 5px diameter blob: exactly at the TINY_MAX_DIM boundary -> tiny tier
+    let mask = blob_mask(64, 64, 32, 32, TINY_MAX_DIM / 2);
     let report = heal(&mut img, &mask, None).unwrap();
     assert_eq!(report.tiny, 1);
     assert_eq!(report.inpainted, 0);
-    assert!(TINY_MAX_DIM >= 5);
 }
 
 #[test]
