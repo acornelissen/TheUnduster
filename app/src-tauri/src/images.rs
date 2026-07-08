@@ -41,9 +41,6 @@ impl Default for Images {
     }
 }
 
-/// `tile` and `close` are consumed by the protocol handler added in a later
-/// task; `open_image` (this task) only calls `open`.
-#[allow(dead_code)]
 impl Images {
     pub fn open(&mut self, path: &Path) -> Result<ImageInfo, String> {
         let img = fd_io::decode(path).map_err(|e| e.to_string())?;
@@ -81,6 +78,8 @@ impl Images {
             .get_or_insert(key, || pyramid.tile(level, tx, ty))
     }
 
+    /// Consumed by a later task that wires image lifecycle cleanup to the UI.
+    #[allow(dead_code)]
     pub fn close(&mut self, id: u64) {
         self.entries.remove(&id);
         self.cache.evict_image(id);
