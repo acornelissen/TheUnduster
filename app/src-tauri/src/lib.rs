@@ -1,5 +1,6 @@
 //! TheUnduster desktop shell: thin Tauri layer over the engine crates.
 
+mod detect;
 mod images;
 mod protocol;
 
@@ -67,15 +68,38 @@ fn close_image(state: State<'_, Mutex<Images>>, id: u64) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn load_detector(
+    state: tauri::State<'_, detect::DetectorState>,
+    path: String,
+) -> Result<(), String> {
+    state.load(std::path::Path::new(&path))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Mutex::new(Images::default()))
-        .invoke_handler(tauri::generate_handler![open_image, close_image])
+        .manage(detect::DetectorState::default())
+        .invoke_handler(tauri::generate_handler![
+            open_image,
+            close_image,
+            load_detector
+        ])
         .register_uri_scheme_protocol("tiles", |ctx, request| {
             let images = ctx.app_handle().state::<Mutex<Images>>();
             protocol::tile_response(&images, request.uri().path())
+        })
+        .setup(|app| {
+            #[cfg(debug_assertions)]
+            {
+                use tauri::Manager;
+                let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../engine/fixtures/tiny-detector.onnx");
+                let _ = app.state::<detect::DetectorState>().load(&fixture);
+            }
+            Ok(())
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
