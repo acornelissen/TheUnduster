@@ -120,7 +120,12 @@ export class TileRenderer {
    * `single` uploads as a single-channel R8 probability texture instead of
    * RGBA; a 404 (no detection yet) is simply not cached, so a later detect
    * can retry the same path (the pending guard clears in finally either way). */
-  private ensure(path: string, opts: { single?: boolean } = {}): WebGLTexture | undefined {
+  private ensure(
+    path: string,
+    expectedW: number,
+    expectedH: number,
+    opts: { single?: boolean } = {},
+  ): WebGLTexture | undefined {
     const hit = this.textures.get(path);
     if (hit) return hit;
     if (!this.pending.has(path)) {
@@ -128,9 +133,16 @@ export class TileRenderer {
       fetch(`tiles://localhost${path}`)
         .then(async (r) => {
           if (!r.ok) return;
-          const w = Number(r.headers.get("x-tile-width"));
-          const h = Number(r.headers.get("x-tile-height"));
+          // Prefer the response headers but never depend on them: CORS hides
+          // custom headers unless the server exposes them, and a 0x0 upload
+          // is an invisible failure. The caller knows the tile geometry.
+          const w = Number(r.headers.get("x-tile-width")) || expectedW;
+          const h = Number(r.headers.get("x-tile-height")) || expectedH;
           const bytes = new Uint8Array(await r.arrayBuffer());
+          if (bytes.length !== w * h * (opts.single ? 1 : 4)) {
+            console.error(`tile ${path}: ${bytes.length} bytes for ${w}x${h}`);
+            return;
+          }
           const gl = this.gl;
           const tex = gl.createTexture()!;
           gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -195,7 +207,7 @@ export class TileRenderer {
     gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 16, 0);
     gl.vertexAttribPointer(uvLoc, 2, gl.FLOAT, false, 16, 8);
     for (const t of tiles) {
-      const tex = this.ensure(t.path);
+      const tex = this.ensure(t.path, t.tileW, t.tileH);
       if (!tex) continue;
       // edge tiles are smaller than 512: scale the drawn quad by the real
       // tile fraction so partial tiles are not stretched
@@ -214,7 +226,9 @@ export class TileRenderer {
       gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STREAM_DRAW);
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, tex);
-      const probTex = overlay.enabled ? this.ensure(probPathFor(t.path), { single: true }) : undefined;
+      const probTex = overlay.enabled
+        ? this.ensure(probPathFor(t.path), t.tileW, t.tileH, { single: true })
+        : undefined;
       gl.activeTexture(gl.TEXTURE1);
       gl.bindTexture(gl.TEXTURE_2D, probTex ?? this.zeroTex);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
