@@ -22,6 +22,13 @@ pub struct ImageInfo {
 }
 
 struct Entry {
+    image: Arc<fd_io::ImageBuf>,
+    pyramid: Pyramid,
+}
+
+/// Heavy half of open: decoded image plus its built pyramid, no registry access yet.
+pub struct Prepared {
+    image: Arc<fd_io::ImageBuf>,
     pyramid: Pyramid,
 }
 
@@ -42,12 +49,20 @@ impl Default for Images {
 }
 
 impl Images {
-    pub fn open(&mut self, path: &Path) -> Result<ImageInfo, String> {
+    /// Heavy half of open: decode + pyramid, no registry access. Blocking.
+    pub fn prepare(path: &Path) -> Result<Prepared, String> {
         let img = fd_io::decode(path).map_err(|e| e.to_string())?;
-        let pyramid = Pyramid::build(&img);
+        let image = Arc::new(img);
+        let pyramid = Pyramid::build(&image);
+        Ok(Prepared { image, pyramid })
+    }
+
+    /// Cheap half: registry insert under the caller's lock.
+    pub fn insert(&mut self, prepared: Prepared) -> ImageInfo {
         let id = self.next_id;
         self.next_id += 1;
-        let levels = pyramid
+        let levels = prepared
+            .pyramid
             .levels
             .iter()
             .map(|l| LevelInfo {
@@ -57,12 +72,32 @@ impl Images {
             .collect();
         let info = ImageInfo {
             id,
-            width: img.width,
-            height: img.height,
+            width: prepared.image.width,
+            height: prepared.image.height,
             levels,
         };
-        self.entries.insert(id, Entry { pyramid });
-        Ok(info)
+        self.entries.insert(
+            id,
+            Entry {
+                image: prepared.image,
+                pyramid: prepared.pyramid,
+            },
+        );
+        info
+    }
+
+    // Exercised by the 3a test suite; the command path now goes through
+    // `prepare` + `insert` directly.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn open(&mut self, path: &Path) -> Result<ImageInfo, String> {
+        let prepared = Self::prepare(path)?;
+        Ok(self.insert(prepared))
+    }
+
+    // Consumed by Task 3's inference pipeline.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn image(&self, id: u64) -> Option<Arc<fd_io::ImageBuf>> {
+        self.entries.get(&id).map(|e| e.image.clone())
     }
 
     pub fn tile(&mut self, id: u64, level: u8, tx: u32, ty: u32) -> Option<Arc<Tile>> {
@@ -132,6 +167,18 @@ mod tests {
         let mut images = Images::default();
         let err = images.open(Path::new("/nonexistent/x.png")).unwrap_err();
         assert!(err.contains("x.png"));
+    }
+
+    #[test]
+    fn image_pixels_are_retained_for_inference() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_png(&dir, 600, 400);
+        let mut images = Images::default();
+        let info = images.open(&path).unwrap();
+        let img = images.image(info.id).expect("pixels retained");
+        assert_eq!((img.width, img.height), (600, 400));
+        images.close(info.id);
+        assert!(images.image(info.id).is_none());
     }
 
     #[test]

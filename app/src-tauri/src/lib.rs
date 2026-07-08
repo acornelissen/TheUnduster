@@ -6,12 +6,50 @@ mod protocol;
 use std::sync::Mutex;
 
 use images::{ImageInfo, Images};
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
+
+#[derive(serde::Serialize, Clone)]
+struct Progress {
+    id: u64,
+    stage: &'static str,
+}
 
 #[tauri::command]
-fn open_image(state: State<'_, Mutex<Images>>, path: String) -> Result<ImageInfo, String> {
-    let mut images = state.lock().map_err(|e| e.to_string())?;
-    images.open(std::path::Path::new(&path))
+async fn open_image(
+    app: tauri::AppHandle,
+    state: State<'_, Mutex<Images>>,
+    path: String,
+) -> Result<ImageInfo, String> {
+    let _ = app.emit(
+        "app-progress",
+        Progress {
+            id: 0,
+            stage: "decoding",
+        },
+    );
+    let prepared =
+        tauri::async_runtime::spawn_blocking(move || Images::prepare(std::path::Path::new(&path)))
+            .await
+            .map_err(|e| e.to_string())??;
+    let _ = app.emit(
+        "app-progress",
+        Progress {
+            id: 0,
+            stage: "building-pyramid",
+        },
+    );
+    let info = {
+        let mut images = state.lock().map_err(|e| e.to_string())?;
+        images.insert(prepared)
+    };
+    let _ = app.emit(
+        "app-progress",
+        Progress {
+            id: info.id,
+            stage: "ready",
+        },
+    );
+    Ok(info)
 }
 
 #[tauri::command]

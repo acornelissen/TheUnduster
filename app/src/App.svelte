@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-dialog";
   import Viewer from "./lib/Viewer.svelte";
   import type { Level } from "./lib/viewport";
@@ -13,6 +14,21 @@
 
   let info: ImageInfo | null = $state(null);
   let error: string | null = $state(null);
+  let loading: string | null = $state(null);
+
+  $effect(() => {
+    const un = listen<{ id: number; stage: string }>("app-progress", (e) => {
+      loading =
+        e.payload.stage === "ready"
+          ? null
+          : e.payload.stage === "decoding"
+            ? "Decoding scan"
+            : "Building preview";
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
 
   async function openScan() {
     error = null;
@@ -22,10 +38,12 @@
     });
     if (typeof path !== "string") return;
     const previousId = info?.id;
+    loading = "Opening scan";
     try {
       info = await invoke<ImageInfo>("open_image", { path });
     } catch (e) {
       error = String(e);
+      loading = null;
       return;
     }
     if (previousId !== undefined) {
@@ -44,7 +62,9 @@
     {#if error}<p role="alert">{error}</p>{/if}
   </header>
   <section class="stage">
-    {#if info}
+    {#if loading}
+      <p class="hint" role="status" aria-busy="true">{loading}...</p>
+    {:else if info}
       {#key info.id}
         <Viewer {info} />
       {/key}
