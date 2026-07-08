@@ -68,6 +68,40 @@ function tilesForLevel(
   return out;
 }
 
+export interface Ring {
+  x: number;
+  y: number;
+  r: number;
+}
+
+/** Maps native-resolution defect bboxes to screen-space ring markers, using
+ * the same pan/zoom convention as Viewer's zoomAt/onPointerMove (screen
+ * origin at canvas center, image point (centerX, centerY) maps there).
+ * Filters out rings whose bounding circle doesn't intersect the canvas. */
+export function ringsFor(
+  bboxes: [number, number, number, number][],
+  zoom: number,
+  centerX: number,
+  centerY: number,
+  canvasW: number,
+  canvasH: number,
+  minR: number,
+): Ring[] {
+  const out: Ring[] = [];
+  for (const [x0, y0, x1, y1] of bboxes) {
+    const bx = (x0 + x1) / 2;
+    const by = (y0 + y1) / 2;
+    const x = (bx - centerX) * zoom + canvasW / 2;
+    const y = (by - centerY) * zoom + canvasH / 2;
+    const extent = Math.max(x1 - x0, y1 - y0);
+    const r = Math.max((extent / 2) * zoom, minR);
+    const onscreen =
+      x + r >= 0 && x - r <= canvasW && y + r >= 0 && y - r <= canvasH;
+    if (onscreen) out.push({ x, y, r });
+  }
+  return out;
+}
+
 /** Tiles to draw, coarse underlay first, then the sharp level, with a
  * one-tile prefetch ring on the sharp level. */
 export function visibleTiles(

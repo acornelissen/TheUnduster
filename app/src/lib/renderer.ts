@@ -38,6 +38,35 @@ export function probPathFor(path: string): string {
   return "/probs" + path;
 }
 
+const RING_VERT = `#version 300 es
+in vec2 corner;
+uniform vec2 viewport;
+uniform vec2 center;
+uniform float radius;
+out vec2 vCorner;
+void main() {
+  vCorner = corner;
+  vec2 pos = center + corner * (radius + 3.0);
+  vec2 clip = (pos / viewport) * 2.0 - 1.0;
+  gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
+}`;
+
+const RING_FRAG = `#version 300 es
+precision mediump float;
+in vec2 vCorner;
+out vec4 color;
+uniform float radius;
+void main() {
+  float d = length(vCorner) * (radius + 3.0);
+  // Soft 2px annulus at the ring radius: smoothstep in from both sides so
+  // the edge anti-aliases instead of stair-stepping.
+  float outer = 1.0 - smoothstep(radius - 1.0, radius + 1.0, d);
+  float inner = smoothstep(radius - 3.0, radius - 1.0, d);
+  float alpha = outer * inner * 0.9;
+  if (alpha <= 0.0) discard;
+  color = vec4(1.0, 0.05, 0.05, alpha);
+}`;
+
 /** Byte-budgeted LRU keyed by tile URL path. Generic over the texture type
  * so the eviction logic is unit-testable without a GL context. */
 export class TextureStore<T> {
@@ -85,6 +114,8 @@ export class TileRenderer {
   private gl: WebGL2RenderingContext;
   private program: WebGLProgram;
   private buf: WebGLBuffer;
+  private ringProgram: WebGLProgram;
+  private ringBuf: WebGLBuffer;
   private textures = new TextureStore<WebGLTexture>(256 * 1024 * 1024);
   private pending = new Set<string>();
   private zeroTex: WebGLTexture;
@@ -116,6 +147,25 @@ export class TileRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     this.zeroTex = zeroTex;
+
+    // Ring program: a unit quad in [-1, 1]^2, positioned and scaled per ring
+    // via uniforms so one draw call handles one ring (ring counts are small
+    // -- dozens, not thousands -- so per-ring draw calls are not a concern).
+    const rp = gl.createProgram()!;
+    gl.attachShader(rp, compile(gl, gl.VERTEX_SHADER, RING_VERT));
+    gl.attachShader(rp, compile(gl, gl.FRAGMENT_SHADER, RING_FRAG));
+    gl.linkProgram(rp);
+    if (!gl.getProgramParameter(rp, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(rp) ?? "ring link failed");
+    }
+    this.ringProgram = rp;
+    this.ringBuf = gl.createBuffer()!;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.ringBuf);
+    gl.bufferData(
+      gl.ARRAY_BUFFER,
+      new Float32Array([-1, -1, 1, -1, -1, 1, 1, -1, 1, 1, -1, 1]),
+      gl.STATIC_DRAW,
+    );
   }
 
   /** Fetch a tile via tiles:// and upload it; no-op if cached or in flight.
@@ -235,5 +285,32 @@ export class TileRenderer {
       gl.bindTexture(gl.TEXTURE_2D, probTex ?? this.zeroTex);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
     }
+  }
+
+  /** Draws ring markers over the already-rendered frame. Call after draw().
+   * `rings` are in screen px (see viewport.ts#ringsFor). Uses additive-free
+   * alpha blending so overlapping rings don't double-darken past the base
+   * 0.9 alpha set in the fragment shader. Blending is disabled again before
+   * returning so the next tile pass (which does not itself touch blend
+   * state) renders opaquely as before. */
+  drawRings(rings: { x: number; y: number; r: number }[], canvasW: number, canvasH: number): void {
+    if (rings.length === 0) return;
+    const gl = this.gl;
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(this.ringProgram);
+    gl.uniform2f(gl.getUniformLocation(this.ringProgram, "viewport"), canvasW, canvasH);
+    const centerLoc = gl.getUniformLocation(this.ringProgram, "center");
+    const radiusLoc = gl.getUniformLocation(this.ringProgram, "radius");
+    const cornerLoc = gl.getAttribLocation(this.ringProgram, "corner");
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.ringBuf);
+    gl.enableVertexAttribArray(cornerLoc);
+    gl.vertexAttribPointer(cornerLoc, 2, gl.FLOAT, false, 8, 0);
+    for (const ring of rings) {
+      gl.uniform2f(centerLoc, ring.x, ring.y);
+      gl.uniform1f(radiusLoc, ring.r);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
+    gl.disable(gl.BLEND);
   }
 }

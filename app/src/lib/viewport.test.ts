@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fitZoom, pickLevel, visibleTiles, type Level } from "./viewport";
+import { fitZoom, pickLevel, ringsFor, visibleTiles, type Level } from "./viewport";
 
 const LEVELS: Level[] = [
   { width: 2000, height: 1200 },
@@ -69,5 +69,56 @@ describe("visibleTiles", () => {
     );
     // level-1 tile is 512 level-1 px = 1024 level-0 px, at zoom 0.5 -> 512 screen px
     expect(half.screenW).toBeCloseTo(512);
+  });
+});
+
+describe("ringsFor", () => {
+  it("maps a centered bbox to the canvas center", () => {
+    // canvas 800x600, viewport centered at image (1000, 600), zoom 1:
+    // a bbox centered exactly at (1000, 600) maps to screen (400, 300).
+    const rings = ringsFor([[980, 580, 1020, 620]], 1, 1000, 600, 800, 600, 12);
+    expect(rings).toHaveLength(1);
+    expect(rings[0].x).toBeCloseTo(400);
+    expect(rings[0].y).toBeCloseTo(300);
+    // bbox extent is 40x40 image px; at zoom 1, radius = max(20, 12) = 20
+    expect(rings[0].r).toBeCloseTo(20);
+  });
+
+  it("enforces the minimum radius for small defects", () => {
+    const rings = ringsFor([[998, 598, 1002, 602]], 1, 1000, 600, 800, 600, 12);
+    expect(rings[0].r).toBeCloseTo(12);
+  });
+
+  it("scales radius with zoom", () => {
+    const rings = ringsFor([[980, 580, 1020, 620]], 0.5, 1000, 600, 800, 600, 12);
+    // extent 40 image px * zoom 0.5 / 2 = 10, below minR -> clamped to 12
+    expect(rings[0].r).toBeCloseTo(12);
+    const rings2 = ringsFor([[900, 500, 1100, 700]], 0.5, 1000, 600, 800, 600, 12);
+    // extent 200 image px * zoom 0.5 / 2 = 50
+    expect(rings2[0].r).toBeCloseTo(50);
+  });
+
+  it("filters bboxes fully offscreen", () => {
+    const rings = ringsFor(
+      [
+        [980, 580, 1020, 620], // centered, onscreen
+        [10000, 10000, 10010, 10010], // far offscreen
+      ],
+      1,
+      1000,
+      600,
+      800,
+      600,
+      12,
+    );
+    expect(rings).toHaveLength(1);
+  });
+
+  it("keeps a ring whose circle still overlaps the canvas edge", () => {
+    // bbox center maps just past the right edge, but its radius reaches back in
+    const rings = ringsFor([[1390, 580, 1430, 620]], 1, 1000, 600, 800, 600, 12);
+    // screen x = (1410 - 1000) * 1 + 400 = 810, r = max(20, 12) = 20;
+    // circle spans 790..830, canvas right edge is 800 -> still overlaps
+    expect(rings).toHaveLength(1);
   });
 });
