@@ -47,6 +47,25 @@
     needsFrame = true;
   }
 
+  // The Viewer is a single long-lived instance: remounting per frame switch
+  // (the old {#key info.id} approach) tears down the GL context and texture
+  // cache on every switch, refetching every visible tile from scratch. React
+  // to the image changing instead; the LRU texture store keeps neighboring
+  // frames' tiles warm, so switching back is instant.
+  let lastInfoId = -1;
+  $effect(() => {
+    if (info.id === lastInfoId) return;
+    lastInfoId = info.id;
+    detections = [];
+    current = -1;
+    centerX = info.width / 2;
+    centerY = info.height / 2;
+    if (canvas && canvas.width > 0) {
+      zoom = fitZoom(info.levels[0], canvas.width, canvas.height);
+    }
+    requestFrame();
+  });
+
   export async function refreshDetections(threshold: number) {
     try {
       detections = await invoke("components", { id: info.id, threshold });
@@ -236,10 +255,10 @@
     requestFrame();
     rafId = requestAnimationFrame(frame);
     return () => {
-      // {#key info.id} remounts this component on every frame switch. Without
-      // stopping the render loop and dropping the GL context here, each switch
-      // leaks a WebGL context and an orphaned rAF loop driving a detached
-      // canvas -- which exhausts WebKit's context cap and crashes the webview.
+      // The Viewer unmounts on mode switches (roll opened, everything
+      // closed). Without stopping the render loop and dropping the GL
+      // context, each unmount leaks a WebGL context and an orphaned rAF
+      // loop -- WebKit caps live contexts near 16, then crashes.
       running = false;
       cancelAnimationFrame(rafId);
       ro.disconnect();

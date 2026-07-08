@@ -101,6 +101,21 @@
   // would keep showing the earlier 404).
   let thumbVersions: Record<number, number> = $state({});
 
+  // The loader overlay appears only when loading persists past 150ms:
+  // reuse-path frame switches resolve in milliseconds and must not flash it.
+  let showLoader = $state(false);
+  let loaderTimer: ReturnType<typeof setTimeout> | undefined;
+
+  $effect(() => {
+    clearTimeout(loaderTimer);
+    if (loading !== null) {
+      loaderTimer = setTimeout(() => (showLoader = true), 150);
+    } else {
+      showLoader = false;
+    }
+    return () => clearTimeout(loaderTimer);
+  });
+
   $effect(() => {
     const un = listen<{ index: number }>("roll-thumb", (e) => {
       thumbVersions[e.payload.index] = (thumbVersions[e.payload.index] ?? 0) + 1;
@@ -356,35 +371,35 @@
     {#if error}<p role="alert">{error}</p>{/if}
   </header>
   <section class="stage">
-    {#if loading}
-      {#if roll}
-        <!-- Full decode of a large frame takes tens of seconds; show the
-             cached queue thumbnail scaled up so the operator sees WHAT is
-             loading, not just that something is. -->
-        <div class="stage-preview" role="status" aria-busy="true">
+    {#if info}
+      <!-- One persistent Viewer: it reacts to `info` changing instead of
+           being remounted, keeping the GL context and tile cache warm so
+           switching to an already-decoded frame is instant. -->
+      <Viewer
+        bind:this={viewer}
+        {info}
+        {overlay}
+        {detected}
+        onRequestDetect={requestDetect}
+        bboxes={roll ? roll.frames[currentIndex].bboxes : null}
+      />
+    {:else if !showLoader}
+      <p class="hint">Open a scan or a roll to begin.</p>
+    {/if}
+    {#if showLoader}
+      <!-- Delayed overlay (not a stage swap): quick switches never flash it,
+           and during a long decode the previous frame stays visible under a
+           dimmed preview of what is coming. -->
+      <div class="stage-overlay" role="status" aria-busy="true">
+        {#if roll}
           <img
             src={`tiles://localhost/thumb/${currentIndex}?v=${thumbVersions[currentIndex] ?? 0}`}
             alt=""
             onerror={(e) => ((e.currentTarget as HTMLImageElement).style.display = "none")}
           />
-          <p class="hint">{loading}...</p>
-        </div>
-      {:else}
-        <p class="hint" role="status" aria-busy="true">{loading}...</p>
-      {/if}
-    {:else if info}
-      {#key info.id}
-        <Viewer
-          bind:this={viewer}
-          {info}
-          {overlay}
-          {detected}
-          onRequestDetect={requestDetect}
-          bboxes={roll ? roll.frames[currentIndex].bboxes : null}
-        />
-      {/key}
-    {:else}
-      <p class="hint">Open a scan or a roll to begin.</p>
+        {/if}
+        <p class="hint">{loading}...</p>
+      </div>
     {/if}
   </section>
   {#if roll}
@@ -434,23 +449,26 @@
   .stage {
     flex: 1;
     min-height: 0;
+    position: relative;
   }
-  .stage-preview {
-    height: 100%;
+  .stage-overlay {
+    position: absolute;
+    inset: 0;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
     gap: 0.5rem;
+    background: rgba(38, 38, 38, 0.75);
+    pointer-events: none;
   }
-  .stage-preview img {
+  .stage-overlay img {
     max-height: 70%;
     max-width: 80%;
-    image-rendering: auto;
     filter: blur(2px) brightness(0.8);
     border-radius: 4px;
   }
-  .stage-preview .hint {
+  .stage-overlay .hint {
     margin: 0;
   }
 
