@@ -200,6 +200,8 @@
     requestFrame();
   }
 
+  let glError: string | null = $state(null);
+
   onMount(() => {
     const dpr = window.devicePixelRatio || 1;
     const resize = () => {
@@ -210,7 +212,15 @@
     resize();
     const ro = new ResizeObserver(resize);
     ro.observe(canvas);
-    renderer = new TileRenderer(canvas);
+    try {
+      renderer = new TileRenderer(canvas);
+    } catch (e) {
+      // A mount-time throw would silently break this component AND freeze
+      // sibling template updates; fail visibly instead. The global error
+      // hook in main.ts additionally forwards this to the dev terminal.
+      glError = String(e);
+      throw e;
+    }
     renderer.onTileLoaded = requestFrame;
     zoom = fitZoom(info.levels[0], canvas.width, canvas.height);
     requestFrame();
@@ -229,6 +239,9 @@
   });
 </script>
 
+{#if glError}
+  <p role="alert" class="gl-error">Viewer failed to start: {glError}</p>
+{/if}
 <canvas
   bind:this={canvas}
   role="application"
@@ -253,6 +266,12 @@
     touch-action: none;
     cursor: grab;
   }
+  .gl-error {
+    color: #ff9c9c;
+    padding: 1rem;
+    margin: 0;
+  }
+
   canvas:focus-visible {
     outline: 3px solid #6ab0ff;
     outline-offset: -3px;

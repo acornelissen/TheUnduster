@@ -63,6 +63,13 @@ async fn open_image(
     Ok(info)
 }
 
+/// Webview-side errors are invisible in the dev terminal; the frontend
+/// forwards uncaught errors and rejections here so they surface in the log.
+#[tauri::command]
+fn log_js_error(message: String) {
+    eprintln!("[webview] {message}");
+}
+
 #[tauri::command]
 fn close_image(state: State<'_, Mutex<Images>>, id: u64) -> Result<(), String> {
     let mut images = state.lock().map_err(|e| e.to_string())?;
@@ -508,6 +515,7 @@ pub fn run() {
         .manage(detect::DetectorState::default())
         .manage(roll::RollState::default())
         .invoke_handler(tauri::generate_handler![
+            log_js_error,
             open_image,
             close_image,
             load_detector,
