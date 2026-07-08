@@ -40,6 +40,19 @@ def test_gray_round_trip(tmp_path):
     assert np.abs(back - img).max() <= 1 / 65535 + 1e-6
 
 
+@pytest.mark.parametrize("bit_depth", [8, 16])
+def test_gray_png_round_trip(tmp_path, bit_depth):
+    # pins the cv2 grayscale PNG path at both depths
+    img = np.linspace(0, 1, 32 * 32, dtype=np.float32).reshape(32, 32)
+    path = tmp_path / "g.png"
+    save_image(path, img, bit_depth=bit_depth)
+    assert path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+    back = load_image(path)
+    assert back.shape == (32, 32)
+    tol = (1 / 255 if bit_depth == 8 else 1 / 65535) + 1e-6
+    assert np.abs(back - img).max() <= tol
+
+
 def test_load_image_rejects_corrupt_png(tmp_path):
     path = tmp_path / "x.png"
     path.write_bytes(b"not a real png")
