@@ -1,0 +1,18 @@
+[package]
+name = "unduster-app"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "unduster_app"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+fd-io = { path = "../../engine/crates/fd-io" }
+fd-tiles = { path = "../../engine/crates/fd-tiles" }

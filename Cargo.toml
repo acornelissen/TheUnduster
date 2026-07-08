@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "engine/crates/fd-io",
+    "engine/crates/fd-tiles",
+    "engine/crates/fd-infer",
+    "engine/crates/fd-heal",
+    "app/src-tauri",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+thiserror = "2"

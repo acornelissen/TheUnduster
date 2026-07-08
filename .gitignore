@@ -4,3 +4,6 @@
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Rust build output (workspace root moved here in app 3a task 1)
+target/

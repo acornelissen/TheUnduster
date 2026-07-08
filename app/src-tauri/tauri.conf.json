@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "TheUnduster",
+  "version": "0.1.0",
+  "identifier": "com.theunduster.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "TheUnduster",
+        "width": 1400,
+        "height": 900
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' tiles: data:; connect-src 'self' tiles: ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'"
+    }
+  }
+}
