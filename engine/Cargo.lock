@@ -91,6 +91,9 @@ dependencies = [
 [[package]]
 name = "fd-tiles"
 version = "0.1.0"
+dependencies = [
+ "fd-io",
+]
 
 [[package]]
 name = "fdeflate"
