@@ -23,22 +23,32 @@ class Defect:
     kind: str  # "dust" | "scratch" | "hair"
 
 
+# Shape-classification thresholds. Components smaller than PCA_MIN_AREA are
+# always dust (PCA on a handful of pixels is meaningless). Above that,
+# elongation below DUST_MAX_ELONGATION means compact (dust); elongated
+# components are scratches when nearly straight (principal-axis residual RMS
+# under SCRATCH_MAX_RMS pixels) and hairs when curved.
+PCA_MIN_AREA = 10
+DUST_MAX_ELONGATION = 4.0
+SCRATCH_MAX_RMS = 1.5
+
+
 def _classify(mask: np.ndarray) -> str:
     coords = np.argwhere(mask).astype(np.float64)
-    if len(coords) < 10:
+    if len(coords) < PCA_MIN_AREA:
         return "dust"
     centered = coords - coords.mean(axis=0)
     cov = centered.T @ centered / len(coords)
     evals, evecs = np.linalg.eigh(cov)  # ascending
     minor, major = max(evals[0], 1e-6), max(evals[1], 1e-6)
     elongation = np.sqrt(major / minor)
-    if elongation < 4.0:
+    if elongation < DUST_MAX_ELONGATION:
         return "dust"
     # residual from the principal axis separates straight scratches from curly hairs
     axis = evecs[:, 1]
     residual = centered - np.outer(centered @ axis, axis)
     rms = np.sqrt((residual**2).sum(axis=1).mean())
-    return "scratch" if rms < 1.5 else "hair"
+    return "scratch" if rms < SCRATCH_MAX_RMS else "hair"
 
 
 def harvest(

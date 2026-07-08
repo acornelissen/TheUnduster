@@ -28,3 +28,29 @@ def test_library_round_trip(tmp_path, blank_scan):
     assert len(back) == len(defects)
     orig = {(d.kind, d.mask.sum()) for d in defects}
     assert {(d.kind, d.mask.sum()) for d in back} == orig
+
+
+def test_defect_touching_scan_corner_is_harvested():
+    rng = np.random.default_rng(5)
+    scan = np.full((200, 200), 0.82, np.float32) + rng.normal(0, 0.004, (200, 200)).astype(
+        np.float32
+    )
+    scan[0:4, 0:4] -= 0.35  # dust blob flush against (0,0)
+    defects = harvest(np.clip(scan, 0, 1))
+    assert len(defects) == 1
+    d = defects[0]
+    assert d.kind == "dust"
+    assert d.mask.any()
+    assert d.delta.shape == d.mask.shape  # crop clamped at the border, no crash
+
+
+def test_sub_min_area_speck_is_excluded():
+    rng = np.random.default_rng(6)
+    scan = np.full((200, 200), 0.82, np.float32) + rng.normal(0, 0.004, (200, 200)).astype(
+        np.float32
+    )
+    scan[100, 100] -= 0.4  # single pixel < min_area=3
+    scan[50:54, 50:54] -= 0.35  # real blob, kept
+    defects = harvest(np.clip(scan, 0, 1))
+    assert len(defects) == 1
+    assert defects[0].mask.sum() >= 3
