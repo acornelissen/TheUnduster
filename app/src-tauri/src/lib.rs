@@ -1200,11 +1200,16 @@ fn export_approved(
 }
 
 /// One background job's identity; the payload for the `job-queued`,
-/// `job-started`, and `job-done` events.
+/// `job-started`, and `job-done` events. `generation` is the roll generation
+/// the job was enqueued against (`job.generation`), so a listener can drop
+/// events belonging to a roll that has since been swapped out -- closing the
+/// same-index-across-roll-swap race at the event layer, not just the
+/// registry-write layer.
 #[derive(serde::Serialize, Clone)]
 struct JobEvent {
     index: usize,
     kind: jobs::JobKind,
+    generation: u64,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -1212,6 +1217,7 @@ struct JobError {
     index: usize,
     kind: jobs::JobKind,
     message: String,
+    generation: u64,
 }
 
 /// Clears the job-worker running flag when dropped, including on unwind, so
@@ -1249,6 +1255,7 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
         JobEvent {
             index,
             kind: job.kind,
+            generation,
         },
     );
     // Cache paths are keyed by the frame's own roll directory, mirroring
@@ -1379,11 +1386,23 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                     dims.map(|dims| build_prob_pyramid(&probs, &dims))
                 }
             };
-            if let (Some(id), Some(pyramid)) = (current_id, pyramid) {
-                let mut images = images_state.lock().map_err(|e| e.to_string())?;
-                // A frame closed mid-job is benign for a background detect:
-                // the sidecar result below still lands.
-                images.set_probs_built(id, probs, pyramid);
+            // Land in the registry only when this job's generation is still
+            // the live one: a roll swap can free `index` and a fresh roll's
+            // frame can activate the very same index before this job
+            // finishes, giving `current_id` a real (but WRONG-roll) image to
+            // write into. Same index, same dims, different roll -- nothing
+            // else here catches that. The sidecar write below stays
+            // unconditional: it is roll-dir-scoped and content-validated
+            // (`record_scan_result` re-checks the generation itself), so a
+            // stale-generation result simply lands in the (still-correct)
+            // directory or is discarded there, never in the wrong roll.
+            if job.generation == app.state::<roll::RollState>().generation() {
+                if let (Some(id), Some(pyramid)) = (current_id, pyramid) {
+                    let mut images = images_state.lock().map_err(|e| e.to_string())?;
+                    // A frame closed mid-job is benign for a background detect:
+                    // the sidecar result below still lands.
+                    images.set_probs_built(id, probs, pyramid);
+                }
             }
             let count = bboxes.len();
             app.state::<roll::RollState>().record_scan_result(
@@ -1588,11 +1607,17 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
             // only needed for the pin and to reuse a resident decode/mask as
             // compute input -- both already happened above.
             let current_id = app.state::<roll::RollState>().image_id(index)?;
-            if let (Some(id), Some(pyramid)) = (current_id, pyramid) {
-                let mut images = images_state.lock().map_err(|e| e.to_string())?;
-                // A frame closed mid-heal is benign here: the heal cache
-                // already holds the result for the next activation or export.
-                images.set_healed(id, healed, pyramid, mask);
+            // Land in the registry only when this job's generation is still
+            // the live one -- see the Detect arm's identical check. The heal
+            // cache write above stays unconditional: it is roll-dir-scoped
+            // and content-validated, so it is safe regardless of generation.
+            if job.generation == app.state::<roll::RollState>().generation() {
+                if let (Some(id), Some(pyramid)) = (current_id, pyramid) {
+                    let mut images = images_state.lock().map_err(|e| e.to_string())?;
+                    // A frame closed mid-heal is benign here: the heal cache
+                    // already holds the result for the next activation or export.
+                    images.set_healed(id, healed, pyramid, mask);
+                }
             }
             Ok(())
         }
@@ -1620,7 +1645,14 @@ fn enqueue_job(
         },
         front,
     )?;
-    let _ = app.emit("job-queued", JobEvent { index, kind });
+    let _ = app.emit(
+        "job-queued",
+        JobEvent {
+            index,
+            kind,
+            generation,
+        },
+    );
     if queue
         .running
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1654,6 +1686,7 @@ fn enqueue_job(
                         JobEvent {
                             index: job.index,
                             kind: job.kind,
+                            generation,
                         },
                     );
                 }
@@ -1664,6 +1697,7 @@ fn enqueue_job(
                             index: job.index,
                             kind: job.kind,
                             message,
+                            generation,
                         },
                     );
                 }

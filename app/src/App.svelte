@@ -31,6 +31,7 @@
   interface RollInfo {
     dir: string;
     frames: FrameInfo[];
+    generation: number;
   }
 
   let info: ImageInfo | null = $state(null);
@@ -57,6 +58,14 @@
   // to be current when the job started.
   let jobStates: Record<number, { state: "queued" | "running"; kind: "detect" | "heal" }> =
     $state({});
+  // The generation the currently-open roll was opened under (from
+  // `open_roll`'s response). Primary guard for the job-* listeners below:
+  // every job event now carries the generation it was enqueued/run against,
+  // so a listener can drop an event belonging to a roll that has since been
+  // swapped out, even if a fresh roll's frame happens to reuse the same
+  // index (the race the index-only guard could not close). `null` when no
+  // roll is open.
+  let rollGeneration: number | null = $state(null);
 
   $effect(() => {
     const un = listen<{ id: number; done: number; total: number }>("heal-progress", (e) => {
@@ -190,79 +199,97 @@
   });
 
   $effect(() => {
-    const un = listen<{ index: number; kind: "detect" | "heal" }>("job-queued", (e) => {
-      jobStates[e.payload.index] = { state: "queued", kind: e.payload.kind };
-    });
-    return () => {
-      un.then((f) => f());
-    };
-  });
-
-  $effect(() => {
-    const un = listen<{ index: number; kind: "detect" | "heal" }>("job-started", (e) => {
-      // Backend job events carry no roll identity. Only trust an event for a
-      // job this frontend session actually queued (job-queued is the sole
-      // entry creator) -- an index left over from a previous roll (or from
-      // one cleared by a roll swap) must not resurrect a jobStates entry.
-      if (!(e.payload.index in jobStates)) return;
-      jobStates[e.payload.index] = { state: "running", kind: e.payload.kind };
-      // Heal-inputs capture happens at job START, not completion: the worker
-      // reads the frame's persisted threshold/strokes moments before this
-      // event fires, so these are the values the heal will actually use --
-      // input drift during a minutes-long heal must not be recorded as the
-      // heal's provenance. Keyed by the JOB's index (not currentIndex) so
-      // Heal-approved batch frames get proper captures too.
-      if (e.payload.kind === "heal" && roll) {
-        const frame = roll.frames[e.payload.index];
-        healInputs[`roll:${e.payload.index}`] = {
-          threshold: frame.threshold,
-          strokeCount: frame.strokes.length,
-        };
-      }
-    });
-    return () => {
-      un.then((f) => f());
-    };
-  });
-
-  $effect(() => {
-    const un = listen<{ index: number; kind: "detect" | "heal" }>("job-done", (e) => {
-      // Backend job events carry no roll identity: see the job-started
-      // listener's comment. A job-done for an index this session never
-      // queued belongs to a torn-down roll and must not flip
-      // detected/info.healed for whatever now occupies that index.
-      if (!(e.payload.index in jobStates)) return;
-      delete jobStates[e.payload.index];
-      // Index-guarded on purpose: only refresh detections / mark healed when
-      // the completed job belongs to the frame still on screen. Activity
-      // flags themselves are derived (see `rollDetecting`/`rollHealing`), so
-      // there is nothing to clear here for a stale/navigated-away index.
-      if (e.payload.index === currentIndex) {
-        if (e.payload.kind === "detect") {
-          detected = true;
-          void viewer?.refreshDetections(overlay.threshold);
-        } else if (info) {
-          info = { ...info, healed: true };
-        }
-      }
-    });
-    return () => {
-      un.then((f) => f());
-    };
-  });
-
-  $effect(() => {
-    const un = listen<{ index: number; kind: "detect" | "heal"; message: string }>(
-      "job-error",
+    const un = listen<{ index: number; kind: "detect" | "heal"; generation: number }>(
+      "job-queued",
       (e) => {
-        // Backend job events carry no roll identity: see the job-started
-        // listener's comment.
-        if (!(e.payload.index in jobStates)) return;
-        delete jobStates[e.payload.index];
-        const fileName = roll?.frames[e.payload.index]?.file_name ?? `frame ${e.payload.index}`;
-        error = `Frame ${fileName}: ${e.payload.message}`;
+        // Generation is the primary guard: a job event belongs to this
+        // session's open roll only if it was enqueued/run against the same
+        // generation `open_roll` handed back. Without this, a job queued
+        // just before a roll swap can land after the swap and be mistaken
+        // for a job against the NEW roll's same-index frame.
+        if (e.payload.generation !== rollGeneration) return;
+        jobStates[e.payload.index] = { state: "queued", kind: e.payload.kind };
       },
     );
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  $effect(() => {
+    const un = listen<{ index: number; kind: "detect" | "heal"; generation: number }>(
+      "job-started",
+      (e) => {
+        if (e.payload.generation !== rollGeneration) return;
+        // Index-in-jobStates guard stays as belt-and-braces: generation is
+        // the primary check above, but this also covers pre-generation
+        // edges (e.g. an event racing a listener re-subscribe) where an
+        // index was never actually queued this session.
+        if (!(e.payload.index in jobStates)) return;
+        jobStates[e.payload.index] = { state: "running", kind: e.payload.kind };
+        // Heal-inputs capture happens at job START, not completion: the worker
+        // reads the frame's persisted threshold/strokes moments before this
+        // event fires, so these are the values the heal will actually use --
+        // input drift during a minutes-long heal must not be recorded as the
+        // heal's provenance. Keyed by the JOB's index (not currentIndex) so
+        // Heal-approved batch frames get proper captures too.
+        if (e.payload.kind === "heal" && roll) {
+          const frame = roll.frames[e.payload.index];
+          healInputs[`roll:${e.payload.index}`] = {
+            threshold: frame.threshold,
+            strokeCount: frame.strokes.length,
+          };
+        }
+      },
+    );
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  $effect(() => {
+    const un = listen<{ index: number; kind: "detect" | "heal"; generation: number }>(
+      "job-done",
+      (e) => {
+        if (e.payload.generation !== rollGeneration) return;
+        // Index-in-jobStates guard stays as belt-and-braces: see the
+        // job-started listener's comment.
+        if (!(e.payload.index in jobStates)) return;
+        delete jobStates[e.payload.index];
+        // Index-guarded on purpose: only refresh detections / mark healed when
+        // the completed job belongs to the frame still on screen. Activity
+        // flags themselves are derived (see `rollDetecting`/`rollHealing`), so
+        // there is nothing to clear here for a stale/navigated-away index.
+        if (e.payload.index === currentIndex) {
+          if (e.payload.kind === "detect") {
+            detected = true;
+            void viewer?.refreshDetections(overlay.threshold);
+          } else if (info) {
+            info = { ...info, healed: true };
+          }
+        }
+      },
+    );
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  $effect(() => {
+    const un = listen<{
+      index: number;
+      kind: "detect" | "heal";
+      message: string;
+      generation: number;
+    }>("job-error", (e) => {
+      if (e.payload.generation !== rollGeneration) return;
+      // Index-in-jobStates guard stays as belt-and-braces: see the
+      // job-started listener's comment.
+      if (!(e.payload.index in jobStates)) return;
+      delete jobStates[e.payload.index];
+      const fileName = roll?.frames[e.payload.index]?.file_name ?? `frame ${e.payload.index}`;
+      error = `Frame ${fileName}: ${e.payload.message}`;
+    });
     return () => {
       un.then((f) => f());
     };
@@ -432,6 +459,7 @@
     const previousId = info?.id;
     const hadRoll = roll !== null;
     roll = null;
+    rollGeneration = null;
     loading = "Opening scan";
     if (hadRoll) {
       try {
@@ -487,6 +515,10 @@
       error = String(e);
       return;
     }
+    // Captured from the SAME response as `roll` itself, so the two are
+    // always consistent: the job listeners gate on this to drop events from
+    // whatever roll was open before this call.
+    rollGeneration = roll.generation;
     // Seed the stroke store from the sidecar-backed strokes each frame
     // already carries, so undo history and painted state survive a reopen.
     const seeded: Record<string, { strokes: StrokeData[]; redo: StrokeData[] }> = {};

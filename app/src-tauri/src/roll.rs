@@ -314,9 +314,18 @@ impl Frame {
 pub struct RollInfo {
     pub dir: String,
     pub frames: Vec<FrameInfo>,
+    /// The `RollState` generation this roll was opened under. `Roll::info`
+    /// cannot populate this itself -- generation is `RollState` bookkeeping,
+    /// not `Roll` state -- so `RollState::open` fills it in after the
+    /// generation bump. The frontend threads this back on every job event so
+    /// it can drop events from a roll that has since been swapped out.
+    pub generation: u64,
 }
 
 impl Roll {
+    /// `generation` is 0 here; `Roll` has no notion of `RollState`
+    /// generation. `RollState::open` overwrites it with the post-bump value
+    /// before returning -- see `RollInfo::generation`'s doc comment.
     pub fn info(&self) -> RollInfo {
         RollInfo {
             dir: self.dir.display().to_string(),
@@ -326,6 +335,7 @@ impl Roll {
                 .enumerate()
                 .map(|(i, f)| f.info(i))
                 .collect(),
+            generation: 0,
         }
     }
 }
@@ -362,7 +372,7 @@ impl RollState {
     /// close the returned ids.
     pub fn open(&self, dir: &Path) -> Result<(RollInfo, Vec<u64>), String> {
         let roll = Roll::open(dir)?;
-        let info = roll.info();
+        let mut info = roll.info();
         let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
         let stale_ids = guard
             .take()
@@ -378,7 +388,11 @@ impl RollState {
         if let Ok(mut lru) = self.lru.lock() {
             lru.clear();
         }
-        self.generation.fetch_add(1, Ordering::SeqCst);
+        // `info.generation` must reflect the generation THIS open produced,
+        // not whatever was live before it -- read post-bump so a caller
+        // (open_roll, then the frontend) can gate on "does this job event
+        // belong to the roll I just opened."
+        info.generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         Ok((info, stale_ids))
     }
 
@@ -747,6 +761,17 @@ mod state_tests {
     fn close_on_a_fresh_state_returns_no_ids() {
         let state = RollState::default();
         assert_eq!(state.close().unwrap(), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn roll_info_carries_the_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"x").unwrap();
+        let state = RollState::default();
+        let (info, _) = state.open(dir.path()).unwrap();
+        assert_eq!(info.generation, state.generation());
+        let (info2, _) = state.open(dir.path()).unwrap();
+        assert!(info2.generation > info.generation);
     }
 
     #[test]
