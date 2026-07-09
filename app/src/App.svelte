@@ -43,6 +43,13 @@
   let detecting = $state(false);
   let healing = $state(false);
 
+  // Healing model lifecycle. Starts "loaded" (not "missing") so the header
+  // button doesn't flash into existence before the mount-time
+  // `inpainter_status` fetch resolves.
+  let modelStatus: "loaded" | "available" | "missing" | "downloading" = $state("loaded");
+  let modelReceived = $state(0);
+  let modelTotal: number | null = $state(null);
+
   let roll: RollInfo | null = $state(null);
   let currentIndex = $state(0);
   // The index of the frame actually on screen. `currentIndex` is set
@@ -179,6 +186,55 @@
   $effect(() => {
     const un = listen<{ index: number }>("roll-thumb", (e) => {
       thumbVersions[e.payload.index] = (thumbVersions[e.payload.index] ?? 0) + 1;
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  $effect(() => {
+    (async () => {
+      try {
+        modelStatus = await invoke<"loaded" | "available" | "missing">("inpainter_status");
+      } catch (e) {
+        error = String(e);
+      }
+    })();
+  });
+
+  $effect(() => {
+    const un = listen<{ received: number; total: number | null }>("model-progress", (e) => {
+      modelReceived = e.payload.received;
+      modelTotal = e.payload.total;
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  $effect(() => {
+    const un = listen("model-done", () => {
+      modelStatus = "loaded";
+      modelReceived = 0;
+      modelTotal = null;
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  $effect(() => {
+    const un = listen<{ message: string }>("model-error", (e) => {
+      error = e.payload.message;
+      modelReceived = 0;
+      modelTotal = null;
+      (async () => {
+        try {
+          modelStatus = await invoke<"loaded" | "available" | "missing">("inpainter_status");
+        } catch (e2) {
+          error = String(e2);
+        }
+      })();
     });
     return () => {
       un.then((f) => f());
@@ -416,6 +472,34 @@
     }
   }
 
+  async function downloadModel() {
+    if (modelStatus === "downloading" || modelStatus === "loaded") return;
+    error = null;
+    modelStatus = "downloading";
+    modelReceived = 0;
+    modelTotal = null;
+    try {
+      await invoke("download_inpaint_model");
+    } catch (e) {
+      // model-error also fires and re-fetches inpainter_status; this catch
+      // just guards against a rejected invoke that never reaches the backend
+      // event path at all.
+      error = String(e);
+      try {
+        modelStatus = await invoke<"loaded" | "available" | "missing">("inpainter_status");
+      } catch (e2) {
+        error = String(e2);
+      }
+    }
+  }
+
+  function modelProgressText(): string {
+    if (modelTotal !== null && modelTotal > 0) {
+      return `${Math.floor((modelReceived / modelTotal) * 100)}%`;
+    }
+    return `${(modelReceived / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
   function strokeKey(): string | null {
     // Keyed off `displayedIndex`, not `currentIndex`: during the activation
     // window `currentIndex` already points at the frame being switched to
@@ -512,6 +596,11 @@
   <header>
     <button onclick={openScan} disabled={loading !== null}>Open scan</button>
     <button onclick={openRoll} disabled={loading !== null}>Open roll</button>
+    {#if modelStatus === "missing"}
+      <button onclick={downloadModel}>Download healing model (207 MB)</button>
+    {:else if modelStatus === "available"}
+      <button onclick={downloadModel}>Repair healing model</button>
+    {/if}
     {#if roll}
       <button
         onclick={approveAndAdvance}
@@ -580,6 +669,11 @@
           {/if}
         {/if}
       </p>
+    {/if}
+    {#if modelStatus === "downloading"}
+      <p class="status" role="status">downloading healing model {modelProgressText()}</p>
+    {:else if modelStatus === "missing" || modelStatus === "available"}
+      <p class="status" role="status">healing: classical fill only</p>
     {/if}
     {#if error}<p role="alert">{error}</p>{/if}
   </header>
