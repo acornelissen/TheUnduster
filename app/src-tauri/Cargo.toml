@@ -23,6 +23,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 sha2 = "0.10"
 tokio = { version = "1", features = ["fs", "io-util"] }
 futures-util = "0.3"
+zstd = "0.13"
 
 [dev-dependencies]
 tempfile = "3"

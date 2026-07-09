@@ -1,5 +1,6 @@
 //! TheUnduster desktop shell: thin Tauri layer over the engine crates.
 
+mod cache;
 mod detect;
 mod export;
 mod images;
