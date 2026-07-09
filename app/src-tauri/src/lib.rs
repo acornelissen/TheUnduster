@@ -1220,6 +1220,11 @@ struct JobError {
     generation: u64,
 }
 
+#[derive(serde::Serialize, Clone)]
+struct QueueIdlePayload {
+    generation: u64,
+}
+
 /// Clears the job-worker running flag when dropped, including on unwind, so
 /// a panic anywhere in the drain task can never wedge the queue permanently.
 /// Mirrors `ScanFlagGuard`.
@@ -1703,7 +1708,12 @@ fn enqueue_job(
                 }
             }
         }
-        let _ = app_for_task.emit("queue-idle", ());
+        // Emit the idle event with the current generation: the notice is about
+        // the worker for the roll that's open NOW, not a stale generation.
+        // This prevents an old worker's idle from wiping live jobs of a new
+        // roll via the index-in-jobStates guard on the event's generation.
+        let generation = app_for_task.state::<roll::RollState>().generation();
+        let _ = app_for_task.emit("queue-idle", QueueIdlePayload { generation });
     });
     Ok(())
 }

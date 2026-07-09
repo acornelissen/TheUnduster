@@ -300,7 +300,10 @@
     // out) -- NOT that every job succeeded. Treat it purely as a cleanup
     // signal for straggler jobState entries the done/error events missed
     // (e.g. jobs dropped mid-drain by a generation bump on roll close).
-    const un = listen("queue-idle", () => {
+    // Generation is the primary guard: ignore idles from stale workers that
+    // may have raced a roll swap (see job-queued listener's comment).
+    const un = listen<{ generation: number }>("queue-idle", (e) => {
+      if (e.payload.generation !== rollGeneration) return;
       jobStates = {};
     });
     return () => {
