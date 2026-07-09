@@ -35,14 +35,36 @@ pub struct Detector {
 }
 
 /// Rec.709 grey, matching unduster_training.io.to_gray.
+///
+/// Streams straight from the native pixels: going through to_f32 first
+/// materializes an interleaved f32 copy of the whole image (2 GB for a
+/// 168MP RGB scan) only to immediately reduce it, and that transient spike
+/// was enough to push the app past the OS memory watchdog on real color
+/// rolls. Normalization and operation order are kept identical to the
+/// to_f32-based reduction so the output stays bit-for-bit the same (pinned
+/// by gray_matches_to_f32_reference_u8_and_u16).
 fn to_gray_f32(img: &ImageBuf) -> Vec<f32> {
-    let f = img.to_f32();
     if img.channels == 1 {
-        return f;
+        return img.to_f32();
     }
-    f.chunks_exact(3)
-        .map(|p| 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2])
-        .collect()
+    match &img.data {
+        fd_io::PixelData::U8(v) => v
+            .chunks_exact(3)
+            .map(|p| {
+                0.2126 * (p[0] as f32 / 255.0)
+                    + 0.7152 * (p[1] as f32 / 255.0)
+                    + 0.0722 * (p[2] as f32 / 255.0)
+            })
+            .collect(),
+        fd_io::PixelData::U16(v) => v
+            .chunks_exact(3)
+            .map(|p| {
+                0.2126 * (p[0] as f32 / 65535.0)
+                    + 0.7152 * (p[1] as f32 / 65535.0)
+                    + 0.0722 * (p[2] as f32 / 65535.0)
+            })
+            .collect(),
+    }
 }
 
 /// Channel-first planes, adapting channel count to the model.
@@ -165,5 +187,76 @@ impl Detector {
             .iter()
             .map(|&p| p > threshold)
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fd_io::PixelData;
+
+    fn rgb_image(data: PixelData, w: u32, h: u32) -> ImageBuf {
+        ImageBuf {
+            width: w,
+            height: h,
+            channels: 3,
+            data,
+            icc: None,
+            exif: None,
+        }
+    }
+
+    fn pseudo_random_bytes(n: usize) -> Vec<u8> {
+        let mut s = 7u32;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                (s >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// The streaming gray path must be bit-identical to the reference
+    /// reduction over to_f32 (same normalization, same operation order) --
+    /// the detector's output feeds threshold comparisons, so even 1-ulp
+    /// drift would move defect boundaries between releases.
+    #[test]
+    fn gray_matches_to_f32_reference_u8_and_u16() {
+        let (w, h) = (37u32, 23u32);
+        let n = (w * h) as usize;
+
+        let bytes = pseudo_random_bytes(n * 3);
+        let img8 = rgb_image(PixelData::U8(bytes.clone()), w, h);
+        let reference8: Vec<f32> = img8
+            .to_f32()
+            .chunks_exact(3)
+            .map(|p| 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2])
+            .collect();
+        assert_eq!(to_gray_f32(&img8), reference8);
+
+        let words: Vec<u16> = pseudo_random_bytes(n * 3)
+            .into_iter()
+            .map(|b| (b as u16) << 8 | 0x2f)
+            .collect();
+        let img16 = rgb_image(PixelData::U16(words), w, h);
+        let reference16: Vec<f32> = img16
+            .to_f32()
+            .chunks_exact(3)
+            .map(|p| 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2])
+            .collect();
+        assert_eq!(to_gray_f32(&img16), reference16);
+    }
+
+    #[test]
+    fn gray_passes_single_channel_through() {
+        let img = ImageBuf {
+            width: 4,
+            height: 2,
+            channels: 1,
+            data: PixelData::U8(vec![0, 51, 102, 153, 204, 255, 7, 91]),
+            icc: None,
+            exif: None,
+        };
+        assert_eq!(to_gray_f32(&img), img.to_f32());
     }
 }
