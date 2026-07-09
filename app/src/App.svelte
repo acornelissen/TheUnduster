@@ -89,6 +89,8 @@
   // don't need to know which mode is active.
   const isDetecting = $derived(detecting || rollDetecting);
   const isHealing = $derived(healing || rollHealing);
+  // Count of queued jobs (all states, all frames) for the status line.
+  const queuedJobCount = $derived(Object.keys(jobStates).length);
   // The index of the frame actually on screen. `currentIndex` is set
   // synchronously on navigation (stepFrame/selectFrame/approveAndAdvance)
   // before `activate_frame` resolves, so during that window the OLD frame is
@@ -932,6 +934,9 @@
           &mdash; Healing...{#if healProgress}
             ({healProgress.done}/{healProgress.total} defects){/if}
         {/if}
+        {#if queuedJobCount > 0}
+          &mdash; {queuedJobCount} job{queuedJobCount === 1 ? "" : "s"} queued
+        {/if}
         {#if info?.healed}
           &mdash; space toggles before/after
         {/if}
@@ -976,7 +981,7 @@
         healedAvailable={info.healed ?? false}
         onRequestDetect={requestDetect}
         onRequestHeal={requestHeal}
-        bboxes={roll ? roll.frames[currentIndex].bboxes : null}
+        bboxes={roll ? roll.frames[displayedIndex].bboxes : null}
         strokes={currentStrokes()}
         redoStrokes={currentRedoStrokes()}
         {onStrokesChange}
