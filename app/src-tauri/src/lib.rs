@@ -635,18 +635,25 @@ fn scan_roll(
 
             #[cfg(debug_assertions)]
             eprintln!("[queue] frame {index} detect starting");
-            // Stage 2: detection on the already-decoded frame.
+            // Stage 2: detection on the already-decoded frame. Only the
+            // decoded pixels cross into the closure: the display pyramid
+            // built for the thumbnail is over a gigabyte on a 168MP scan and
+            // detection never reads it, while inference itself is the app's
+            // peak-memory window -- keeping the pyramid alive through it
+            // helped push real color rolls into the OS memory killer.
+            let image = prepared.image;
+            drop(prepared.pyramid);
             let detector = detector.clone();
             let outcome = tauri::async_runtime::spawn_blocking(move || {
-                let probs = detector.detect(&prepared.image)?;
+                let probs = detector.detect(&image)?;
                 Ok::<_, String>(images::components_from_probs(
                     &probs,
-                    prepared.image.width,
-                    prepared.image.height,
+                    image.width,
+                    image.height,
                     SCAN_THRESHOLD,
                 ))
-                // `prepared` (and its full-res pixels) drops here, before the
-                // task moves to the next frame.
+                // `image` (the full-res pixels) drops here, before the task
+                // moves to the next frame.
             })
             .await
             .map_err(|e| e.to_string())

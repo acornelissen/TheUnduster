@@ -94,6 +94,26 @@ impl Detector {
             reason,
         };
         let mut builder = Session::builder().map_err(|e| mk_err(e.to_string()))?;
+        // The session lives for the whole app run and serves hundreds of
+        // same-shaped tile inferences per scanned frame. The default CPU
+        // arena retains its high-water mark for the session's lifetime, so
+        // run without an arena and without memory-pattern preallocation:
+        // measured neutral on single-frame speed and peak (35.6s vs 36.7s,
+        // ~10 GB transient either way on 168MP), but freed pages return to
+        // the OS between frames instead of accruing in a long-lived arena.
+        builder = builder
+            .with_memory_pattern(false)
+            .map_err(|e| mk_err(e.to_string()))?;
+        let cpu_no_arena = ort::memory::MemoryInfo::new(
+            ort::memory::AllocationDevice::CPU,
+            0,
+            ort::memory::AllocatorType::Device,
+            ort::memory::MemoryType::Default,
+        )
+        .map_err(|e| mk_err(e.to_string()))?;
+        builder = builder
+            .with_allocator(cpu_no_arena)
+            .map_err(|e| mk_err(e.to_string()))?;
         if let Ep::CoreML = ep {
             builder = builder
                 .with_execution_providers([
