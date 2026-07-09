@@ -914,6 +914,10 @@ fn scan_roll(
                 let detector = detector.clone();
                 let cache_path = roll::probs_cache_path(&roll_dir, &file_name);
                 let outcome = tauri::async_runtime::spawn_blocking(move || {
+                    // Stamp BEFORE decoding (fail-safe direction: a source
+                    // changed after the stat mismatches on the next read
+                    // instead of pairing a fresh stamp with stale pixels).
+                    let stamp = stamp_or_skip(&path);
                     let image = images::Images::decode_stage(&path)?;
                     // detect_hashed pairs the output with the hash of the model
                     // that produced it under one lock -- see its doc comment --
@@ -928,9 +932,9 @@ fn scan_roll(
                     );
                     // Cache write is sequential with detection here (milliseconds
                     // against a ~9s detect); failures eprintln in debug only,
-                    // never fail the scan. A source stat failure skips the write
-                    // outright (stamp_or_skip's contract).
-                    if let Some(stamp) = stamp_or_skip(&path) {
+                    // never fail the scan. A source stat failure skipped the
+                    // stamp above, which skips this write outright.
+                    if let Some(stamp) = stamp {
                         if let Err(_e) = cache::write_probs(
                             &cache_path,
                             &probs,
@@ -1184,14 +1188,15 @@ fn export_approved(
                         let _ = app_for_stages
                             .emit("export-frame-stage", ExportFrameStage { index, stage: s });
                     };
+                    // Stamp BEFORE decoding: if the source changes after the
+                    // stat, the stamp mismatches on the next read (benign
+                    // miss). Stamping after the read would accept a fresh
+                    // stamp over stale pixels -- the fail-unsafe direction.
+                    // A stat failure skips the heal-cache interaction (read
+                    // AND write) entirely; it must never fail the export.
+                    let stamp = stamp_or_skip(&path);
                     let image = images::Images::decode_stage(&path)?;
                     masks::validate_strokes(&frame_strokes)?;
-
-                    // A source stat failure skips the heal-cache interaction
-                    // (read AND write) entirely, falling straight through to
-                    // the transient detect/heal below -- it must never fail
-                    // the export.
-                    let stamp = stamp_or_skip(&path);
 
                     // Everything provenance-dependent happens inside the one
                     // with_inpainter_hashed lock, exactly as in run_heal: the
