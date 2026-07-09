@@ -913,10 +913,25 @@ pub fn run() {
                 if state.load(&fixtures.join("demo-detector.onnx")).is_err() {
                     let _ = state.load(&fixtures.join("tiny-detector.onnx"));
                 }
-                let _ = app
-                    .state::<detect::InpainterState>()
-                    .load(&fixtures.join("tiny-inpaint.onnx"));
             }
+            let inpainter = app.state::<detect::InpainterState>();
+            let mut loaded = false;
+            if let Ok(lama) = models::lama_path(app.handle()) {
+                if lama.exists() {
+                    match inpainter.load(&lama) {
+                        Ok(()) => loaded = true,
+                        Err(e) => eprintln!("[models] lama load failed, falling back: {e}"),
+                    }
+                }
+            }
+            #[cfg(debug_assertions)]
+            if !loaded {
+                let fixtures =
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../engine/fixtures");
+                let _ = inpainter.load(&fixtures.join("tiny-inpaint.onnx"));
+            }
+            #[cfg(not(debug_assertions))]
+            let _ = loaded;
             Ok(())
         })
         .run(tauri::generate_context!())
