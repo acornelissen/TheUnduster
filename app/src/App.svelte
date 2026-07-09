@@ -6,6 +6,7 @@
   import Filmstrip from "./lib/Filmstrip.svelte";
   import { nextUnapprovedIndex } from "./lib/roll-nav";
   import type { Level } from "./lib/viewport";
+  import { undoStroke, redoStroke, type StrokeData } from "./lib/brush";
 
   interface ImageInfo {
     id: number;
@@ -23,6 +24,8 @@
     exported: boolean;
     defect_count: number | null;
     bboxes: [number, number, number, number][] | null;
+    strokes: StrokeData[];
+    redo_strokes: StrokeData[];
   }
 
   interface RollInfo {
@@ -45,6 +48,12 @@
   let scanDone = $state(false);
   let exporting = $state(false);
   let thresholdSaveTimer: ReturnType<typeof setTimeout> | undefined;
+
+  // Per-frame brush stroke undo/redo stacks, keyed by roll index
+  // (`roll:{index}`) or by the single-image's id (`single:{id}`). Roll
+  // frames persist to the sidecar via set_frame_strokes; single-image
+  // strokes are session-local and never written anywhere.
+  let strokeStore: Record<string, { strokes: StrokeData[]; redo: StrokeData[] }> = $state({});
   // Monotonically increasing activation sequence number. Rapid ,/. presses
   // can fire overlapping `activate_frame` invokes whose resolutions race;
   // each call captures its own `seq` and drops its result if a newer
@@ -216,6 +225,13 @@
       error = String(e);
       return;
     }
+    // Seed the stroke store from the sidecar-backed strokes each frame
+    // already carries, so undo history and painted state survive a reopen.
+    const seeded: Record<string, { strokes: StrokeData[]; redo: StrokeData[] }> = {};
+    roll.frames.forEach((f, i) => {
+      seeded[`roll:${i}`] = { strokes: f.strokes, redo: f.redo_strokes };
+    });
+    strokeStore = seeded;
     currentIndex = 0;
     if (roll.frames.length > 0) {
       await activateCurrentFrame();
@@ -367,12 +383,45 @@
     error = null;
     healing = true;
     try {
-      await invoke("heal_frame", { id: info.id, threshold: overlay.threshold, strokes: [] });
+      await invoke("heal_frame", {
+        id: info.id,
+        threshold: overlay.threshold,
+        strokes: currentStrokes(),
+      });
       info = { ...info, healed: true };
     } catch (e) {
       error = String(e);
     } finally {
       healing = false;
+    }
+  }
+
+  function strokeKey(): string | null {
+    if (roll) return `roll:${currentIndex}`;
+    if (info) return `single:${info.id}`;
+    return null;
+  }
+
+  function currentStrokes(): StrokeData[] {
+    const key = strokeKey();
+    return key ? (strokeStore[key]?.strokes ?? []) : [];
+  }
+
+  function currentRedoStrokes(): StrokeData[] {
+    const key = strokeKey();
+    return key ? (strokeStore[key]?.redo ?? []) : [];
+  }
+
+  function onStrokesChange(strokes: StrokeData[], redo: StrokeData[]) {
+    const key = strokeKey();
+    if (!key) return;
+    strokeStore[key] = { strokes, redo };
+    if (roll) {
+      invoke("set_frame_strokes", { index: currentIndex, strokes, redoStrokes: redo }).catch(
+        (e) => {
+          error = String(e);
+        },
+      );
     }
   }
 
@@ -383,6 +432,23 @@
   }
 
   function onWindowKey(e: KeyboardEvent) {
+    // Undo/redo must work regardless of which element has focus (the canvas
+    // owns its own keydown handler, but the operator may be tabbed to a
+    // button or the sensitivity slider when they reach for cmd-z), so this
+    // check runs before the typing-target guard below and before the `roll`
+    // gate that the roll-navigation keys need.
+    if (e.metaKey && (e.key === "z" || e.key === "Z")) {
+      if (isTypingTarget(e.target)) return;
+      const key = strokeKey();
+      if (!key) return;
+      e.preventDefault();
+      const before = strokeStore[key] ?? { strokes: [], redo: [] };
+      const result = e.shiftKey
+        ? redoStroke(before.strokes, before.redo)
+        : undoStroke(before.strokes, before.redo);
+      onStrokesChange(result.strokes, result.redo);
+      return;
+    }
     if (!roll) return;
     // Roll navigation keys must not fire while the operator is typing in a
     // form control (e.g. the sensitivity slider has focus via keyboard, or
@@ -462,6 +528,9 @@
         {#if info?.healed}
           &mdash; space toggles before/after
         {/if}
+        {#if viewer?.brushStatus()}
+          &mdash; {viewer.brushStatus()}
+        {/if}
         {#if roll}
           &mdash; {roll.frames.filter((f) => f.approved).length}/{roll.frames.length} approved
           {#if !scanDone}
@@ -492,6 +561,9 @@
         onRequestDetect={requestDetect}
         onRequestHeal={requestHeal}
         bboxes={roll ? roll.frames[currentIndex].bboxes : null}
+        strokes={currentStrokes()}
+        redoStrokes={currentRedoStrokes()}
+        {onStrokesChange}
       />
     {:else if !showLoader}
       <p class="hint">Open a scan or a roll to begin.</p>
