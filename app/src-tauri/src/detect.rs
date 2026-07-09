@@ -54,6 +54,29 @@ impl DetectorState {
         }
     }
 
+    /// Runs inference and reads the model's file hash under one lock
+    /// acquisition, mirroring `InpainterState::with_inpainter_hashed`'s
+    /// rationale: `detect()` and `hash()` taken as two separate locks would
+    /// let a model load complete between them, so the model that actually
+    /// produced `probs` could be model B while the hash returned (from a
+    /// call before or after) says model A. Pairing them under a single guard
+    /// makes "the hash recorded for cache provenance" and "the model that
+    /// detected" the same observation, closing that race. Errors exactly
+    /// like `detect()` when no detector is loaded.
+    pub fn detect_hashed(&self, img: &ImageBuf) -> Result<(Vec<f32>, [u8; 32]), String> {
+        let mut guard = self.0.lock().map_err(|e| e.to_string())?;
+        match guard.as_mut() {
+            Some(loaded) => {
+                let probs = loaded
+                    .detector
+                    .probabilities(img)
+                    .map_err(|e| e.to_string())?;
+                Ok((probs, loaded.hash))
+            }
+            None => Err("no detector loaded".to_string()),
+        }
+    }
+
     /// The producing detector's file hash, for cache provenance. `None` on
     /// no detector loaded, or (via `.ok()`) on a poisoned mutex -- unlike
     /// sibling methods, poisoning is not propagated as `Err` here: a
@@ -206,6 +229,26 @@ mod tests {
     fn inpaint_fixture() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../engine/fixtures/tiny-inpaint.onnx")
+    }
+
+    #[test]
+    fn detect_hashed_pairs_output_with_the_producing_model() {
+        let state = DetectorState::default();
+        state.load(&fixture()).unwrap();
+        let expected = state.hash().unwrap();
+        let img = ImageBuf {
+            width: 64,
+            height: 48,
+            channels: 1,
+            data: PixelData::U8(vec![128; 64 * 48]),
+            icc: None,
+            exif: None,
+        };
+        let (probs, hash) = state.detect_hashed(&img).unwrap();
+        assert_eq!(probs.len(), 64 * 48);
+        assert_eq!(hash, expected);
+        let none = DetectorState::default();
+        assert!(none.detect_hashed(&img).is_err());
     }
 
     #[test]

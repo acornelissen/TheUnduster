@@ -130,12 +130,14 @@ async fn run_detect(
     let cache_path = roll
         .frame_for_image(id)?
         .map(|(roll_dir, file_name)| roll::probs_cache_path(&roll_dir, &file_name));
-    let detector_hash = detector.hash();
     let detector = detector.inner().clone(); // DetectorState is Clone over an Arc
     let (probs, pyramid) = tauri::async_runtime::spawn_blocking(move || {
-        let probs = detector.detect(&img)?;
-        if let (Some(path), Some(hash)) = (&cache_path, &detector_hash) {
-            if let Err(_e) = cache::write_probs(path, &probs, img.width, img.height, hash) {
+        // detect_hashed pairs the output with the hash of the model that
+        // produced it under one lock -- see its doc comment -- so the cache
+        // write below can never record a different model's hash.
+        let (probs, hash) = detector.detect_hashed(&img)?;
+        if let Some(path) = &cache_path {
+            if let Err(_e) = cache::write_probs(path, &probs, img.width, img.height, &hash) {
                 #[cfg(debug_assertions)]
                 eprintln!("[cache] probs write failed for image {id}: {_e}");
             }
@@ -232,6 +234,8 @@ async fn run_heal(
     // The CURRENT detector's hash: the thresholded probs in the registry came
     // from it. Zeros when none loaded -- that race (detector swapped between
     // detect and heal) is bead-tracked separately as unreachable in practice.
+    // Read path only (feeds provenance, not a cache write): a race here is a
+    // benign cache miss.
     let detector_hash = detector.hash().unwrap_or([0u8; 32]);
     let inpainter = inpainter.inner().clone();
     let app_for_progress = app.clone();
@@ -560,6 +564,8 @@ async fn activate_frame(
     // awaiting it here made every first frame visit seconds slower (field
     // report) -- activation must return at decode speed. A stale or closed
     // id is harmless: set_probs_built validates and drops the result.
+    // Read path only (cache lookup, not a write): a race against a
+    // concurrent model swap is a benign cache miss.
     if let (Some((roll_dir, file_name)), Some(hash)) =
         (roll.frame_for_image(info.id)?, detector.hash())
     {
@@ -851,11 +857,14 @@ fn scan_roll(
             // ever reads the decoded pixels for detection, so building the
             // multi-resolution display pyramid would just waste memory/CPU.
             let detector = detector.clone();
-            let detector_hash = detector.hash();
             let cache_path = roll::probs_cache_path(&roll_dir, &file_name);
             let outcome = tauri::async_runtime::spawn_blocking(move || {
                 let image = images::Images::decode_stage(&path)?;
-                let probs = detector.detect(&image)?;
+                // detect_hashed pairs the output with the hash of the model
+                // that produced it under one lock -- see its doc comment --
+                // so the cache write below can never record a different
+                // model's hash.
+                let (probs, hash) = detector.detect_hashed(&image)?;
                 let bboxes = images::components_from_probs(
                     &probs,
                     image.width,
@@ -865,13 +874,11 @@ fn scan_roll(
                 // Cache write is sequential with detection here (milliseconds
                 // against a ~9s detect); failures eprintln in debug only,
                 // never fail the scan.
-                if let Some(hash) = detector_hash {
-                    if let Err(_e) =
-                        cache::write_probs(&cache_path, &probs, image.width, image.height, &hash)
-                    {
-                        #[cfg(debug_assertions)]
-                        eprintln!("[queue] frame {index} probs cache write failed: {_e}");
-                    }
+                if let Err(_e) =
+                    cache::write_probs(&cache_path, &probs, image.width, image.height, &hash)
+                {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[queue] frame {index} probs cache write failed: {_e}");
                 }
                 Ok::<_, String>(bboxes)
                 // `image` (the full-res pixels) drops here, before the task
@@ -1033,6 +1040,8 @@ fn export_approved(
                 // resolved here, before the closure -- mirroring run_heal --
                 // since it is not itself provenance-racy the way the
                 // inpainter is (see with_inpainter_hashed's doc comment).
+                // Read path only (feeds provenance, not a cache write): a
+                // race here is a benign cache miss.
                 let detector = detector.clone();
                 let inpainter = inpainter.clone();
                 let detector_hash = detector.hash().unwrap_or([0u8; 32]);
@@ -1234,6 +1243,9 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
             };
             let detector_state = app.state::<detect::DetectorState>();
             let detector = detector_state.inner().clone();
+            // Read-path lookup only: a race against a concurrent model swap
+            // means at worst a benign cache miss (falls through to a fresh,
+            // correctly-paired detect below via detect_hashed).
             let detector_hash = detector_state.hash();
             let cache_path = roll::probs_cache_path(&roll_dir, &file_name);
             let (probs, pyramid, bboxes) = tauri::async_runtime::spawn_blocking(move || {
@@ -1243,20 +1255,27 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                 let cached = detector_hash.as_ref().and_then(|hash| {
                     cache::read_probs(&cache_path, image.width, image.height, hash)
                 });
-                let (probs, fresh) = match cached {
-                    Some(probs) => (probs, false),
-                    None => (detector.detect(&image)?, true),
-                };
-                if fresh {
-                    if let Some(hash) = &detector_hash {
-                        if let Err(_e) =
-                            cache::write_probs(&cache_path, &probs, image.width, image.height, hash)
-                        {
+                let probs = match cached {
+                    Some(probs) => probs,
+                    None => {
+                        // detect_hashed pairs the output with the hash of the
+                        // model that produced it under one lock -- see its
+                        // doc comment -- so the cache write below can never
+                        // record a different model's hash.
+                        let (probs, hash) = detector.detect_hashed(&image)?;
+                        if let Err(_e) = cache::write_probs(
+                            &cache_path,
+                            &probs,
+                            image.width,
+                            image.height,
+                            &hash,
+                        ) {
                             #[cfg(debug_assertions)]
                             eprintln!("[jobs] frame {index} probs cache write failed: {_e}");
                         }
+                        probs
                     }
-                }
+                };
                 let bboxes = images::components_from_probs(
                     &probs,
                     image.width,
@@ -1353,7 +1372,10 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
             };
             let detector_state = app.state::<detect::DetectorState>();
             let detector = detector_state.inner().clone();
-            // The Option distinguishes "no detector loaded" (no cache IO) from
+            // Read path only: this hash feeds provenance and the probs-cache
+            // lookup below, not a cache write, so a race against a concurrent
+            // model swap means at worst a benign cache/provenance miss. The
+            // Option distinguishes "no detector loaded" (no cache IO) from
             // the zeros sentinel run_heal folds into provenance.
             let detector_hash_opt = detector_state.hash();
             let detector_hash = detector_hash_opt.unwrap_or([0u8; 32]);
@@ -1406,20 +1428,23 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                             let probs = match cached {
                                 Some(p) => p,
                                 None => {
-                                    let probs = detector.detect(&image)?;
-                                    if let Some(hash) = &detector_hash_opt {
-                                        if let Err(_e) = cache::write_probs(
-                                            &probs_cache_path,
-                                            &probs,
-                                            image.width,
-                                            image.height,
-                                            hash,
-                                        ) {
-                                            #[cfg(debug_assertions)]
-                                            eprintln!(
-                                                "[jobs] frame {index} probs cache write failed: {_e}"
-                                            );
-                                        }
+                                    // detect_hashed pairs the output with the
+                                    // hash of the model that produced it
+                                    // under one lock -- see its doc comment
+                                    // -- so the cache write below can never
+                                    // record a different model's hash.
+                                    let (probs, hash) = detector.detect_hashed(&image)?;
+                                    if let Err(_e) = cache::write_probs(
+                                        &probs_cache_path,
+                                        &probs,
+                                        image.width,
+                                        image.height,
+                                        &hash,
+                                    ) {
+                                        #[cfg(debug_assertions)]
+                                        eprintln!(
+                                            "[jobs] frame {index} probs cache write failed: {_e}"
+                                        );
                                     }
                                     probs
                                 }
@@ -1451,7 +1476,9 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                         cache::write_heal(&heal_cache_path, &image, &copy, &mask, &provenance)
                     {
                         #[cfg(debug_assertions)]
-                        eprintln!("[cache] heal write failed for frame {index} ({file_name}): {_e}");
+                        eprintln!(
+                            "[cache] heal write failed for frame {index} ({file_name}): {_e}"
+                        );
                     }
                     let healed = std::sync::Arc::new(copy);
                     // Always build; see the cache-hit branch above for why.
