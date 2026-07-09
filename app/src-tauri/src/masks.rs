@@ -56,8 +56,21 @@ pub fn validate_strokes(strokes: &[Stroke]) -> Result<(), String> {
 
 /// Rasterizes strokes onto `mask` in order. Paint sets pixels; erase clears
 /// them -- including pixels the detector set, which is the point of `e`.
+/// Mismatched inputs (zero dimensions or mask length != width * height) are a
+/// no-op, treating degenerate sidecar data as invalid rather than panicking.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn apply_strokes(mask: &mut [bool], width: u32, height: u32, strokes: &[Stroke]) {
+    // Early exit on zero dimensions to avoid clamp panics.
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    // Validate mask length matches dimensions before rasterizing.
+    let expected_len = width as usize * height as usize;
+    if mask.len() != expected_len {
+        return;
+    }
+
     for s in strokes {
         let value = !s.erase;
         if s.points.len() == 1 {
@@ -206,5 +219,26 @@ mod tests {
             .map(|_| dab(1.0, 1.0, 5.0, false))
             .collect();
         assert!(validate_strokes(&too_many).is_err());
+    }
+
+    #[test]
+    fn zero_dimensions_are_a_no_op() {
+        // width == 0 case: empty mask
+        let mut mask = vec![];
+        apply_strokes(&mut mask, 0, 0, &[dab(1.0, 1.0, 4.0, false)]);
+        assert!(mask.is_empty());
+
+        // 0 x 8 case: empty mask
+        let mut mask = vec![];
+        apply_strokes(&mut mask, 0, 8, &[dab(1.0, 1.0, 4.0, false)]);
+        assert!(mask.is_empty());
+    }
+
+    #[test]
+    fn mismatched_mask_length_is_a_no_op() {
+        let mut mask = vec![false; 10];
+        apply_strokes(&mut mask, 8, 8, &[dab(4.0, 4.0, 2.0, false)]);
+        // mask should be unchanged, all false
+        assert!(mask.iter().all(|&b| !b));
     }
 }
