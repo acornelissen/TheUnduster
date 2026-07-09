@@ -627,6 +627,27 @@ mod tests {
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
+    fn noisy8(w: u32, h: u32) -> fd_io::ImageBuf {
+        let n = (w * h * 3) as usize;
+        let mut s = 0x9E3779B97F4A7C15u64;
+        let data: Vec<u8> = (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 56) as u8
+            })
+            .collect();
+        fd_io::ImageBuf {
+            width: w,
+            height: h,
+            channels: 3,
+            data: fd_io::PixelData::U8(data),
+            icc: None,
+            exif: None,
+        }
+    }
+
     fn noisy16(w: u32, h: u32) -> fd_io::ImageBuf {
         let n = (w * h * 3) as usize;
         let mut s = 0x2545F4914F6CDD1Du64;
@@ -646,6 +667,40 @@ mod tests {
             icc: Some(vec![1, 2, 3]),
             exif: None,
         }
+    }
+
+    #[test]
+    fn heal_delta_round_trips_bit_exact_u8() {
+        // The reference rolls are 8-bit JPEGs, so U8 is the dominant
+        // production depth; the gather/scatter branches are depth-specific
+        // and each needs its own bit-exact pin.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.heal");
+        let original = noisy8(40, 30);
+        let mut healed = original.clone();
+        let mut mask = vec![false; 40 * 30];
+        for y in 5..12 {
+            for x in 20..35 {
+                mask[y * 40 + x] = true;
+            }
+        }
+        if let fd_io::PixelData::U8(v) = &mut healed.data {
+            for (i, &m) in mask.iter().enumerate() {
+                if m {
+                    for c in 0..3 {
+                        v[i * 3 + c] = v[i * 3 + c].wrapping_add(10 + c as u8);
+                    }
+                }
+            }
+        }
+        let prov = heal_provenance(0.5, 2, &[], &[3u8; 32], &[4u8; 32]);
+        write_heal(&p, &original, &healed, &mask, &prov).unwrap();
+        let (back, back_mask) = read_heal(&p, &original, &prov).expect("cache hit");
+        assert_eq!(back_mask, mask);
+        let (fd_io::PixelData::U8(a), fd_io::PixelData::U8(b)) = (&healed.data, &back.data) else {
+            panic!("depth changed");
+        };
+        assert_eq!(a, b, "U8 reconstruction must be bit-exact");
     }
 
     #[test]
