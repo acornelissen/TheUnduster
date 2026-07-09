@@ -158,20 +158,34 @@ pub fn read_probs(
     ]);
     offset += 8;
 
-    // Validate compressed length fits in file
-    if offset as u64 + compressed_len != bytes.len() as u64 {
+    // Validate compressed length fits in file. Use checked_add: a crafted
+    // length near u64::MAX must not panic on overflow in debug builds.
+    let total_len = match (offset as u64).checked_add(compressed_len) {
+        Some(t) => t,
+        None => return corrupt(), // length arithmetic overflow is structural corruption
+    };
+    if total_len != bytes.len() as u64 {
         return corrupt();
     }
 
-    // Decompress
+    // Expected decompressed size is known before decompressing; use it to
+    // bound the allocation so a crafted small file can't decompress-bomb us.
+    let expected_size = match (width as usize).checked_mul(height as usize) {
+        Some(s) => s,
+        None => return corrupt(), // unreachable on 64-bit, but treat as corruption not a bare bailout
+    };
+
+    // Decompress, capped at expected_size. bulk::decompress's capacity is
+    // exact: a frame that decompresses to more than expected_size errors,
+    // which is exactly the corruption signal we want. Equal-but-wrong
+    // content is caught by the length/hash checks below.
     let compressed_data = &bytes[offset..];
-    let quantized = match zstd::decode_all(compressed_data) {
+    let quantized = match zstd::bulk::decompress(compressed_data, expected_size) {
         Ok(q) => q,
         Err(_) => return corrupt(),
     };
 
     // Validate decompressed size
-    let expected_size = (width as usize).checked_mul(height as usize)?;
     if quantized.len() != expected_size {
         return corrupt();
     }
@@ -221,6 +235,57 @@ mod tests {
         assert!(read_probs(&p, 16, 16, &[1u8; 32]).is_none()); // corrupt payload
         assert!(!p.exists(), "corrupt file deleted on sight");
         assert!(read_probs(&p, 16, 16, &[1u8; 32]).is_none()); // absent -> None
+    }
+
+    #[test]
+    fn crafted_length_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.probs");
+        let probs = synth_probs(16 * 16);
+        let hash = [1u8; 32];
+        write_probs(&p, &probs, 16, 16, &hash).unwrap();
+
+        // Overwrite the compressed_len field (offset 52..60) with u64::MAX.
+        let mut bytes = std::fs::read(&p).unwrap();
+        bytes[52..60].copy_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&p, &bytes).unwrap();
+
+        assert!(read_probs(&p, 16, 16, &hash).is_none());
+        assert!(!p.exists(), "crafted length is treated as corruption");
+    }
+
+    #[test]
+    fn oversized_decompression_is_rejected_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.probs");
+        let width: u32 = 16;
+        let height: u32 = 16; // expected decompressed size = 256 bytes
+
+        // zstd frame that decompresses to 1MB of zeros -- wildly more than
+        // the 256 bytes the header claims.
+        let bomb_payload = vec![0u8; 1024 * 1024];
+        let compressed = zstd::encode_all(&bomb_payload[..], 3).unwrap();
+
+        let mut header = Vec::new();
+        header.extend_from_slice(PROBS_MAGIC);
+        header.extend_from_slice(&1u32.to_le_bytes());
+        header.extend_from_slice(&width.to_le_bytes());
+        header.extend_from_slice(&height.to_le_bytes());
+        header.extend_from_slice(&[3u8; 32]);
+        header.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+        header.extend_from_slice(&compressed);
+
+        std::fs::write(&p, &header).unwrap();
+
+        // Bounded decompression must reject (not allocate 1MB and then
+        // reject after the fact) -- we can only assert on the outcome:
+        // rejection plus deletion, since allocation size isn't observable
+        // from a test.
+        assert!(read_probs(&p, width, height, &[3u8; 32]).is_none());
+        assert!(
+            !p.exists(),
+            "oversized decompression is treated as corruption"
+        );
     }
 
     #[test]
