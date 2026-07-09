@@ -19,6 +19,10 @@ fd-io = { path = "../../engine/crates/fd-io" }
 fd-tiles = { path = "../../engine/crates/fd-tiles" }
 fd-infer = { path = "../../engine/crates/fd-infer" }
 fd-heal = { path = "../../engine/crates/fd-heal" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["fs", "io-util"] }
+futures-util = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

@@ -4,6 +4,7 @@ mod detect;
 mod export;
 mod images;
 mod masks;
+mod models;
 mod protocol;
 mod roll;
 
@@ -872,6 +873,7 @@ pub fn run() {
         .manage(detect::DetectorState::default())
         .manage(detect::InpainterState::default())
         .manage(roll::RollState::default())
+        .manage(models::ModelDownloadState::default())
         .invoke_handler(tauri::generate_handler![
             log_js_error,
             open_image,
@@ -889,7 +891,9 @@ pub fn run() {
             set_frame_strokes,
             export_frame,
             scan_roll,
-            export_approved
+            export_approved,
+            models::inpainter_status,
+            models::download_inpaint_model
         ])
         .register_uri_scheme_protocol("tiles", |ctx, request| {
             let images = ctx.app_handle().state::<Mutex<Images>>();
