@@ -3,7 +3,15 @@
   import { invoke } from "@tauri-apps/api/core";
   import { fitZoom, visibleTiles, ringsFor, TILE, type Level } from "./viewport";
   import { TileRenderer, probPathFor, type StrokeSegment } from "./renderer";
-  import { screenToImage, stepRadius, pushStroke, type StrokeData } from "./brush";
+  import {
+    screenToImage,
+    stepRadius,
+    pushStroke,
+    chunkPoints,
+    MAX_POINTS_PER_STROKE,
+    MAX_STROKES,
+    type StrokeData,
+  } from "./brush";
 
   interface ImageInfo {
     id: number;
@@ -29,6 +37,7 @@
     strokes = [],
     redoStrokes = [],
     onStrokesChange,
+    onBrushLimit,
   }: {
     info: ImageInfo;
     overlay: Overlay;
@@ -40,6 +49,7 @@
     strokes?: StrokeData[];
     redoStrokes?: StrokeData[];
     onStrokesChange?: (strokes: StrokeData[], redo: StrokeData[]) => void;
+    onBrushLimit?: (message: string) => void;
   } = $props();
 
   let canvas: HTMLCanvasElement;
@@ -179,13 +189,33 @@
     return () => clearTimeout(refreshTimer);
   });
 
-  /** Finalizes a stroke: pushes it onto the undo stack and hands the new
-   * strokes/redo pair up to App, which owns persistence. */
+  /** Finalizes a stroke: chunks it to the backend's per-stroke point cap
+   * (a fit-zoom drag on a large scan can easily exceed it), pushes each
+   * chunk onto the undo stack in order (so undo pops chunks one at a time --
+   * acceptable and predictable), and hands the new strokes/redo pair up to
+   * App, which owns persistence. If the chunks would push the total stroke
+   * count past the backend's cap, only as many as fit are committed and the
+   * excess is surfaced via `onBrushLimit`. */
   function commitStroke(points: [number, number][]) {
     if (points.length === 0) return;
-    const s: StrokeData = { erase: brushMode === "erase", radius: brushRadius, points };
-    const result = pushStroke(strokes, redoStrokes, s);
-    onStrokesChange?.(result.strokes, result.redo);
+    const chunks = chunkPoints(points, MAX_POINTS_PER_STROKE);
+    let curStrokes = strokes;
+    let curRedo = redoStrokes;
+    let committed = 0;
+    for (const chunk of chunks) {
+      if (curStrokes.length >= MAX_STROKES) break;
+      const s: StrokeData = { erase: brushMode === "erase", radius: brushRadius, points: chunk };
+      const result = pushStroke(curStrokes, curRedo, s);
+      curStrokes = result.strokes;
+      curRedo = result.redo;
+      committed++;
+    }
+    if (committed > 0) {
+      onStrokesChange?.(curStrokes, curRedo);
+    }
+    if (committed < chunks.length) {
+      onBrushLimit?.("stroke limit reached for this frame; undo or heal to continue");
+    }
   }
 
   /** Image-space stroke -> screen-space capsule segments for drawStrokes(). */
@@ -340,6 +370,9 @@
       overlay.enabled = !overlay.enabled;
       requestFrame();
       return;
+    // Plain z/Z only: with cmd/ctrl held this must fall through untouched so
+    // the event bubbles to App's window-level undo/redo handler instead of
+    // cycling detections and undoing a stroke on the same keypress.
     } else if ((e.key === "z" || e.key === "Z") && !e.metaKey && !e.ctrlKey) {
       e.preventDefault();
       cycleDetection(e.key === "z" ? 1 : -1);
@@ -358,7 +391,15 @@
     } else if (e.key === "b" || e.key === "e") {
       e.preventDefault();
       const mode = e.key === "b" ? "paint" : "erase";
+      const turningOn = brushMode === "off";
       brushMode = brushMode === mode ? "off" : mode;
+      // Initialize the cursor to the current view center rather than
+      // leaving it at a stale position (or (0,0) on first use) so the brush
+      // ring appears somewhere visible the moment brush mode turns on.
+      if (turningOn && brushMode !== "off") {
+        cursorX = centerX;
+        cursorY = centerY;
+      }
       requestFrame();
       return;
     } else if (e.key === "Escape" && brushMode !== "off") {
@@ -448,7 +489,7 @@
 <canvas
   bind:this={canvas}
   role="application"
-  aria-label="Scan viewer: arrows pan, plus and minus zoom, 0 fits, 1 is 100%, d detects, m toggles overlay, z and shift-z cycle defects, h heals, space toggles before and after, b paints, e erases, bracket keys size the brush, arrows nudge it and enter stamps while brushing, cmd-z undoes"
+  aria-label="Scan viewer: arrows pan, plus and minus zoom, 0 fits, 1 is 100%, d detects, m toggles overlay, z and shift-z cycle defects, h heals, space toggles before and after, b paints, e erases, bracket keys size the brush, arrows nudge it and enter stamps while brushing, cmd-z undoes, escape exits, shift-cmd-z redoes"
   tabindex="0"
   onwheel={onWheel}
   onpointerdown={(e) => {

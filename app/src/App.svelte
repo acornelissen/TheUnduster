@@ -45,6 +45,15 @@
 
   let roll: RollInfo | null = $state(null);
   let currentIndex = $state(0);
+  // The index of the frame actually on screen. `currentIndex` is set
+  // synchronously on navigation (stepFrame/selectFrame/approveAndAdvance)
+  // before `activate_frame` resolves, so during that window the OLD frame is
+  // still displayed while `currentIndex` already points at the NEW one.
+  // `displayedIndex` only advances once an activation actually lands (both
+  // the reuse and decode paths in activateCurrentFrame), so strokes and
+  // persistence -- which must bind to what the operator is looking at --
+  // key off this instead of `currentIndex`.
+  let displayedIndex = $state(0);
   let scanDone = $state(false);
   let exporting = $state(false);
   let thresholdSaveTimer: ReturnType<typeof setTimeout> | undefined;
@@ -282,6 +291,11 @@
     if (seq !== activationSeq) return; // stale: a newer activation superseded this one
     activating = false;
     info = result;
+    // Only advance once the activation actually landed -- see the
+    // `displayedIndex` declaration for why this must not track `currentIndex`
+    // directly. This covers both the reuse and fresh-decode paths: the
+    // backend doesn't distinguish them here, both resolve `result` above.
+    displayedIndex = index;
     // Belt and braces: the backend now guarantees a terminal "ready" emit on
     // both the reuse and fresh-decode paths, which already clears `loading`
     // via the app-progress listener. Clear it here too so a successful
@@ -370,6 +384,12 @@
 
   async function requestHeal() {
     if (!info || healing || detecting) return;
+    // While an activation is in flight, `overlay.threshold` already belongs
+    // to the new frame (activateCurrentFrame sets it before awaiting) but
+    // `info`/`displayedIndex` still lag behind the old one; healing now
+    // would mix the new frame's threshold with the old frame's strokes and
+    // image. Blocking until the switch lands is the coherent choice.
+    if (activating) return;
     if (!detected && !(roll && roll.frames[currentIndex].defect_count !== null)) {
       error = "Run detection before healing";
       return;
@@ -397,7 +417,12 @@
   }
 
   function strokeKey(): string | null {
-    if (roll) return `roll:${currentIndex}`;
+    // Keyed off `displayedIndex`, not `currentIndex`: during the activation
+    // window `currentIndex` already points at the frame being switched to
+    // while the old frame is still on screen. A stroke committed, undone, or
+    // healed in that window must bind to what the operator is actually
+    // looking at.
+    if (roll) return `roll:${displayedIndex}`;
     if (info) return `single:${info.id}`;
     return null;
   }
@@ -417,7 +442,10 @@
     if (!key) return;
     strokeStore[key] = { strokes, redo };
     if (roll) {
-      invoke("set_frame_strokes", { index: currentIndex, strokes, redoStrokes: redo }).catch(
+      // `displayedIndex`, matching `strokeKey()` above: persist to the
+      // sidecar entry for the frame actually on screen, not whichever frame
+      // navigation may already be mid-switch towards.
+      invoke("set_frame_strokes", { index: displayedIndex, strokes, redoStrokes: redo }).catch(
         (e) => {
           error = String(e);
         },
@@ -439,6 +467,11 @@
     // gate that the roll-navigation keys need.
     if (e.metaKey && (e.key === "z" || e.key === "Z")) {
       if (isTypingTarget(e.target)) return;
+      // Undo during a frame switch is ambiguous -- `strokeKey()` already
+      // points at the new (not-yet-displayed) frame while the operator is
+      // still looking at the old one. Dropping the keypress is predictable;
+      // the operator can repeat it once the switch lands.
+      if (activating) return;
       const key = strokeKey();
       if (!key) return;
       e.preventDefault();
@@ -446,6 +479,9 @@
       const result = e.shiftKey
         ? redoStroke(before.strokes, before.redo)
         : undoStroke(before.strokes, before.redo);
+      // undoStroke/redoStroke return the same array references when there is
+      // nothing to undo/redo; skip the no-op persist/store update in that case.
+      if (result.strokes === before.strokes && result.redo === before.redo) return;
       onStrokesChange(result.strokes, result.redo);
       return;
     }
@@ -564,6 +600,7 @@
         strokes={currentStrokes()}
         redoStrokes={currentRedoStrokes()}
         {onStrokesChange}
+        onBrushLimit={(message) => (error = message)}
       />
     {:else if !showLoader}
       <p class="hint">Open a scan or a roll to begin.</p>
