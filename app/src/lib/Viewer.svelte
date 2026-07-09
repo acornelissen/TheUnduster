@@ -90,6 +90,11 @@
     // Strokes themselves arrive per-frame via props and belong to App; only
     // the transient in-canvas brush mode resets here.
     brushMode = "off";
+    // An in-progress stroke's coordinates are meaningless on another frame;
+    // drop it rather than let a pointerup after the switch commit frame N's
+    // geometry onto frame N+1.
+    painting = false;
+    livePoints = [];
     centerX = info.width / 2;
     centerY = info.height / 2;
     if (canvas && canvas.width > 0) {
@@ -335,7 +340,7 @@
       overlay.enabled = !overlay.enabled;
       requestFrame();
       return;
-    } else if (e.key === "z" || e.key === "Z") {
+    } else if ((e.key === "z" || e.key === "Z") && !e.metaKey && !e.ctrlKey) {
       e.preventDefault();
       cycleDetection(e.key === "z" ? 1 : -1);
       return;
