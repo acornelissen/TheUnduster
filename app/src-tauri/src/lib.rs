@@ -159,6 +159,13 @@ async fn detect(
 const HEAL_DILATE_RADIUS: u32 = 2;
 
 #[derive(serde::Serialize, Clone)]
+struct HealProgress {
+    id: u64,
+    done: usize,
+    total: usize,
+}
+
+#[derive(serde::Serialize, Clone)]
 struct HealSummary {
     id: u64,
     defects: usize,
@@ -170,6 +177,7 @@ struct HealSummary {
 /// guarantee a terminal "ready" emit on every exit path, mirroring
 /// `run_detect`/`detect`.
 async fn run_heal(
+    app: &tauri::AppHandle,
     images: &State<'_, Mutex<Images>>,
     inpainter: &State<'_, detect::InpainterState>,
     id: u64,
@@ -189,6 +197,7 @@ async fn run_heal(
         (image, mask)
     };
     let inpainter = inpainter.inner().clone();
+    let app_for_progress = app.clone();
     let (healed, pyramid, mask, report) = tauri::async_runtime::spawn_blocking(move || {
         let mask = masks::compose_heal_mask(
             mask,
@@ -198,8 +207,15 @@ async fn run_heal(
             &strokes,
         );
         let mut copy = (*image).clone(); // the original Arc stays pristine
+                                         // A real inpainting model costs seconds per defect window; per-defect
+                                         // progress keeps a long heal visibly alive in the status line.
         let report = inpainter
-            .with_inpainter(|inp| fd_heal::heal(&mut copy, &mask, inp))?
+            .with_inpainter(|inp| {
+                fd_heal::heal_with_progress(&mut copy, &mask, inp, &mut |done, total| {
+                    let _ =
+                        app_for_progress.emit("heal-progress", HealProgress { id, done, total });
+                })
+            })?
             .map_err(|e| e.to_string())?;
         let healed = std::sync::Arc::new(copy);
         let pyramid = fd_tiles::Pyramid::build(&healed);
@@ -235,7 +251,7 @@ async fn heal_frame(
             stage: "healing",
         },
     );
-    let result = run_heal(&images, &inpainter, id, threshold, strokes).await;
+    let result = run_heal(&app, &images, &inpainter, id, threshold, strokes).await;
     let _ = app.emit("app-progress", Progress { id, stage: "ready" });
     result
 }

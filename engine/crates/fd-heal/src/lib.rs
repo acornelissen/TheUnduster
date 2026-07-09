@@ -11,7 +11,7 @@ pub use classical::classical_fill;
 pub use components::{components, Bbox, Defect};
 pub use dilate::dilate;
 pub use grain::add_grain;
-pub use heal::{heal, HealReport, TINY_MAX_DIM};
+pub use heal::{heal, heal_with_progress, HealReport, TINY_MAX_DIM};
 pub use inpaint::Inpainter;
 
 #[derive(Debug, thiserror::Error)]

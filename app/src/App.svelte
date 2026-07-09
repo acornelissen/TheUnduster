@@ -42,6 +42,18 @@
   let componentsAtHalf: number | null = $state(null);
   let detecting = $state(false);
   let healing = $state(false);
+  let healProgress: { done: number; total: number } | null = $state(null);
+
+  $effect(() => {
+    const un = listen<{ id: number; done: number; total: number }>("heal-progress", (e) => {
+      if (info && e.payload.id === info.id) {
+        healProgress = { done: e.payload.done, total: e.payload.total };
+      }
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
 
   // Healing model lifecycle. Starts "loaded" (not "missing") so the header
   // button doesn't flash into existence before the mount-time
@@ -462,6 +474,7 @@
     }
     error = null;
     healing = true;
+    healProgress = null;
     try {
       await invoke("heal_frame", {
         id: info.id,
@@ -659,7 +672,8 @@
           &mdash; Detecting...
         {/if}
         {#if healing}
-          &mdash; Healing...
+          &mdash; Healing...{#if healProgress}
+            ({healProgress.done}/{healProgress.total} defects){/if}
         {/if}
         {#if info?.healed}
           &mdash; space toggles before/after

@@ -174,3 +174,25 @@ fn full_width_defect_does_not_panic() {
         .expect("fixture inpainter loads");
     heal(&mut img, &mask, Some(&mut inpainter)).expect("heal succeeds");
 }
+
+/// Progress callback fires once per defect with a stable total, ending at
+/// (total, total) -- the app surfaces this during multi-minute LaMa heals.
+#[test]
+fn heal_reports_per_defect_progress() {
+    let mut img = noisy_image(64, 64);
+    let mut mask = vec![false; 64 * 64];
+    for (cx, cy) in [(10u32, 10u32), (30, 30), (50, 50)] {
+        for y in cy - 2..=cy + 2 {
+            for x in cx - 2..=cx + 2 {
+                mask[(y * 64 + x) as usize] = true;
+            }
+        }
+    }
+    let mut calls: Vec<(usize, usize)> = Vec::new();
+    let report = fd_heal::heal_with_progress(&mut img, &mask, None, &mut |done, total| {
+        calls.push((done, total));
+    })
+    .unwrap();
+    assert_eq!(report.defects, 3);
+    assert_eq!(calls, vec![(1, 3), (2, 3), (3, 3)]);
+}

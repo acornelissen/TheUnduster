@@ -222,7 +222,20 @@ fn window_start(interior_start: usize, margin: usize, n: usize, limit: usize) ->
 pub fn heal(
     img: &mut ImageBuf,
     mask: &[bool],
+    inpainter: Option<&mut Inpainter>,
+) -> Result<HealReport, HealError> {
+    heal_with_progress(img, mask, inpainter, &mut |_, _| {})
+}
+
+/// `heal` with a per-defect progress callback `(done, total)`. A real
+/// inpainting model costs seconds of CPU per defect window, so a frame with
+/// dozens of defects heals for minutes; the callback lets the app show
+/// motion instead of a frozen "Healing..." label.
+pub fn heal_with_progress(
+    img: &mut ImageBuf,
+    mask: &[bool],
     mut inpainter: Option<&mut Inpainter>,
+    progress: &mut dyn FnMut(usize, usize),
 ) -> Result<HealReport, HealError> {
     let (width, height) = (img.width as usize, img.height as usize);
     if mask.len() != width * height {
@@ -232,12 +245,13 @@ pub fn heal(
         });
     }
     let defects = components(mask, img.width, img.height);
+    let total = defects.len();
     let mut planes = to_planes(img);
     let mut report = HealReport {
-        defects: defects.len(),
+        defects: total,
         ..Default::default()
     };
-    for d in &defects {
+    for (i, d) in defects.iter().enumerate() {
         match inpainter.as_deref_mut() {
             Some(inp) if d.max_dim() > TINY_MAX_DIM => {
                 match inp.window_size() {
@@ -254,6 +268,7 @@ pub fn heal(
                 report.tiny += 1;
             }
         }
+        progress(i + 1, total);
     }
     write_back(img, &planes, mask);
     Ok(report)
