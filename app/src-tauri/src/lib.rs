@@ -533,26 +533,35 @@ async fn activate_frame(
         images.close(superseded);
     }
 
-    // Decode-path frames start with no probs; check for a cache hit so a
-    // rescanned frame arrives detection-ready across relaunches, without
-    // re-running the (seconds-long) detector. File IO + zstd decompress of
-    // tens of MB, so this stays off the lock like the decode above.
+    // Decode-path frames start with no probs; restore a cache hit so a
+    // scanned frame becomes detection-ready across relaunches without
+    // re-running the (seconds-long) detector. Fire-and-forget: the restore
+    // costs file IO plus a full-image dequantize and pyramid build, and
+    // awaiting it here made every first frame visit seconds slower (field
+    // report) -- activation must return at decode speed. A stale or closed
+    // id is harmless: set_probs_built validates and drops the result.
     if let (Some((roll_dir, file_name)), Some(hash)) =
         (roll.frame_for_image(info.id)?, detector.hash())
     {
         let cache_path = roll::probs_cache_path(&roll_dir, &file_name);
         let (width, height) = (info.width, info.height);
         let level_dims: Vec<(u32, u32)> = info.levels.iter().map(|l| (l.width, l.height)).collect();
-        let hit = tauri::async_runtime::spawn_blocking(move || {
-            cache::read_probs(&cache_path, width, height, &hash)
-                .map(|probs| (build_prob_pyramid(&probs, &level_dims), probs))
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-        if let Some((pyramid, probs)) = hit {
-            let mut images = images.lock().map_err(|e| e.to_string())?;
-            images.set_probs_built(info.id, probs, pyramid);
-        }
+        let app_for_restore = app.clone();
+        let id = info.id;
+        tauri::async_runtime::spawn(async move {
+            let hit = tauri::async_runtime::spawn_blocking(move || {
+                cache::read_probs(&cache_path, width, height, &hash)
+                    .map(|probs| (build_prob_pyramid(&probs, &level_dims), probs))
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some((pyramid, probs)) = hit {
+                if let Ok(mut guard) = app_for_restore.state::<Mutex<Images>>().lock() {
+                    guard.set_probs_built(id, probs, pyramid);
+                }
+            }
+        });
     }
 
     roll.touch(index)?;
@@ -1158,7 +1167,7 @@ mod roll_queue_tests {
     }
 
     #[test]
-    fn frames_to_scan_lists_only_uncounted_frames() {
+    fn frames_to_scan_lists_uncounted_and_uncached_frames() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.png"), b"x").unwrap();
         std::fs::write(dir.path().join("b.png"), b"x").unwrap();
@@ -1167,6 +1176,13 @@ mod roll_queue_tests {
         state
             .record_scan_result(state.generation(), 0, Some(2), Some(vec![]))
             .unwrap();
+        // Frame 0 is counted but has no probs cache file: it backfills, so
+        // both frames are queued (rolls scanned before the cache existed
+        // must not silently never cache).
+        assert_eq!(state.frames_to_scan().unwrap(), vec![0, 1]);
+        // Once its probs cache exists, a counted frame leaves the queue.
+        let cache_path = roll::probs_cache_path(dir.path(), "a.png");
+        crate::cache::write_probs(&cache_path, &[0.5], 1, 1, &[7u8; 32]).unwrap();
         assert_eq!(state.frames_to_scan().unwrap(), vec![1]);
     }
 

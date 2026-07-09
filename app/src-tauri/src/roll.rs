@@ -549,7 +549,13 @@ impl RollState {
             .frames
             .iter()
             .enumerate()
-            .filter(|(_, f)| f.defect_count.is_none())
+            .filter(|(_, f)| {
+                // Unscanned frames, plus scanned frames whose probability
+                // cache file is missing: rolls scanned before the cache
+                // existed (or after a cache wipe) backfill in the background
+                // instead of silently never caching.
+                f.defect_count.is_none() || !probs_cache_path(&roll.dir, &f.file_name).exists()
+            })
             .map(|(i, _)| i)
             .collect())
     }
