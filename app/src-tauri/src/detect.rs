@@ -17,7 +17,14 @@ impl Default for DetectorState {
 
 impl DetectorState {
     pub fn load(&self, path: &Path) -> Result<(), String> {
-        let det = Detector::load(path, Ep::Cpu).map_err(|e| e.to_string())?;
+        // CoreML first: on Apple Silicon it detects a 168MP frame in ~9s at
+        // ~2.9 GB peak versus ~36s at 11+ GB on the CPU EP (which was
+        // enough, stacked with a decoded roll frame, to get the app
+        // memory-killed). Thresholded output measured identical on a real
+        // scan; formal benchmark tracked separately (TheUnduster-3uz).
+        let det = Detector::load(path, Ep::CoreML)
+            .or_else(|_| Detector::load(path, Ep::Cpu))
+            .map_err(|e| e.to_string())?;
         *self.0.lock().map_err(|e| e.to_string())? = Some(det);
         Ok(())
     }
