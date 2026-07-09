@@ -40,13 +40,23 @@
   let overlay = $state({ enabled: true, threshold: 0.5 });
   let detected = $state(false);
   let componentsAtHalf: number | null = $state(null);
+  // Single-image mode only: set/cleared directly around the awaited
+  // detect/heal invokes below. Roll mode never touches these -- its activity
+  // is derived from `jobStates` (see `rollDetecting`/`rollHealing`) so that
+  // navigating away mid-job can never leave a stale flag stuck true.
   let detecting = $state(false);
   let healing = $state(false);
   let healProgress: { done: number; total: number } | null = $state(null);
-  // Roll-mode queue state: index -> "queued" | "running", driven entirely by
+  // Roll-mode queue state: index -> { state, kind }, driven entirely by
   // job-queued/job-started/job-done/job-error/queue-idle. Single-image mode
   // never touches this (it invokes detect/heal directly and awaits them).
-  let jobStates: Record<number, "queued" | "running"> = $state({});
+  // Deliberately NOT the source of a tracked "is the current frame busy"
+  // flag -- that is derived below (`currentJob`/`rollDetecting`/
+  // `rollHealing`) so it self-corrects when the operator navigates to a
+  // different frame mid-job instead of latching on the index that happened
+  // to be current when the job started.
+  let jobStates: Record<number, { state: "queued" | "running"; kind: "detect" | "heal" }> =
+    $state({});
 
   $effect(() => {
     const un = listen<{ id: number; done: number; total: number }>("heal-progress", (e) => {
@@ -68,6 +78,17 @@
 
   let roll: RollInfo | null = $state(null);
   let currentIndex = $state(0);
+  // Derived, not tracked: the current frame's job (if any) always reflects
+  // `jobStates[currentIndex]` live, so navigating to a different frame while
+  // a job is in flight immediately (and correctly) reports "not busy" here
+  // without any listener needing to know the operator moved on.
+  const currentJob = $derived(roll ? jobStates[currentIndex] : undefined);
+  const rollDetecting = $derived(currentJob?.state === "running" && currentJob.kind === "detect");
+  const rollHealing = $derived(currentJob?.state === "running" && currentJob.kind === "heal");
+  // Combined single-image + roll activity, for template/guard use so callers
+  // don't need to know which mode is active.
+  const isDetecting = $derived(detecting || rollDetecting);
+  const isHealing = $derived(healing || rollHealing);
   // The index of the frame actually on screen. `currentIndex` is set
   // synchronously on navigation (stepFrame/selectFrame/approveAndAdvance)
   // before `activate_frame` resolves, so during that window the OLD frame is
@@ -152,7 +173,7 @@
 
   $effect(() => {
     const un = listen<{ index: number; kind: "detect" | "heal" }>("job-queued", (e) => {
-      jobStates[e.payload.index] = "queued";
+      jobStates[e.payload.index] = { state: "queued", kind: e.payload.kind };
     });
     return () => {
       un.then((f) => f());
@@ -161,11 +182,7 @@
 
   $effect(() => {
     const un = listen<{ index: number; kind: "detect" | "heal" }>("job-started", (e) => {
-      jobStates[e.payload.index] = "running";
-      if (e.payload.index === currentIndex) {
-        if (e.payload.kind === "detect") detecting = true;
-        else healing = true;
-      }
+      jobStates[e.payload.index] = { state: "running", kind: e.payload.kind };
     });
     return () => {
       un.then((f) => f());
@@ -175,13 +192,15 @@
   $effect(() => {
     const un = listen<{ index: number; kind: "detect" | "heal" }>("job-done", (e) => {
       delete jobStates[e.payload.index];
+      // Index-guarded on purpose: only refresh detections / mark healed when
+      // the completed job belongs to the frame still on screen. Activity
+      // flags themselves are derived (see `rollDetecting`/`rollHealing`), so
+      // there is nothing to clear here for a stale/navigated-away index.
       if (e.payload.index === currentIndex) {
         if (e.payload.kind === "detect") {
-          detecting = false;
           detected = true;
           void viewer?.refreshDetections(overlay.threshold);
         } else {
-          healing = false;
           if (info) info = { ...info, healed: true };
         }
       }
@@ -196,10 +215,6 @@
       "job-error",
       (e) => {
         delete jobStates[e.payload.index];
-        if (e.payload.index === currentIndex) {
-          if (e.payload.kind === "detect") detecting = false;
-          else healing = false;
-        }
         const fileName = roll?.frames[e.payload.index]?.file_name ?? `frame ${e.payload.index}`;
         error = `Frame ${fileName}: ${e.payload.message}`;
       },
@@ -541,6 +556,7 @@
     roll.frames[currentIndex].threshold = overlay.threshold;
     clearTimeout(thresholdSaveTimer);
     thresholdSaveTimer = setTimeout(() => {
+      thresholdSaveTimer = undefined;
       invoke("set_frame_threshold", {
         index: currentIndex,
         threshold: overlay.threshold,
@@ -551,7 +567,7 @@
   }
 
   async function requestDetect() {
-    if (!info || detecting) return;
+    if (!info || isDetecting) return;
     // Roll mode: the background queue owns the run. Enqueue and return --
     // `detecting`/`detected` follow the job-started/job-done events instead
     // of this call's resolution. The queue is roll-only (jobs run against a
@@ -591,7 +607,7 @@
   }
 
   async function requestHeal() {
-    if (!info || healing || detecting) return;
+    if (!info || isHealing || isDetecting) return;
     // While an activation is in flight, `overlay.threshold` already belongs
     // to the new frame (activateCurrentFrame sets it before awaiting) but
     // `info`/`displayedIndex` still lag behind the old one; healing now
@@ -814,11 +830,11 @@
       </button>
     {/if}
     {#if info}
-      <button onclick={requestDetect} disabled={loading !== null || detecting}>
-        {detecting ? "Detecting..." : "Detect"}
+      <button onclick={requestDetect} disabled={loading !== null || isDetecting}>
+        {isDetecting ? "Detecting..." : "Detect"}
       </button>
-      <button onclick={requestHeal} disabled={loading !== null || detecting || healing || !info}>
-        {healing ? "Healing..." : "Heal"}
+      <button onclick={requestHeal} disabled={loading !== null || isDetecting || isHealing || !info}>
+        {isHealing ? "Healing..." : "Heal"}
       </button>
       <label>
         Sensitivity
@@ -842,10 +858,10 @@
         {:else}
           Not yet detected
         {/if}
-        {#if detecting}
+        {#if isDetecting}
           &mdash; Detecting...
         {/if}
-        {#if healing}
+        {#if isHealing}
           &mdash; Healing...{#if healProgress}
             ({healProgress.done}/{healProgress.total} defects){/if}
         {/if}

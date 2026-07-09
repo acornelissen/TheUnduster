@@ -19,7 +19,7 @@
     frames: FrameInfo[];
     currentIndex: number;
     thumbVersions?: Record<number, number>;
-    jobStates?: Record<number, "queued" | "running">;
+    jobStates?: Record<number, { state: "queued" | "running"; kind: "detect" | "heal" }>;
     onSelect: (index: number) => void;
   } = $props();
 
@@ -96,10 +96,10 @@
         {#if frame.exported}
           <span class="exported" aria-hidden="true">out</span>
         {/if}
-        {#if jobStates[frame.index] === "queued"}
-          <span class="job-marker job-queued" title="Queued" aria-hidden="true">&#9675;</span>
-        {:else if jobStates[frame.index] === "running"}
-          <span class="job-marker job-running" title="Running" aria-hidden="true">&#9679;</span>
+        {#if jobStates[frame.index]?.state === "queued"}
+          <span class="job-marker job-queued" title={`${jobStates[frame.index].kind} queued`} aria-hidden="true">&#9675;</span>
+        {:else if jobStates[frame.index]?.state === "running"}
+          <span class="job-marker job-running" title={`${jobStates[frame.index].kind} running`} aria-hidden="true">&#9679;</span>
         {/if}
       </div>
       <span class="name">{frame.file_name}</span>
