@@ -113,6 +113,18 @@
   // frames persist to the sidecar via set_frame_strokes; single-image
   // strokes are session-local and never written anywhere.
   let strokeStore: Record<string, { strokes: StrokeData[]; redo: StrokeData[] }> = $state({});
+  // Inputs a heal was produced from, keyed the same way as strokeStore
+  // (`strokeKey()`). Captured at every point a heal lands for a frame --
+  // single-image `requestHeal` success, a roll-mode heal job-done for the
+  // current frame, and activation of a frame that arrives already healed --
+  // and compared against the frame's current inputs to flag a stale heal
+  // (see `healStale` below). Stroke count is a deliberate approximation of
+  // "strokes changed": a moved stroke with the same count escapes this
+  // check. The cache's provenance hash remains the correctness layer; this
+  // is only a display hint. Entries are never removed -- the map is
+  // session-scoped and tiny (one entry per frame ever healed), so there is
+  // nothing worth the complexity of cleaning up.
+  let healInputs: Record<string, { threshold: number; strokeCount: number }> = $state({});
   // Monotonically increasing activation sequence number. Rapid ,/. presses
   // can fire overlapping `activate_frame` invokes whose resolutions race;
   // each call captures its own `seq` and drops its result if a newer
@@ -218,6 +230,16 @@
           void viewer?.refreshDetections(overlay.threshold);
         } else {
           if (info) info = { ...info, healed: true };
+          // Capture from the frame's PERSISTED values -- that is what the
+          // worker actually healed with, independent of whatever the
+          // threshold slider or stroke store show right now.
+          if (roll) {
+            const frame = roll.frames[e.payload.index];
+            healInputs[`roll:${e.payload.index}`] = {
+              threshold: frame.threshold,
+              strokeCount: frame.strokes.length,
+            };
+          }
         }
       }
     });
@@ -573,6 +595,18 @@
     // directly. This covers both the reuse and fresh-decode paths: the
     // backend doesn't distinguish them here, both resolve `result` above.
     displayedIndex = index;
+    // Restore case: this frame arrived already healed (cache reuse), and no
+    // capture point has recorded its inputs yet. Its current persisted
+    // values ARE the provenance inputs that matched the cache -- capture
+    // them so the staleness check has something to compare against. A real
+    // capture point (heal job-done) always overwrites this if one exists.
+    if (result.healed && !(`roll:${index}` in healInputs)) {
+      const frame = roll.frames[index];
+      healInputs[`roll:${index}`] = {
+        threshold: frame.threshold,
+        strokeCount: frame.strokes.length,
+      };
+    }
     // Belt and braces: the backend now guarantees a terminal "ready" emit on
     // both the reuse and fresh-decode paths, which already clears `loading`
     // via the app-progress listener. Clear it here too so a successful
@@ -732,6 +766,12 @@
         threshold: overlay.threshold,
         strokes: currentStrokes(),
       });
+      // Capture at invoke time: the threshold and stroke count this heal was
+      // actually produced from.
+      const key = strokeKey();
+      if (key) {
+        healInputs[key] = { threshold: overlay.threshold, strokeCount: currentStrokes().length };
+      }
       info = { ...info, healed: true };
     } catch (e) {
       error = String(e);
@@ -789,6 +829,22 @@
     const key = strokeKey();
     return key ? (strokeStore[key]?.redo ?? []) : [];
   }
+
+  // True when the displayed frame's heal no longer matches its inputs:
+  // the threshold has moved or the stroke count has changed since the heal
+  // that produced what's on screen was captured. Display-only -- SPACE still
+  // toggles the existing before/after, and a re-heal (any capture point)
+  // overwrites the `healInputs` entry, clearing this naturally.
+  const healStale = $derived.by(() => {
+    const key = strokeKey();
+    if (!key) return false;
+    const captured = healInputs[key];
+    if (!captured) return false;
+    const currentStrokeCount = strokeStore[key]?.strokes.length ?? 0;
+    return (
+      overlay.threshold !== captured.threshold || currentStrokeCount !== captured.strokeCount
+    );
+  });
 
   function onStrokesChange(strokes: StrokeData[], redo: StrokeData[]) {
     const key = strokeKey();
@@ -939,6 +995,9 @@
         {/if}
         {#if info?.healed}
           &mdash; space toggles before/after
+          {#if healStale}
+            &mdash; heal is stale (h re-heals)
+          {/if}
         {/if}
         {#if viewer?.brushStatus()}
           &mdash; {viewer.brushStatus()}
