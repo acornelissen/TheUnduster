@@ -231,7 +231,26 @@ impl Roll {
     pub fn open(dir: &Path) -> Result<Roll, String> {
         let on_disk = list_image_files(dir)?;
         let remembered = load_sidecar(dir)?;
-        let frames = merge(on_disk, remembered);
+        let mut frames = merge(on_disk, remembered);
+
+        // Validate strokes at frame materialization: invalid lists are replaced
+        // with empty vectors. Strokes and redo_strokes are validated independently.
+        for frame in &mut frames {
+            if crate::masks::validate_strokes(&frame.strokes).is_err() {
+                #[cfg(debug_assertions)]
+                eprintln!("invalid strokes in frame: {} (dropping)", frame.file_name);
+                frame.strokes = Vec::new();
+            }
+            if crate::masks::validate_strokes(&frame.redo_strokes).is_err() {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "invalid redo_strokes in frame: {} (dropping)",
+                    frame.file_name
+                );
+                frame.redo_strokes = Vec::new();
+            }
+        }
+
         Ok(Roll {
             dir: dir.to_path_buf(),
             frames,
@@ -1163,5 +1182,40 @@ mod tests {
         let err = Roll::open(dir.path()).unwrap_err();
         assert!(err.contains("version"), "error was: {err}");
         assert!(err.contains("99"), "error was: {err}");
+    }
+
+    #[test]
+    fn invalid_sidecar_strokes_are_dropped_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"x").unwrap();
+        let state = RollState::default();
+        state.open(dir.path()).unwrap();
+        // persist a valid stroke, then corrupt it on disk to out-of-range coords
+        state
+            .set_strokes(
+                0,
+                vec![crate::masks::Stroke {
+                    erase: false,
+                    radius: 5.0,
+                    points: vec![[1.0, 1.0]],
+                }],
+                vec![],
+            )
+            .unwrap();
+        let sidecar = dir.path().join(".unduster/roll.json");
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        let text = text.replace("1.0", "1e30"); // out of coordinate range
+        std::fs::write(&sidecar, text).unwrap();
+        // Verify the corruption actually landed
+        let corrupted = std::fs::read_to_string(&sidecar).unwrap();
+        assert!(
+            corrupted.contains("1e30"),
+            "corruption must be present in file"
+        );
+        let (info, _) = state.open(dir.path()).unwrap();
+        assert!(
+            info.frames[0].strokes.is_empty(),
+            "invalid strokes must be dropped, not wedge the frame"
+        );
     }
 }
