@@ -304,7 +304,28 @@
     // may have raced a roll swap (see job-queued listener's comment).
     const un = listen<{ generation: number }>("queue-idle", (e) => {
       if (e.payload.generation !== rollGeneration) return;
-      jobStates = {};
+      // Grace-period cleanup instead of a blanket wipe: a same-generation
+      // idle can race an enqueue whose job a fresh worker is about to run
+      // (the worker's emit happens after its empty-check releases the lock).
+      // Blanket-wiping would drop that entry and the index guard would then
+      // swallow its job-started/done events. Snapshot what the idle saw and
+      // delete only entries still identical after a grace window: the raced
+      // entry transitions to "running" within milliseconds and survives; a
+      // genuine straggler (backend events lost, e.g. to a panic) still
+      // clears.
+      const seen = Object.entries(jobStates).map(
+        ([k, v]) => [Number(k), v.state, v.kind] as [number, string, string],
+      );
+      const generationAtIdle = rollGeneration;
+      setTimeout(() => {
+        if (rollGeneration !== generationAtIdle) return; // roll changed; reset already ran
+        for (const [k, state, kind] of seen) {
+          const cur = jobStates[k];
+          if (cur && cur.state === state && cur.kind === kind) {
+            delete jobStates[k];
+          }
+        }
+      }, 2000);
     });
     return () => {
       un.then((f) => f());
