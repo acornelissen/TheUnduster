@@ -70,6 +70,51 @@ void main() {
   color = vec4(1.0, 0.05, 0.05, alpha);
 }`;
 
+const CAPSULE_VERT = `#version 300 es
+precision highp float;
+in vec2 pos;      // screen-px quad corner
+in vec4 seg;      // segment endpoints a.xy b.xy, screen px
+in float radius;  // screen px
+uniform vec2 viewport;
+out vec4 vSeg;
+out float vRadius;
+out vec2 vPix;
+void main() {
+  vSeg = seg;
+  vRadius = radius;
+  vPix = pos;
+  vec2 clip = (pos / viewport) * 2.0 - 1.0;
+  gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
+}`;
+
+const CAPSULE_FRAG = `#version 300 es
+precision highp float;
+in vec4 vSeg;
+in float vRadius;
+in vec2 vPix;
+uniform vec4 color;
+out vec4 outColor;
+void main() {
+  vec2 a = vSeg.xy;
+  vec2 b = vSeg.zw;
+  vec2 ab = b - a;
+  float t = clamp(dot(vPix - a, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
+  float d = length(vPix - (a + t * ab));
+  float alpha = 1.0 - smoothstep(vRadius - 1.5, vRadius, d);
+  if (alpha <= 0.0) discard;
+  outColor = vec4(color.rgb, color.a * alpha);
+}`;
+
+/** One brush-stroke segment in screen/device pixels. A dab (single click,
+ * no drag) passes ax==bx, ay==by, which collapses the capsule to a circle. */
+export interface StrokeSegment {
+  ax: number;
+  ay: number;
+  bx: number;
+  by: number;
+  r: number;
+}
+
 /** Byte-budgeted LRU keyed by tile URL path. Generic over the texture type
  * so the eviction logic is unit-testable without a GL context. */
 export class TextureStore<T> {
@@ -126,6 +171,8 @@ export class TileRenderer {
   private buf: WebGLBuffer;
   private ringProgram: WebGLProgram;
   private ringBuf: WebGLBuffer;
+  private capsuleProgram: WebGLProgram;
+  private capsuleBuf: WebGLBuffer;
   private textures = new TextureStore<WebGLTexture>(256 * 1024 * 1024);
   private pending = new Set<string>();
   private zeroTex: WebGLTexture;
@@ -176,6 +223,20 @@ export class TileRenderer {
       new Float32Array([-1, -1, 1, -1, -1, 1, 1, -1, 1, 1, -1, 1]),
       gl.STATIC_DRAW,
     );
+
+    // Capsule program: streams a fresh interleaved vertex buffer per
+    // drawStrokes() call, same pattern as the tile pass's per-draw buffer
+    // (stroke segment counts are small -- a live brush stroke, not a whole
+    // image -- so rebuilding the buffer every call is not a concern).
+    const cp = gl.createProgram()!;
+    gl.attachShader(cp, compile(gl, gl.VERTEX_SHADER, CAPSULE_VERT));
+    gl.attachShader(cp, compile(gl, gl.FRAGMENT_SHADER, CAPSULE_FRAG));
+    gl.linkProgram(cp);
+    if (!gl.getProgramParameter(cp, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(cp) ?? "capsule link failed");
+    }
+    this.capsuleProgram = cp;
+    this.capsuleBuf = gl.createBuffer()!;
   }
 
   /** Fetch a tile via tiles:// and upload it; no-op if cached or in flight.
@@ -325,6 +386,67 @@ export class TileRenderer {
     gl.disable(gl.BLEND);
   }
 
+  /** Draws filled anti-aliased capsules over the already-rendered frame, for
+   * live brush-stroke preview. Call after draw(). `segments` are in screen
+   * px; a dab passes ax==bx, ay==by (the capsule degenerates to a circle).
+   * Builds one interleaved vertex buffer per call, matching the tile pass's
+   * per-draw streaming. Blending is disabled again before returning, same
+   * convention as drawRings(). */
+  drawStrokes(
+    segments: StrokeSegment[],
+    color: [number, number, number, number],
+    width: number,
+    height: number,
+  ): void {
+    if (segments.length === 0) return;
+    const gl = this.gl;
+    // 6 vertices per segment, stride 7 floats: pos.xy, seg.xyzw, radius.
+    const verts = new Float32Array(segments.length * 6 * 7);
+    let i = 0;
+    for (const s of segments) {
+      const pad = s.r + 1.5;
+      const minX = Math.min(s.ax, s.bx) - pad;
+      const maxX = Math.max(s.ax, s.bx) + pad;
+      const minY = Math.min(s.ay, s.by) - pad;
+      const maxY = Math.max(s.ay, s.by) + pad;
+      const corners: [number, number][] = [
+        [minX, minY],
+        [maxX, minY],
+        [minX, maxY],
+        [maxX, minY],
+        [maxX, maxY],
+        [minX, maxY],
+      ];
+      for (const [x, y] of corners) {
+        verts[i++] = x;
+        verts[i++] = y;
+        verts[i++] = s.ax;
+        verts[i++] = s.ay;
+        verts[i++] = s.bx;
+        verts[i++] = s.by;
+        verts[i++] = s.r;
+      }
+    }
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(this.capsuleProgram);
+    gl.uniform2f(gl.getUniformLocation(this.capsuleProgram, "viewport"), width, height);
+    gl.uniform4f(gl.getUniformLocation(this.capsuleProgram, "color"), ...color);
+    const posLoc = gl.getAttribLocation(this.capsuleProgram, "pos");
+    const segLoc = gl.getAttribLocation(this.capsuleProgram, "seg");
+    const radiusLoc = gl.getAttribLocation(this.capsuleProgram, "radius");
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.capsuleBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STREAM_DRAW);
+    gl.enableVertexAttribArray(posLoc);
+    gl.enableVertexAttribArray(segLoc);
+    gl.enableVertexAttribArray(radiusLoc);
+    gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 28, 0);
+    gl.vertexAttribPointer(segLoc, 4, gl.FLOAT, false, 28, 8);
+    gl.vertexAttribPointer(radiusLoc, 1, gl.FLOAT, false, 28, 24);
+    gl.drawArrays(gl.TRIANGLES, 0, segments.length * 6);
+    gl.disable(gl.BLEND);
+  }
+
   /** Release every GL resource and force the context to be dropped. The
    * Viewer is remounted per frame switch via `{#key info.id}`; without this,
    * each remount leaks a WebGL context (WebKit caps live contexts at ~16),
@@ -336,8 +458,10 @@ export class TileRenderer {
     gl.deleteTexture(this.zeroTex);
     gl.deleteBuffer(this.buf);
     gl.deleteBuffer(this.ringBuf);
+    gl.deleteBuffer(this.capsuleBuf);
     gl.deleteProgram(this.program);
     gl.deleteProgram(this.ringProgram);
+    gl.deleteProgram(this.capsuleProgram);
     gl.getExtension("WEBGL_lose_context")?.loseContext();
   }
 }
