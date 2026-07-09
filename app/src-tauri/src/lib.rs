@@ -102,6 +102,7 @@ struct DetectReport {
 async fn run_detect(
     app: &tauri::AppHandle,
     images: &State<'_, Mutex<Images>>,
+    roll: &State<'_, roll::RollState>,
     detector: &State<'_, detect::DetectorState>,
     id: u64,
 ) -> Result<DetectReport, String> {
@@ -122,9 +123,22 @@ async fn run_detect(
             .level_dims(id)
             .ok_or_else(|| format!("no image {id}"))?
     };
+    // Resolved before spawn_blocking so the closure can write the probs
+    // cache from the borrowed slice, before handing the Vec's ownership to
+    // set_probs_built -- avoids cloning a 671MB vector for a 168MP frame.
+    let cache_path = roll
+        .frame_for_image(id)?
+        .map(|(roll_dir, file_name)| roll::probs_cache_path(&roll_dir, &file_name));
+    let detector_hash = detector.hash();
     let detector = detector.inner().clone(); // DetectorState is Clone over an Arc
     let (probs, pyramid) = tauri::async_runtime::spawn_blocking(move || {
         let probs = detector.detect(&img)?;
+        if let (Some(path), Some(hash)) = (&cache_path, &detector_hash) {
+            if let Err(_e) = cache::write_probs(path, &probs, img.width, img.height, hash) {
+                #[cfg(debug_assertions)]
+                eprintln!("[cache] probs write failed for image {id}: {_e}");
+            }
+        }
         let pyramid = build_prob_pyramid(&probs, &level_dims);
         Ok::<_, String>((probs, pyramid))
     })
@@ -146,10 +160,11 @@ async fn run_detect(
 async fn detect(
     app: tauri::AppHandle,
     images: State<'_, Mutex<Images>>,
+    roll: State<'_, roll::RollState>,
     detector: State<'_, detect::DetectorState>,
     id: u64,
 ) -> Result<DetectReport, String> {
-    let result = run_detect(&app, &images, &detector, id).await;
+    let result = run_detect(&app, &images, &roll, &detector, id).await;
     let _ = app.emit("app-progress", Progress { id, stage: "ready" });
     result
 }
@@ -375,6 +390,7 @@ async fn activate_frame(
     app: tauri::AppHandle,
     images: State<'_, Mutex<Images>>,
     roll: State<'_, roll::RollState>,
+    detector: State<'_, detect::DetectorState>,
     index: usize,
 ) -> Result<ImageInfo, String> {
     #[cfg(debug_assertions)]
@@ -451,6 +467,28 @@ async fn activate_frame(
     if let Some(superseded) = roll.set_image_id(index, info.id)? {
         let mut images = images.lock().map_err(|e| e.to_string())?;
         images.close(superseded);
+    }
+
+    // Decode-path frames start with no probs; check for a cache hit so a
+    // rescanned frame arrives detection-ready across relaunches, without
+    // re-running the (seconds-long) detector. File IO + zstd decompress of
+    // tens of MB, so this stays off the lock like the decode above.
+    if let (Some((roll_dir, file_name)), Some(hash)) =
+        (roll.frame_for_image(info.id)?, detector.hash())
+    {
+        let cache_path = roll::probs_cache_path(&roll_dir, &file_name);
+        let (width, height) = (info.width, info.height);
+        let level_dims: Vec<(u32, u32)> = info.levels.iter().map(|l| (l.width, l.height)).collect();
+        let hit = tauri::async_runtime::spawn_blocking(move || {
+            cache::read_probs(&cache_path, width, height, &hash)
+                .map(|probs| (build_prob_pyramid(&probs, &level_dims), probs))
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        if let Some((pyramid, probs)) = hit {
+            let mut images = images.lock().map_err(|e| e.to_string())?;
+            images.set_probs_built(info.id, probs, pyramid);
+        }
     }
 
     roll.touch(index)?;
@@ -688,14 +726,28 @@ fn scan_roll(
             let image = prepared.image;
             drop(prepared.pyramid);
             let detector = detector.clone();
+            let detector_hash = detector.hash();
+            let cache_path = roll::probs_cache_path(&roll_dir, &file_name);
             let outcome = tauri::async_runtime::spawn_blocking(move || {
                 let probs = detector.detect(&image)?;
-                Ok::<_, String>(images::components_from_probs(
+                let bboxes = images::components_from_probs(
                     &probs,
                     image.width,
                     image.height,
                     SCAN_THRESHOLD,
-                ))
+                );
+                // Cache write is sequential with detection here (milliseconds
+                // against a ~9s detect); failures eprintln in debug only,
+                // never fail the scan.
+                if let Some(hash) = detector_hash {
+                    if let Err(_e) =
+                        cache::write_probs(&cache_path, &probs, image.width, image.height, &hash)
+                    {
+                        #[cfg(debug_assertions)]
+                        eprintln!("[queue] frame {index} probs cache write failed: {_e}");
+                    }
+                }
+                Ok::<_, String>(bboxes)
                 // `image` (the full-res pixels) drops here, before the task
                 // moves to the next frame.
             })

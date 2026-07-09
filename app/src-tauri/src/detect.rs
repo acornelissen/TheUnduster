@@ -32,6 +32,9 @@ impl DetectorState {
         let det = Detector::load(path, Ep::CoreML)
             .or_else(|_| Detector::load(path, Ep::Cpu))
             .map_err(|e| e.to_string())?;
+        // Hashes the file as loaded; assumes nothing else in the models dir
+        // writes concurrently (TOCTOU note -- the app is the only writer in
+        // practice, via `models::download_inpaint_model`'s atomic rename).
         let hash = crate::models::file_sha256(path)?;
         *self.0.lock().map_err(|e| e.to_string())? = Some(LoadedDetector {
             detector: det,
@@ -51,7 +54,11 @@ impl DetectorState {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The producing detector's file hash, for cache provenance. `None` on
+    /// no detector loaded, or (via `.ok()`) on a poisoned mutex -- unlike
+    /// sibling methods, poisoning is not propagated as `Err` here: a
+    /// poisoned state already fails `detect()` loudly on the hot path, so a
+    /// cache write/read on this path just skips instead of erroring.
     pub fn hash(&self) -> Option<[u8; 32]> {
         let guard = self.0.lock().ok()?;
         guard.as_ref().map(|loaded| loaded.hash)

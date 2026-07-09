@@ -9,12 +9,10 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub const PROBS_MAGIC: &[u8; 8] = b"UNDPROB1";
 
 /// Writes width*height probabilities as u8 (round(p*255)), zstd-compressed,
 /// with the producing detector's file hash in the header. Atomic.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn write_probs(
     path: &Path,
     probs: &[f32],
@@ -80,7 +78,6 @@ pub fn write_probs(
 /// Reads a probs cache written by write_probs. Returns None (never Err) when
 /// the file is absent, malformed, dimension-mismatched, or produced by a
 /// different detector -- malformed files are deleted on sight.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn read_probs(
     path: &Path,
     width: u32,

@@ -130,12 +130,10 @@ pub fn thumb_path(dir: &Path, file_name: &str) -> PathBuf {
     thumbs_dir(dir).join(format!("{file_name}.png"))
 }
 
-#[allow(dead_code)]
 pub fn cache_dir(dir: &Path) -> PathBuf {
     sidecar_dir(dir).join("cache")
 }
 
-#[allow(dead_code)]
 pub fn probs_cache_path(dir: &Path, file_name: &str) -> PathBuf {
     cache_dir(dir).join(format!("{file_name}.probs"))
 }
@@ -650,7 +648,6 @@ impl RollState {
     /// This deviates from sibling accessors: "no roll" is Ok(None), not Err,
     /// because id-keyed commands (detect, heal) expect closed rolls to be
     /// a benign cache-miss, not a failure.
-    #[allow(dead_code)]
     pub fn frame_for_image(&self, id: u64) -> Result<Option<(PathBuf, String)>, String> {
         let guard = self.roll.lock().map_err(|e| e.to_string())?;
         let roll = match guard.as_ref() {
