@@ -71,9 +71,18 @@
   });
 
   $effect(() => {
-    const un = listen<{ index: number; count: number | null }>("roll-progress", (e) => {
+    const un = listen<{
+      index: number;
+      count: number | null;
+      bboxes: [number, number, number, number][] | null;
+    }>("roll-progress", (e) => {
       if (!roll) return;
       roll.frames[e.payload.index].defect_count = e.payload.count;
+      // Rings for a freshly scanned frame appear immediately; without this
+      // the viewer only learns bboxes when the roll is reopened.
+      if (e.payload.bboxes) {
+        roll.frames[e.payload.index].bboxes = e.payload.bboxes;
+      }
     });
     return () => {
       un.then((f) => f());

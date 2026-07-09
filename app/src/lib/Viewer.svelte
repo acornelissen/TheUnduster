@@ -112,6 +112,13 @@
     requestFrame();
   }
 
+  // The roll queue delivers bboxes asynchronously mid-scan; redraw when
+  // they land so ring markers appear without waiting for a pan or zoom.
+  $effect(() => {
+    void bboxes;
+    requestFrame();
+  });
+
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
   $effect(() => {

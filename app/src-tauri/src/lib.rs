@@ -490,6 +490,10 @@ const SCAN_THRESHOLD: f32 = 0.5;
 struct RollProgress {
     index: usize,
     count: Option<usize>,
+    /// The scan's defect boxes ride along so the viewer can draw ring
+    /// markers for the active frame immediately; without them the frontend
+    /// only learns bboxes when a roll is (re)opened from its sidecar.
+    bboxes: Option<Vec<[u32; 4]>>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -662,13 +666,18 @@ fn scan_roll(
             match outcome {
                 Ok(bboxes) => {
                     let count = bboxes.len();
-                    let _ =
-                        roll_state.record_scan_result(generation, index, Some(count), Some(bboxes));
+                    let _ = roll_state.record_scan_result(
+                        generation,
+                        index,
+                        Some(count),
+                        Some(bboxes.clone()),
+                    );
                     let _ = app_for_task.emit(
                         "roll-progress",
                         RollProgress {
                             index,
                             count: Some(count),
+                            bboxes: Some(bboxes),
                         },
                     );
                 }
