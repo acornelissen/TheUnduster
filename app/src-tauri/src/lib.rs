@@ -776,7 +776,7 @@ fn export_approved(
             if roll_state.generation() != generation {
                 break;
             }
-            let (path, file_name, frame_threshold, _frame_strokes) =
+            let (path, file_name, frame_threshold, frame_strokes) =
                 match roll_state.export_frame_meta(index) {
                     Ok(meta) => meta,
                     Err(e) => {
@@ -827,10 +827,15 @@ fn export_approved(
                 tauri::async_runtime::spawn_blocking(move || {
                     let image = images::Images::decode_stage(&path)?;
                     let probs = detector.detect(&image)?;
-                    let mask = {
-                        let raw: Vec<bool> = probs.iter().map(|&p| p > threshold).collect();
-                        fd_heal::dilate(&raw, image.width, image.height, HEAL_DILATE_RADIUS)
-                    };
+                    masks::validate_strokes(&frame_strokes)?;
+                    let raw: Vec<bool> = probs.iter().map(|&p| p > threshold).collect();
+                    let mask = masks::compose_heal_mask(
+                        raw,
+                        image.width,
+                        image.height,
+                        HEAL_DILATE_RADIUS,
+                        &frame_strokes,
+                    );
                     let mut copy = (*image).clone();
                     inpainter
                         .with_inpainter(|inp| fd_heal::heal(&mut copy, &mask, inp))?
