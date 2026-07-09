@@ -367,7 +367,7 @@
     error = null;
     healing = true;
     try {
-      await invoke("heal_frame", { id: info.id, threshold: overlay.threshold });
+      await invoke("heal_frame", { id: info.id, threshold: overlay.threshold, strokes: [] });
       info = { ...info, healed: true };
     } catch (e) {
       error = String(e);

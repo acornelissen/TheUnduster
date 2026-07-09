@@ -52,11 +52,25 @@ pub fn validate_strokes(strokes: &[Stroke]) -> Result<(), String> {
     Ok(())
 }
 
+/// The one place mask composition order is defined: detector probs
+/// thresholded, dilated (model masks under-cover; see fd_heal::dilate),
+/// then manual strokes in chronological order, undilated.
+pub fn compose_heal_mask(
+    probs_mask: Vec<bool>,
+    width: u32,
+    height: u32,
+    dilate_radius: u32,
+    strokes: &[Stroke],
+) -> Vec<bool> {
+    let mut mask = fd_heal::dilate(&probs_mask, width, height, dilate_radius);
+    apply_strokes(&mut mask, width, height, strokes);
+    mask
+}
+
 /// Rasterizes strokes onto `mask` in order. Paint sets pixels; erase clears
 /// them -- including pixels the detector set, which is the point of `e`.
 /// Mismatched inputs (zero dimensions or mask length != width * height) are a
 /// no-op, treating degenerate sidecar data as invalid rather than panicking.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn apply_strokes(mask: &mut [bool], width: u32, height: u32, strokes: &[Stroke]) {
     // Early exit on zero dimensions to avoid clamp panics.
     if width == 0 || height == 0 {
@@ -135,6 +149,30 @@ mod tests {
             radius,
             points: vec![[x, y]],
         }
+    }
+
+    #[test]
+    fn compose_paints_beyond_detection_and_erase_protects() {
+        let (w, h) = (32u32, 32u32);
+        let mut probs_mask = vec![false; (w * h) as usize];
+        probs_mask[(10 * w + 10) as usize] = true; // one detected pixel
+        let strokes = vec![
+            Stroke {
+                erase: false,
+                radius: 2.0,
+                points: vec![[25.0, 25.0]],
+            },
+            Stroke {
+                erase: true,
+                radius: 4.0,
+                points: vec![[10.0, 10.0]],
+            },
+        ];
+        let mask = compose_heal_mask(probs_mask, w, h, 2, &strokes);
+        assert!(mask[(25 * w + 25) as usize]); // painted region heals
+        assert!(!mask[(10 * w + 10) as usize]); // erased detection protected
+                                                // the erase covered the dilated ring too (radius 4 > dilate 2)
+        assert!(!mask[(10 * w + 12) as usize]);
     }
 
     #[test]

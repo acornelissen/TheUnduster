@@ -173,10 +173,12 @@ async fn run_heal(
     inpainter: &State<'_, detect::InpainterState>,
     id: u64,
     threshold: f32,
+    strokes: Vec<masks::Stroke>,
 ) -> Result<HealSummary, String> {
     if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
         return Err(format!("threshold {threshold} out of range"));
     }
+    masks::validate_strokes(&strokes)?;
     let (image, mask) = {
         let images = images.lock().map_err(|e| e.to_string())?;
         let image = images.image(id).ok_or_else(|| format!("no image {id}"))?;
@@ -187,7 +189,13 @@ async fn run_heal(
     };
     let inpainter = inpainter.inner().clone();
     let (healed, pyramid, mask, report) = tauri::async_runtime::spawn_blocking(move || {
-        let mask = fd_heal::dilate(&mask, image.width, image.height, HEAL_DILATE_RADIUS);
+        let mask = masks::compose_heal_mask(
+            mask,
+            image.width,
+            image.height,
+            HEAL_DILATE_RADIUS,
+            &strokes,
+        );
         let mut copy = (*image).clone(); // the original Arc stays pristine
         let report = inpainter
             .with_inpainter(|inp| fd_heal::heal(&mut copy, &mask, inp))?
@@ -217,6 +225,7 @@ async fn heal_frame(
     inpainter: State<'_, detect::InpainterState>,
     id: u64,
     threshold: f32,
+    strokes: Vec<masks::Stroke>,
 ) -> Result<HealSummary, String> {
     let _ = app.emit(
         "app-progress",
@@ -225,7 +234,7 @@ async fn heal_frame(
             stage: "healing",
         },
     );
-    let result = run_heal(&images, &inpainter, id, threshold).await;
+    let result = run_heal(&images, &inpainter, id, threshold, strokes).await;
     let _ = app.emit("app-progress", Progress { id, stage: "ready" });
     result
 }
