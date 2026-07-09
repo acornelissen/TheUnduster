@@ -1668,6 +1668,12 @@ fn enqueue_job(
     // The flag is set; any fallible setup from here must clear it before
     // returning (the scan_roll discipline).
     let app_for_task = app.clone();
+    // The worker's identity for its terminal queue-idle emit: the generation
+    // at SPAWN. Reading the current generation at emit time instead would
+    // let an old worker's final idle race a roll swap, read the NEW
+    // generation, pass the frontend's filter, and wipe the new roll's live
+    // job entries -- the exact hole the generation guard exists to close.
+    let spawn_generation = generation;
     tauri::async_runtime::spawn(async move {
         let _job_flag_guard = JobFlagGuard(app_for_task.clone());
         // Drains until empty; a poisoned queue lock also ends the drain.
@@ -1708,12 +1714,12 @@ fn enqueue_job(
                 }
             }
         }
-        // Emit the idle event with the current generation: the notice is about
-        // the worker for the roll that's open NOW, not a stale generation.
-        // This prevents an old worker's idle from wiping live jobs of a new
-        // roll via the index-in-jobStates guard on the event's generation.
-        let generation = app_for_task.state::<roll::RollState>().generation();
-        let _ = app_for_task.emit("queue-idle", QueueIdlePayload { generation });
+        let _ = app_for_task.emit(
+            "queue-idle",
+            QueueIdlePayload {
+                generation: spawn_generation,
+            },
+        );
     });
     Ok(())
 }
