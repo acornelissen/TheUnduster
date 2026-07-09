@@ -917,6 +917,9 @@ pub fn run() {
             let inpainter = app.state::<detect::InpainterState>();
             let mut loaded = false;
             if let Ok(lama) = models::lama_path(app.handle()) {
+                // A crash mid-download can orphan the ~200MB temp file; it is
+                // never loaded, only wasted disk. Clear it on startup.
+                let _ = std::fs::remove_file(lama.with_file_name("lama.onnx.tmp-unduster"));
                 if lama.exists() {
                     match inpainter.load(&lama) {
                         Ok(()) => loaded = true,
@@ -924,8 +927,11 @@ pub fn run() {
                     }
                 }
             }
+            // The fixture autoload makes dev builds report a loaded inpainter,
+            // which hides the model-download UI entirely; the env var lets a
+            // dev session exercise the missing/download states.
             #[cfg(debug_assertions)]
-            if !loaded {
+            if !loaded && std::env::var("UNDUSTER_NO_FIXTURE_INPAINT").is_err() {
                 let fixtures =
                     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../engine/fixtures");
                 let _ = inpainter.load(&fixtures.join("tiny-inpaint.onnx"));

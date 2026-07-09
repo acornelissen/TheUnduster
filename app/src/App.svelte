@@ -231,7 +231,10 @@
       modelTotal = null;
       (async () => {
         try {
-          modelStatus = await invoke<"loaded" | "available" | "missing">("inpainter_status");
+          const s = await invoke<"loaded" | "available" | "missing">("inpainter_status");
+          // A retry click may have started a new download while this refetch
+          // was in flight; never clobber the live downloading state.
+          if (modelStatus !== "downloading") modelStatus = s;
         } catch (e2) {
           error = String(e2);
         }
@@ -487,7 +490,8 @@
       // event path at all.
       error = String(e);
       try {
-        modelStatus = await invoke<"loaded" | "available" | "missing">("inpainter_status");
+        const s = await invoke<"loaded" | "available" | "missing">("inpainter_status");
+        if (modelStatus !== "downloading") modelStatus = s;
       } catch (e2) {
         error = String(e2);
       }
