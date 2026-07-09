@@ -4,6 +4,7 @@ mod cache;
 mod detect;
 mod export;
 mod images;
+mod jobs;
 mod masks;
 mod models;
 mod protocol;
