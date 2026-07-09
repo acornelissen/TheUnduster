@@ -280,22 +280,30 @@
       // Strokes are edit state, not a detector overlay: they stay visible
       // regardless of the `m` tint toggle. The in-progress stroke (not yet
       // committed to `strokes`) is appended so painting gives live feedback.
-      const allStrokes =
-        painting && livePoints.length > 0
-          ? [...strokes, { erase: brushMode === "erase", radius: brushRadius, points: livePoints }]
-          : strokes;
-      const paintSegs = strokeSegments(allStrokes.filter((s) => !s.erase));
-      const eraseSegs = strokeSegments(allStrokes.filter((s) => s.erase));
-      if (paintSegs.length > 0) {
-        renderer.drawStrokes(paintSegs, [1.0, 0.72, 0.24, 0.35], canvas.width, canvas.height);
-      }
-      if (eraseSegs.length > 0) {
-        renderer.drawStrokes(eraseSegs, [0.42, 0.69, 1.0, 0.3], canvas.width, canvas.height);
-      }
-      if (brushMode !== "off") {
-        const cx = (cursorX - centerX) * zoom + canvas.width / 2;
-        const cy = (cursorY - centerY) * zoom + canvas.height / 2;
-        renderer.drawRings([{ x: cx, y: cy, r: brushRadius * zoom }], canvas.width, canvas.height);
+      // The healed "after" view is the exception: strokes annotate the
+      // BEFORE state and sit exactly over the healed pixels the operator is
+      // trying to inspect, so the space toggle shows the result unobscured.
+      if (!showHealed) {
+        const allStrokes =
+          painting && livePoints.length > 0
+            ? [
+                ...strokes,
+                { erase: brushMode === "erase", radius: brushRadius, points: livePoints },
+              ]
+            : strokes;
+        const paintSegs = strokeSegments(allStrokes.filter((s) => !s.erase));
+        const eraseSegs = strokeSegments(allStrokes.filter((s) => s.erase));
+        if (paintSegs.length > 0) {
+          renderer.drawStrokes(paintSegs, [1.0, 0.72, 0.24, 0.35], canvas.width, canvas.height);
+        }
+        if (eraseSegs.length > 0) {
+          renderer.drawStrokes(eraseSegs, [0.42, 0.69, 1.0, 0.3], canvas.width, canvas.height);
+        }
+        if (brushMode !== "off") {
+          const cx = (cursorX - centerX) * zoom + canvas.width / 2;
+          const cy = (cursorY - centerY) * zoom + canvas.height / 2;
+          renderer.drawRings([{ x: cx, y: cy, r: brushRadius * zoom }], canvas.width, canvas.height);
+        }
       }
     }
     rafId = requestAnimationFrame(frame);
