@@ -1,3 +1,4 @@
+import "./app.css";
 import { mount } from "svelte";
 import { invoke } from "@tauri-apps/api/core";
 import App from "./App.svelte";

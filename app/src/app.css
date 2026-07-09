@@ -1,0 +1,152 @@
+/* Darkroom design tokens: graphite chrome, safelight amber accent.
+   Every later UI task in this pass consumes this sheet -- do not rename
+   tokens without checking downstream usage. */
+:root {
+  /* Darkroom palette: graphite chrome, safelight amber accent. */
+  --bg-0: #141414; /* app background */
+  --bg-1: #1d1d1d; /* toolbar, status bar, filmstrip */
+  --bg-2: #272727; /* raised: buttons, inputs, thumbs */
+  --bg-3: #323232; /* hover on raised */
+  --surround: #3d3d3d; /* neutral grey around images (spec) */
+  --border: #3a3a3a;
+  --text-1: #e8e6e3; /* primary: 13.5:1 on --bg-1 */
+  --text-2: #a8a5a0; /* secondary: 6.9:1 on --bg-1 */
+  --text-3: #7c7a76; /* hints/disabled labels: 3.9:1 -- large/AA-nontext only, never body copy */
+  --accent: #e8a33d; /* safelight amber: 7.8:1 on --bg-1 */
+  --accent-hover: #f4b658;
+  --on-accent: #141414; /* 8.5:1 on --accent */
+  --accent-soft: rgba(232, 163, 61, 0.16);
+  --ok: #8fbf7f; /* muted green: 8.0:1 on --bg-1 */
+  --err: #e08379; /* muted red: 6.2:1 on --bg-1 */
+  --info: #8fb8e8; /* 8.2:1 on --bg-1 */
+  --focus: #ffc46b; /* focus ring, 3px, offset 1px */
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --radius-1: 4px;
+  --radius-2: 6px;
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-lg: 15px;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --ease: 120ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg-0);
+  color: var(--text-1);
+  font-family: var(--font);
+  font-size: var(--text-base);
+}
+
+#app {
+  background: var(--bg-0);
+  color: var(--text-1);
+}
+
+/* Buttons */
+.btn {
+  font: inherit;
+  background: var(--bg-2);
+  color: var(--text-1);
+  border: none;
+  border-radius: var(--radius-1);
+  padding: var(--space-1) var(--space-3);
+  min-height: 26px;
+  cursor: pointer;
+  transition: background var(--ease);
+}
+.btn:hover:not(:disabled) {
+  background: var(--bg-3);
+}
+.btn:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 1px;
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+/* Toolbar */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.toolbar-group + .toolbar-group {
+  border-left: 1px solid var(--border);
+  margin-left: var(--space-3);
+  padding-left: var(--space-3);
+}
+
+/* Range input */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  padding: 10px 0; /* pads the hit area to ~24px tall around the 4px track */
+  cursor: pointer;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: var(--radius-1);
+  background: var(--bg-3);
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: none;
+  margin-top: -5px; /* centers the 14px thumb on the 4px track */
+}
+input[type="range"]:focus-visible {
+  outline: none;
+}
+input[type="range"]:focus-visible::-webkit-slider-thumb {
+  outline: 3px solid var(--focus);
+  outline-offset: 1px;
+}
+
+/* Badges */
+.badge {
+  font-size: var(--text-xs);
+  border-radius: var(--radius-1);
+  padding: 1px var(--space-1);
+  font-variant-numeric: tabular-nums;
+}

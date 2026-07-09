@@ -110,35 +110,35 @@
 <style>
   .filmstrip {
     display: flex;
-    gap: 0.5rem;
+    gap: var(--space-2);
     overflow-x: auto;
-    padding: 0.5rem;
-    background: #1b1b1b;
-    border-top: 1px solid #333;
+    padding: var(--space-2);
+    background: var(--bg-1);
+    border-top: 1px solid var(--border);
   }
   .frame {
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 0.2rem;
+    gap: var(--space-1);
     width: 96px;
     flex: 0 0 auto;
     cursor: pointer;
-    border-radius: 4px;
-    padding: 0.25rem;
+    border-radius: var(--radius-1);
+    padding: var(--space-1);
   }
   .frame.current {
-    background: #2d3f57;
+    background: var(--accent-soft);
   }
   .frame:focus-visible {
-    outline: 3px solid #6ab0ff;
+    outline: 3px solid var(--focus);
     outline-offset: 2px;
   }
   .thumb-wrap {
     position: relative;
     width: 88px;
     height: 88px;
-    background: #333;
+    background: var(--bg-3);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -153,10 +153,8 @@
     bottom: 2px;
     right: 2px;
     background: rgba(0, 0, 0, 0.75);
-    color: #fff;
-    font-size: 0.7rem;
-    padding: 0.05rem 0.3rem;
-    border-radius: 8px;
+    color: var(--text-1);
+    border-radius: var(--radius-2);
   }
   .spinner {
     position: absolute;
@@ -164,8 +162,8 @@
     right: 4px;
     width: 10px;
     height: 10px;
-    border: 2px solid #888;
-    border-top-color: #ddd;
+    border: 2px solid var(--text-2);
+    border-top-color: var(--text-1);
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
   }
@@ -178,39 +176,39 @@
     position: absolute;
     top: 2px;
     left: 2px;
-    color: #7CFC00;
-    font-size: 0.9rem;
+    color: var(--ok);
+    font-size: var(--text-sm);
   }
   .exported {
     position: absolute;
     top: 2px;
     right: 2px;
     background: rgba(0, 0, 0, 0.75);
-    color: #6ab0ff;
-    font-size: 0.6rem;
+    color: var(--info);
+    font-size: var(--text-xs);
     font-weight: 600;
     letter-spacing: 0.02em;
-    padding: 0.05rem 0.25rem;
-    border-radius: 3px;
+    padding: 1px var(--space-1);
+    border-radius: var(--radius-1);
     text-transform: uppercase;
   }
   .job-marker {
     position: absolute;
     bottom: 2px;
     left: 2px;
-    font-size: 0.75rem;
+    font-size: var(--text-sm);
     line-height: 1;
     text-shadow: 0 0 2px rgba(0, 0, 0, 0.9);
   }
   .job-queued {
-    color: #f0c674;
+    color: var(--focus);
   }
   .job-running {
-    color: #ff9c3c;
+    color: var(--accent);
   }
   .name {
-    font-size: 0.65rem;
-    color: #ccc;
+    font-size: var(--text-xs);
+    color: var(--text-2);
     max-width: 88px;
     overflow: hidden;
     text-overflow: ellipsis;

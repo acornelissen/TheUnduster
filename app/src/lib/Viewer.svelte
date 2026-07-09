@@ -549,17 +549,18 @@
     width: 100%;
     height: 100%;
     display: block;
+    background: var(--surround);
     touch-action: none;
     cursor: grab;
   }
   .gl-error {
-    color: #ff9c9c;
-    padding: 1rem;
+    color: var(--err);
+    padding: var(--space-4);
     margin: 0;
   }
 
   canvas:focus-visible {
-    outline: 3px solid #6ab0ff;
+    outline: 3px solid var(--focus);
     outline-offset: -3px;
   }
 </style>

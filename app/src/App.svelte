@@ -992,11 +992,11 @@
 <svelte:window onkeydown={onWindowKey} />
 
 <div class="shell">
-  <header>
-    <button onclick={openScan} disabled={loading !== null}>Open scan</button>
-    <button onclick={openRoll} disabled={loading !== null}>Open roll</button>
+  <header class="toolbar">
+    <button class="btn" onclick={openScan} disabled={loading !== null}>Open scan</button>
+    <button class="btn" onclick={openRoll} disabled={loading !== null}>Open roll</button>
     {#if modelStatus !== "loaded"}
-      <button onclick={downloadModel} disabled={modelStatus === "downloading"}>
+      <button class="btn" onclick={downloadModel} disabled={modelStatus === "downloading"}>
         {#if modelStatus === "missing"}
           Download healing model (207 MB)
         {:else if modelStatus === "available"}
@@ -1008,30 +1008,36 @@
     {/if}
     {#if roll}
       <button
+        class="btn"
         onclick={approveAndAdvance}
         disabled={roll.frames[currentIndex].approved}
       >
         {roll.frames[currentIndex].approved ? "Approved" : "Approve"}
       </button>
       <button
+        class="btn"
         onclick={exportApproved}
         disabled={exporting || roll.frames.every((f) => !f.approved)}
       >
         {exporting ? "Exporting..." : "Export approved"}
       </button>
-      <button onclick={healApproved} disabled={roll.frames.every((f) => !f.approved)}>
+      <button class="btn" onclick={healApproved} disabled={roll.frames.every((f) => !f.approved)}>
         Heal approved
       </button>
     {/if}
     {#if info}
-      <button onclick={requestDetect} disabled={loading !== null || isDetecting}>
+      <button class="btn" onclick={requestDetect} disabled={loading !== null || isDetecting}>
         {isDetecting ? "Detecting..." : "Detect"}
       </button>
-      <button onclick={requestHeal} disabled={loading !== null || isDetecting || isHealing || !info}>
+      <button
+        class="btn"
+        onclick={requestHeal}
+        disabled={loading !== null || isDetecting || isHealing || !info}
+      >
         {isHealing ? "Healing..." : "Heal"}
       </button>
       {#if info && !roll}
-        <button onclick={exportSingle} disabled={!info.healed || exportingSingle}>
+        <button class="btn" onclick={exportSingle} disabled={!info.healed || exportingSingle}>
           {exportingSingle ? "Exporting..." : "Export"}
         </button>
       {/if}
@@ -1145,43 +1151,28 @@
 </div>
 
 <style>
-  :global(body) {
-    margin: 0;
-    background: #262626;
-    color: #e8e8e8;
-    font-family: system-ui, sans-serif;
-  }
   .shell {
     display: flex;
     flex-direction: column;
     height: 100vh;
+    background: var(--bg-0);
+    color: var(--text-1);
   }
   header {
-    padding: 0.5rem;
-    display: flex;
-    gap: 0.75rem;
-    align-items: center;
-  }
-  button {
-    font: inherit;
-    padding: 0.4rem 0.9rem;
-  }
-  button:focus-visible {
-    outline: 3px solid #6ab0ff;
+    padding: var(--space-2);
+    background: var(--bg-1);
   }
   label {
     display: flex;
     align-items: center;
-    gap: 0.4rem;
-    font-size: 0.9rem;
-  }
-  input[type="range"]:focus-visible {
-    outline: 3px solid #6ab0ff;
+    gap: var(--space-1);
+    font-size: var(--text-sm);
   }
   .status {
     margin: 0;
-    color: #bbb;
-    font-size: 0.9rem;
+    color: var(--text-2);
+    font-size: var(--text-sm);
+    font-variant-numeric: tabular-nums;
   }
   .stage {
     flex: 1;
@@ -1195,15 +1186,15 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 0.5rem;
-    background: rgba(38, 38, 38, 0.75);
+    gap: var(--space-2);
+    background: rgba(20, 20, 20, 0.75);
     pointer-events: none;
   }
   .stage-overlay img {
     max-height: 70%;
     max-width: 80%;
     filter: blur(2px) brightness(0.8);
-    border-radius: 4px;
+    border-radius: var(--radius-1);
   }
   .stage-overlay .hint {
     margin: 0;
@@ -1211,11 +1202,11 @@
 
   .hint {
     text-align: center;
-    color: #999;
-    margin-top: 4rem;
+    color: var(--text-2);
+    margin-top: var(--space-6);
   }
   [role="alert"] {
-    color: #ff9c9c;
+    color: var(--err);
     margin: 0;
   }
 </style>
