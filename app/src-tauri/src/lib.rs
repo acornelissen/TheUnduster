@@ -460,6 +460,18 @@ fn approve_frame(
 }
 
 #[tauri::command]
+fn set_frame_strokes(
+    roll: State<'_, roll::RollState>,
+    index: usize,
+    strokes: Vec<masks::Stroke>,
+    redo_strokes: Vec<masks::Stroke>,
+) -> Result<(), String> {
+    masks::validate_strokes(&strokes)?;
+    masks::validate_strokes(&redo_strokes)?;
+    roll.set_strokes(index, strokes, redo_strokes)
+}
+
+#[tauri::command]
 async fn export_frame(
     images: State<'_, Mutex<Images>>,
     id: u64,
@@ -755,14 +767,15 @@ fn export_approved(
             if roll_state.generation() != generation {
                 break;
             }
-            let (path, file_name, frame_threshold) = match roll_state.export_frame_meta(index) {
-                Ok(meta) => meta,
-                Err(e) => {
-                    let _ = app_for_task
-                        .emit("export-frame-error", ExportFrameError { index, message: e });
-                    continue;
-                }
-            };
+            let (path, file_name, frame_threshold, _frame_strokes) =
+                match roll_state.export_frame_meta(index) {
+                    Ok(meta) => meta,
+                    Err(e) => {
+                        let _ = app_for_task
+                            .emit("export-frame-error", ExportFrameError { index, message: e });
+                        continue;
+                    }
+                };
 
             // Prefer already-healed registry data (the operator reviewed it).
             let registry_export = {
@@ -859,6 +872,7 @@ pub fn run() {
             activate_frame,
             set_frame_threshold,
             approve_frame,
+            set_frame_strokes,
             export_frame,
             scan_roll,
             export_approved

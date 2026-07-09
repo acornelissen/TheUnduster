@@ -11,7 +11,6 @@ pub const MIN_RADIUS: f32 = 1.0;
 pub const MAX_RADIUS: f32 = 512.0;
 const MAX_COORD: f32 = 1e7;
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Stroke {
     pub erase: bool,
@@ -23,7 +22,6 @@ pub struct Stroke {
 /// sidecar. Coordinates may exceed the image (drags can exit the canvas);
 /// the rasterizer clamps. Non-finite values and absurd magnitudes are not
 /// drawing, they are malformed input.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn validate_strokes(strokes: &[Stroke]) -> Result<(), String> {
     if strokes.len() > MAX_STROKES {
         return Err(format!(

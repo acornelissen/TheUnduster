@@ -25,6 +25,10 @@ pub struct Frame {
     pub defect_count: Option<usize>,
     #[serde(default)]
     pub bboxes: Option<Vec<[u32; 4]>>,
+    #[serde(default)]
+    pub strokes: Vec<crate::masks::Stroke>,
+    #[serde(default)]
+    pub redo_strokes: Vec<crate::masks::Stroke>,
     /// Registry id while the frame's pixels are activated. Runtime-only:
     /// a fresh process has no registry entries, so persisting this would
     /// point at nothing after restart.
@@ -45,6 +49,8 @@ impl Frame {
             exported: false,
             defect_count: None,
             bboxes: None,
+            strokes: Vec::new(),
+            redo_strokes: Vec::new(),
             image_id: None,
         }
     }
@@ -253,6 +259,8 @@ pub struct FrameInfo {
     pub exported: bool,
     pub defect_count: Option<usize>,
     pub bboxes: Option<Vec<[u32; 4]>>,
+    pub strokes: Vec<crate::masks::Stroke>,
+    pub redo_strokes: Vec<crate::masks::Stroke>,
 }
 
 impl Frame {
@@ -265,6 +273,8 @@ impl Frame {
             exported: self.exported,
             defect_count: self.defect_count,
             bboxes: self.bboxes.clone(),
+            strokes: self.strokes.clone(),
+            redo_strokes: self.redo_strokes.clone(),
         }
     }
 }
@@ -451,12 +461,16 @@ impl RollState {
         Ok(roll.dir.join(&frame.file_name))
     }
 
-    /// Path, file name, and stored threshold for a frame, read under a single
-    /// lock acquisition: the transient export pipeline needs all three
+    /// Path, file name, stored threshold, and strokes for a frame, read under
+    /// a single lock acquisition: the transient export pipeline needs all four
     /// together (path to decode, file name to name the destination file,
-    /// threshold to build the mask), and reading them separately would risk
-    /// observing an inconsistent frame across two lock windows.
-    pub fn export_frame_meta(&self, index: usize) -> Result<(PathBuf, String, f32), String> {
+    /// threshold to build the mask, strokes to apply), and reading them
+    /// separately would risk observing an inconsistent frame across two lock
+    /// windows.
+    pub fn export_frame_meta(
+        &self,
+        index: usize,
+    ) -> Result<(PathBuf, String, f32, Vec<crate::masks::Stroke>), String> {
         let guard = self.roll.lock().map_err(|e| e.to_string())?;
         let roll = guard.as_ref().ok_or("no roll open")?;
         let frame = roll
@@ -467,6 +481,7 @@ impl RollState {
             roll.dir.join(&frame.file_name),
             frame.file_name.clone(),
             frame.threshold,
+            frame.strokes.clone(),
         ))
     }
 
@@ -494,6 +509,23 @@ impl RollState {
             .get_mut(index)
             .ok_or_else(|| format!("no frame {index}"))?;
         frame.approved = approved;
+        roll.save()
+    }
+
+    pub fn set_strokes(
+        &self,
+        index: usize,
+        strokes: Vec<crate::masks::Stroke>,
+        redo_strokes: Vec<crate::masks::Stroke>,
+    ) -> Result<(), String> {
+        let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
+        let roll = guard.as_mut().ok_or("no roll open")?;
+        let frame = roll
+            .frames
+            .get_mut(index)
+            .ok_or_else(|| format!("no frame {index}"))?;
+        frame.strokes = strokes;
+        frame.redo_strokes = redo_strokes;
         roll.save()
     }
 
@@ -845,6 +877,54 @@ mod state_tests {
         state.scanning.store(true, Ordering::SeqCst);
         state.clear_scanning();
         assert!(!state.scanning.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn strokes_persist_in_the_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"x").unwrap();
+        let state = RollState::default();
+        state.open(dir.path()).unwrap();
+        let strokes = vec![crate::masks::Stroke {
+            erase: false,
+            radius: 12.0,
+            points: vec![[100.0, 200.0], [110.0, 210.0]],
+        }];
+        let redo = vec![crate::masks::Stroke {
+            erase: true,
+            radius: 8.0,
+            points: vec![[5.0, 5.0]],
+        }];
+        state.set_strokes(0, strokes.clone(), redo.clone()).unwrap();
+        // reopen from disk: both lists survive
+        let (info, _) = state.open(dir.path()).unwrap();
+        assert_eq!(info.frames[0].strokes, strokes);
+        assert_eq!(info.frames[0].redo_strokes, redo);
+    }
+
+    #[test]
+    fn set_strokes_rejects_bad_index() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"x").unwrap();
+        let state = RollState::default();
+        state.open(dir.path()).unwrap();
+        assert!(state.set_strokes(5, vec![], vec![]).is_err());
+    }
+
+    #[test]
+    fn export_frame_meta_carries_strokes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"x").unwrap();
+        let state = RollState::default();
+        state.open(dir.path()).unwrap();
+        let strokes = vec![crate::masks::Stroke {
+            erase: false,
+            radius: 4.0,
+            points: vec![[1.0, 1.0]],
+        }];
+        state.set_strokes(0, strokes.clone(), vec![]).unwrap();
+        let (_, _, _, meta_strokes) = state.export_frame_meta(0).unwrap();
+        assert_eq!(meta_strokes, strokes);
     }
 }
 
