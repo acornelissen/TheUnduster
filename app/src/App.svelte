@@ -198,6 +198,7 @@
         modelStatus = await invoke<"loaded" | "available" | "missing">("inpainter_status");
       } catch (e) {
         error = String(e);
+        modelStatus = "missing";
       }
     })();
   });
@@ -596,10 +597,16 @@
   <header>
     <button onclick={openScan} disabled={loading !== null}>Open scan</button>
     <button onclick={openRoll} disabled={loading !== null}>Open roll</button>
-    {#if modelStatus === "missing"}
-      <button onclick={downloadModel}>Download healing model (207 MB)</button>
-    {:else if modelStatus === "available"}
-      <button onclick={downloadModel}>Repair healing model</button>
+    {#if modelStatus !== "loaded"}
+      <button onclick={downloadModel} disabled={modelStatus === "downloading"}>
+        {#if modelStatus === "missing"}
+          Download healing model (207 MB)
+        {:else if modelStatus === "available"}
+          Repair healing model
+        {:else if modelStatus === "downloading"}
+          Downloading...
+        {/if}
+      </button>
     {/if}
     {#if roll}
       <button
