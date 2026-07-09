@@ -102,6 +102,7 @@
   let exporting = $state(false);
   let exportingSingle = $state(false);
   let scanFileName: string | null = $state(null);
+  let scanFileExt: string | null = $state(null);
   let singleExportNote: string | null = $state(null);
   let thresholdSaveTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -402,6 +403,8 @@
     });
     if (typeof path !== "string") return;
     scanFileName = path.split(/[\\/]/).pop() ?? null;
+    // Capture the file extension to lock export format to the source format
+    scanFileExt = path.split(".").pop()?.toLowerCase() ?? null;
     const previousId = info?.id;
     const hadRoll = roll !== null;
     roll = null;
@@ -428,6 +431,7 @@
     }
     detected = false;
     componentsAtHalf = null;
+    singleExportNote = null;
     if (previousId !== undefined) {
       try {
         await invoke("close_image", { id: previousId });
@@ -507,7 +511,14 @@
     if (!info || exportingSingle) return;
     error = null;
     singleExportNote = null;
-    const dest = await save({ defaultPath: scanFileName ?? undefined });
+    const saveOptions: { defaultPath?: string; filters?: { name: string; extensions: string[] }[] } = {
+      defaultPath: scanFileName ?? undefined,
+    };
+    // Lock export format to the source format when known
+    if (scanFileExt) {
+      saveOptions.filters = [{ name: "Same format", extensions: [scanFileExt] }];
+    }
+    const dest = await save(saveOptions);
     if (!dest) return;
     exportingSingle = true;
     try {
