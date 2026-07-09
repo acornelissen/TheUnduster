@@ -3,6 +3,7 @@
 mod detect;
 mod export;
 mod images;
+mod masks;
 mod protocol;
 mod roll;
 
