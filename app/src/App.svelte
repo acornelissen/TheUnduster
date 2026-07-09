@@ -576,6 +576,12 @@
     const index = currentIndex;
     loading = "Opening frame";
     overlay.threshold = roll.frames[index].threshold;
+    // Snapshot for the restore-case heal-inputs capture below: the slider
+    // stays live during the activation await and mutates the same frame
+    // object in place, so reading it post-await could record a live edit
+    // instead of the persisted values the cached heal actually matched.
+    const persistedThreshold = roll.frames[index].threshold;
+    const persistedStrokeCount = roll.frames[index].strokes.length;
     activating = true;
     let result: ImageInfo;
     try {
@@ -601,10 +607,9 @@
     // them so the staleness check has something to compare against. A real
     // capture point (heal job-done) always overwrites this if one exists.
     if (result.healed && !(`roll:${index}` in healInputs)) {
-      const frame = roll.frames[index];
       healInputs[`roll:${index}`] = {
-        threshold: frame.threshold,
-        strokeCount: frame.strokes.length,
+        threshold: persistedThreshold,
+        strokeCount: persistedStrokeCount,
       };
     }
     // Belt and braces: the backend now guarantees a terminal "ready" emit on
@@ -760,17 +765,20 @@
     singleExportNote = null;
     healing = true;
     healProgress = null;
+    // Snapshot BEFORE the await: the slider and brush stay live during a
+    // long heal, and the capture must record what was actually sent, not
+    // whatever the inputs drifted to by the time the invoke resolved.
+    const healThreshold = overlay.threshold;
+    const healStrokes = currentStrokes();
     try {
       await invoke("heal_frame", {
         id: info.id,
-        threshold: overlay.threshold,
-        strokes: currentStrokes(),
+        threshold: healThreshold,
+        strokes: healStrokes,
       });
-      // Capture at invoke time: the threshold and stroke count this heal was
-      // actually produced from.
       const key = strokeKey();
       if (key) {
-        healInputs[key] = { threshold: overlay.threshold, strokeCount: currentStrokes().length };
+        healInputs[key] = { threshold: healThreshold, strokeCount: healStrokes.length };
       }
       info = { ...info, healed: true };
     } catch (e) {
