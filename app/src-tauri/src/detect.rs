@@ -103,6 +103,29 @@ impl InpainterState {
         Ok(f(guard.as_mut().map(|loaded| &mut loaded.inpainter)))
     }
 
+    /// Runs `f` with mutable access to the loaded inpainter AND its file hash,
+    /// observed under one lock acquisition. This is the atomicity guarantee
+    /// heal-cache provenance depends on: `with_inpainter` and `hash()` taken
+    /// as two separate locks would let a model download complete between
+    /// them, so the model that actually heals could be model B while the
+    /// provenance recorded (from a hash taken before or after) says model A
+    /// -- or the zeros sentinel for "no model". Pairing them under a single
+    /// guard makes "the hash used for provenance" and "the model that heals"
+    /// the same observation, closing that race.
+    pub fn with_inpainter_hashed<R>(
+        &self,
+        f: impl FnOnce(Option<(&mut fd_heal::Inpainter, [u8; 32])>) -> R,
+    ) -> Result<R, String> {
+        let mut guard = self.0.lock().map_err(|e| e.to_string())?;
+        Ok(f(guard
+            .as_mut()
+            .map(|loaded| (&mut loaded.inpainter, loaded.hash))))
+    }
+
+    // No production caller: heal-cache provenance always reads the inpainter's
+    // hash through with_inpainter_hashed (one lock, paired with the model
+    // that actually heals -- see that method's doc comment). Kept for tests
+    // and any future non-racy caller.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn hash(&self) -> Option<[u8; 32]> {
         let guard = self.0.lock().ok()?;
@@ -205,5 +228,25 @@ mod tests {
         // stable across loads of the same file
         state.load(&inpaint_fixture()).unwrap();
         assert_eq!(state.hash().unwrap(), h);
+    }
+
+    #[test]
+    fn with_inpainter_hashed_pairs_the_model_with_its_own_hash() {
+        let state = InpainterState::default();
+        // No model loaded: the closure sees None.
+        assert!(state.with_inpainter_hashed(|pair| pair.is_none()).unwrap());
+
+        state.load(&inpaint_fixture()).unwrap();
+        // Capture the expected hash BEFORE entering the closure: calling
+        // state.hash() from inside would try to lock the same non-reentrant
+        // mutex that with_inpainter_hashed already holds, and deadlock.
+        let expected_hash = state.hash().expect("hash after load");
+        let saw_matching_pair = state
+            .with_inpainter_hashed(|pair| {
+                let (_inp, hash) = pair.expect("model loaded");
+                hash == expected_hash
+            })
+            .unwrap();
+        assert!(saw_matching_pair);
     }
 }

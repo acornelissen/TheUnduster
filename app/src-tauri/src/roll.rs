@@ -138,7 +138,6 @@ pub fn probs_cache_path(dir: &Path, file_name: &str) -> PathBuf {
     cache_dir(dir).join(format!("{file_name}.probs"))
 }
 
-#[allow(dead_code)]
 pub fn heal_cache_path(dir: &Path, file_name: &str) -> PathBuf {
     cache_dir(dir).join(format!("{file_name}.heal"))
 }

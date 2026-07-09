@@ -210,7 +210,6 @@ const HEAL_HEADER_LEN: usize = 8 + 4 + 4 + 4 + 1 + 1 + 32 + 8;
 /// Provenance of a heal: any input that changes the output contributes.
 /// Strokes are canonicalized as serde_json bytes (deterministic for
 /// identical f32 bit patterns, which is exactly the invariant we want).
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn heal_provenance(
     threshold: f32,
     dilate_radius: u32,
@@ -237,7 +236,6 @@ fn pixel_data_depth(data: &fd_io::PixelData) -> u8 {
 
 /// Persists a heal as a delta: the mask (bitset, zstd) and the healed pixel
 /// values inside it (native depth, zstd), plus the provenance. Atomic.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn write_heal(
     path: &Path,
     original: &fd_io::ImageBuf,
@@ -347,7 +345,6 @@ pub fn write_heal(
 /// matches the requested provenance and the original's dimensions/depth.
 /// Returns the healed copy and the mask. None on any mismatch; malformed
 /// files deleted on sight.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn read_heal(
     path: &Path,
     original: &fd_io::ImageBuf,

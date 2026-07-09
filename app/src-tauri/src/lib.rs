@@ -187,14 +187,24 @@ struct HealSummary {
     defects: usize,
     tiny: usize,
     inpainted: usize,
+    /// True when this heal was restored from the on-disk delta cache
+    /// (provenance-matched) instead of freshly computed. Informational only
+    /// -- the frontend is free to ignore it.
+    restored: bool,
 }
 
 /// Runs the fallible body of `heal_frame`. Split out so `heal_frame` can
 /// guarantee a terminal "ready" emit on every exit path, mirroring
 /// `run_detect`/`detect`.
+// Params mirror the Tauri states/args heal_frame receives, plus the roll and
+// detector handles the cache read/write needs; splitting them into a struct
+// would obscure rather than clarify this thin a function.
+#[allow(clippy::too_many_arguments)]
 async fn run_heal(
     app: &tauri::AppHandle,
     images: &State<'_, Mutex<Images>>,
+    roll: &State<'_, roll::RollState>,
+    detector: &State<'_, detect::DetectorState>,
     inpainter: &State<'_, detect::InpainterState>,
     id: u64,
     threshold: f32,
@@ -212,33 +222,80 @@ async fn run_heal(
             .ok_or_else(|| format!("no detection for image {id}"))?;
         (image, mask)
     };
+    // Resolved before spawn_blocking (owned values into the closure), mirroring
+    // run_detect's cache_path resolution. `None` when the frame doesn't map to
+    // a roll (single-image mode): the heal cache is roll-only.
+    let cache_path = roll
+        .frame_for_image(id)?
+        .map(|(roll_dir, file_name)| roll::heal_cache_path(&roll_dir, &file_name));
+    // The CURRENT detector's hash: the thresholded probs in the registry came
+    // from it. Zeros when none loaded -- that race (detector swapped between
+    // detect and heal) is bead-tracked separately as unreachable in practice.
+    let detector_hash = detector.hash().unwrap_or([0u8; 32]);
     let inpainter = inpainter.inner().clone();
     let app_for_progress = app.clone();
-    let (healed, pyramid, mask, report) = tauri::async_runtime::spawn_blocking(move || {
-        let mask = masks::compose_heal_mask(
-            mask,
-            image.width,
-            image.height,
-            HEAL_DILATE_RADIUS,
-            &strokes,
-        );
-        let mut copy = (*image).clone(); // the original Arc stays pristine
-                                         // A real inpainting model costs seconds per defect window; per-defect
-                                         // progress keeps a long heal visibly alive in the status line.
-        let report = inpainter
-            .with_inpainter(|inp| {
-                fd_heal::heal_with_progress(&mut copy, &mask, inp, &mut |done, total| {
-                    let _ =
-                        app_for_progress.emit("heal-progress", HealProgress { id, done, total });
-                })
+    let (healed, pyramid, mask, report, restored) =
+        tauri::async_runtime::spawn_blocking(move || {
+            // Everything provenance-dependent -- including the inpainter's
+            // hash -- happens inside this closure, under with_inpainter_hashed's
+            // single lock: the model that actually heals (on a miss) and the
+            // hash recorded in provenance must be the same observation, or a
+            // model download completing mid-flight could heal with model B
+            // while provenance says model A.
+            inpainter.with_inpainter_hashed(|pair| {
+                let inpainter_hash = pair.as_ref().map(|(_, h)| *h).unwrap_or([0u8; 32]);
+                let provenance = cache::heal_provenance(
+                    threshold,
+                    HEAL_DILATE_RADIUS,
+                    &strokes,
+                    &detector_hash,
+                    &inpainter_hash,
+                );
+
+                if let Some(path) = &cache_path {
+                    if let Some((healed, mask)) = cache::read_heal(path, &image, &provenance) {
+                        let healed = std::sync::Arc::new(healed);
+                        let pyramid = fd_tiles::Pyramid::build(&healed);
+                        return Ok::<_, String>((
+                            healed,
+                            pyramid,
+                            std::sync::Arc::new(mask),
+                            fd_heal::HealReport::default(),
+                            true,
+                        ));
+                    }
+                }
+
+                let mask = masks::compose_heal_mask(
+                    mask,
+                    image.width,
+                    image.height,
+                    HEAL_DILATE_RADIUS,
+                    &strokes,
+                );
+                let mut copy = (*image).clone(); // the original Arc stays pristine
+                                                 // A real inpainting model costs seconds per defect window; per-defect
+                                                 // progress keeps a long heal visibly alive in the status line.
+                let inp = pair.map(|(inp, _)| inp);
+                let report =
+                    fd_heal::heal_with_progress(&mut copy, &mask, inp, &mut |done, total| {
+                        let _ = app_for_progress
+                            .emit("heal-progress", HealProgress { id, done, total });
+                    })
+                    .map_err(|e| e.to_string())?;
+                if let Some(path) = &cache_path {
+                    if let Err(_e) = cache::write_heal(path, &image, &copy, &mask, &provenance) {
+                        #[cfg(debug_assertions)]
+                        eprintln!("[cache] heal write failed for image {id}: {_e}");
+                    }
+                }
+                let healed = std::sync::Arc::new(copy);
+                let pyramid = fd_tiles::Pyramid::build(&healed);
+                Ok((healed, pyramid, std::sync::Arc::new(mask), report, false))
             })?
-            .map_err(|e| e.to_string())?;
-        let healed = std::sync::Arc::new(copy);
-        let pyramid = fd_tiles::Pyramid::build(&healed);
-        Ok::<_, String>((healed, pyramid, std::sync::Arc::new(mask), report))
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+        })
+        .await
+        .map_err(|e| e.to_string())??;
     let mut images = images.lock().map_err(|e| e.to_string())?;
     if !images.set_healed(id, healed, pyramid, mask) {
         return Err(format!("image {id} closed during healing"));
@@ -248,13 +305,17 @@ async fn run_heal(
         defects: report.defects,
         tiny: report.tiny,
         inpainted: report.inpainted,
+        restored,
     })
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn heal_frame(
     app: tauri::AppHandle,
     images: State<'_, Mutex<Images>>,
+    roll: State<'_, roll::RollState>,
+    detector: State<'_, detect::DetectorState>,
     inpainter: State<'_, detect::InpainterState>,
     id: u64,
     threshold: f32,
@@ -267,7 +328,10 @@ async fn heal_frame(
             stage: "healing",
         },
     );
-    let result = run_heal(&app, &images, &inpainter, id, threshold, strokes).await;
+    let result = run_heal(
+        &app, &images, &roll, &detector, &inpainter, id, threshold, strokes,
+    )
+    .await;
     let _ = app.emit("app-progress", Progress { id, stage: "ready" });
     result
 }
@@ -902,52 +966,86 @@ fn export_approved(
                 .map_err(|e| e.to_string())
                 .and_then(|r| r)
             } else {
-                // Transient pipeline: decode, detect, heal, export -- one
-                // frame's pixels at a time, dropped at the closure's end.
-                // With a real inpainting model this path costs minutes per
-                // frame, so it narrates its stages; without the events the
-                // roll counter sits frozen and reads as a hang (field
-                // report: "hangs at image 2").
+                // No registry entry: try the heal cache before running the
+                // transient detect/heal pipeline. The DETECTOR hash is
+                // resolved here, before the closure -- mirroring run_heal --
+                // since it is not itself provenance-racy the way the
+                // inpainter is (see with_inpainter_hashed's doc comment).
                 let detector = detector.clone();
                 let inpainter = inpainter.clone();
+                let detector_hash = detector.hash().unwrap_or([0u8; 32]);
                 let threshold = frame_threshold;
+                // Cache path is keyed by the frame's own roll directory (the
+                // source), not dest_dir (the export destination) -- mirrors
+                // run_heal's use of roll::frame_for_image's roll_dir.
+                let cache_path = roll::heal_cache_path(
+                    path.parent().unwrap_or_else(|| std::path::Path::new("")),
+                    &file_name,
+                );
                 let app_for_stages = app_for_task.clone();
                 tauri::async_runtime::spawn_blocking(move || {
                     let stage = |s: &'static str| {
                         let _ = app_for_stages
                             .emit("export-frame-stage", ExportFrameStage { index, stage: s });
                     };
-                    stage("detecting");
                     let image = images::Images::decode_stage(&path)?;
-                    let probs = detector.detect(&image)?;
                     masks::validate_strokes(&frame_strokes)?;
-                    let raw: Vec<bool> = probs.iter().map(|&p| p > threshold).collect();
-                    let mask = masks::compose_heal_mask(
-                        raw,
-                        image.width,
-                        image.height,
-                        HEAL_DILATE_RADIUS,
-                        &frame_strokes,
-                    );
-                    stage("healing");
-                    let mut copy = (*image).clone();
-                    inpainter
-                        .with_inpainter(|inp| {
-                            fd_heal::heal_with_progress(
-                                &mut copy,
-                                &mask,
-                                inp,
-                                &mut |done, total| {
-                                    let _ = app_for_stages.emit(
-                                        "export-heal-progress",
-                                        ExportHealProgress { index, done, total },
-                                    );
-                                },
-                            )
-                        })?
+
+                    // Everything provenance-dependent happens inside the one
+                    // with_inpainter_hashed lock, exactly as in run_heal: the
+                    // inpainter hash and the model that actually heals (on a
+                    // miss) must be the same observation.
+                    inpainter.with_inpainter_hashed(|pair| {
+                        let inpainter_hash = pair.as_ref().map(|(_, h)| *h).unwrap_or([0u8; 32]);
+                        let provenance = cache::heal_provenance(
+                            threshold,
+                            HEAL_DILATE_RADIUS,
+                            &frame_strokes,
+                            &detector_hash,
+                            &inpainter_hash,
+                        );
+
+                        if let Some((healed, mask)) =
+                            cache::read_heal(&cache_path, &image, &provenance)
+                        {
+                            stage("writing");
+                            return export::export_healed(&image, &healed, &mask, &dest)
+                                .map(|_| ());
+                        }
+
+                        stage("detecting");
+                        let probs = detector.detect(&image)?;
+                        let raw: Vec<bool> = probs.iter().map(|&p| p > threshold).collect();
+                        let mask = masks::compose_heal_mask(
+                            raw,
+                            image.width,
+                            image.height,
+                            HEAL_DILATE_RADIUS,
+                            &frame_strokes,
+                        );
+                        stage("healing");
+                        let mut copy = (*image).clone();
+                        let inp = pair.map(|(inp, _)| inp);
+                        fd_heal::heal_with_progress(&mut copy, &mask, inp, &mut |done, total| {
+                            let _ = app_for_stages.emit(
+                                "export-heal-progress",
+                                ExportHealProgress { index, done, total },
+                            );
+                        })
                         .map_err(|e| e.to_string())?;
-                    stage("writing");
-                    export::export_healed(&image, &copy, &mask, &dest).map(|_| ())
+                        // Cache the fresh heal so the next export or heal of
+                        // this frame is instant.
+                        if let Err(_e) =
+                            cache::write_heal(&cache_path, &image, &copy, &mask, &provenance)
+                        {
+                            #[cfg(debug_assertions)]
+                            eprintln!(
+                                "[cache] heal write failed for frame {index} ({file_name}): {_e}"
+                            );
+                        }
+                        stage("writing");
+                        export::export_healed(&image, &copy, &mask, &dest).map(|_| ())
+                    })?
                 })
                 .await
                 .map_err(|e| e.to_string())
