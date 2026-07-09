@@ -11,6 +11,12 @@ pub const MIN_RADIUS: f32 = 1.0;
 pub const MAX_RADIUS: f32 = 512.0;
 const MAX_COORD: f32 = 1e7;
 
+/// Ceiling on total rasterization work, as a multiple of the image area.
+/// Honest retouching stays orders of magnitude below this; a crafted
+/// sidecar spanning the image with hundreds of max-radius segments would
+/// otherwise cost ~1e14 pixel writes inside an export task.
+const MAX_RASTER_AREA_FACTOR: u64 = 32;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Stroke {
     pub erase: bool,
@@ -83,6 +89,44 @@ pub fn apply_strokes(mask: &mut [bool], width: u32, height: u32, strokes: &[Stro
         return;
     }
 
+    // Pre-scan: compute total rasterization work and reject crafted area bombs.
+    let image_area = (width as u64) * (height as u64);
+    let max_total_area = MAX_RASTER_AREA_FACTOR * image_area;
+    let mut total_area: u64 = 0;
+
+    for s in strokes {
+        if s.points.len() == 1 {
+            // Single-point dab: segment where a == b
+            if let Some((x0, x1, y0, y1)) =
+                clamped_bbox(s.points[0], s.points[0], s.radius, width, height)
+            {
+                let area = ((x1 - x0 + 1) as u64) * ((y1 - y0 + 1) as u64);
+                total_area = total_area.saturating_add(area);
+            }
+        } else {
+            // Multi-point stroke: sum areas of all segments
+            for pair in s.points.windows(2) {
+                if let Some((x0, x1, y0, y1)) =
+                    clamped_bbox(pair[0], pair[1], s.radius, width, height)
+                {
+                    let area = ((x1 - x0 + 1) as u64) * ((y1 - y0 + 1) as u64);
+                    total_area = total_area.saturating_add(area);
+                }
+            }
+        }
+
+        if total_area > max_total_area {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "apply_strokes: rejected pathological area bomb: \
+                 total_area={}, max={} ({}x image area)",
+                total_area, max_total_area, MAX_RASTER_AREA_FACTOR
+            );
+            return;
+        }
+    }
+
+    // All strokes passed the area cap; rasterize them.
     for s in strokes {
         let value = !s.erase;
         if s.points.len() == 1 {
@@ -103,6 +147,31 @@ pub fn apply_strokes(mask: &mut [bool], width: u32, height: u32, strokes: &[Stro
     }
 }
 
+/// Computes the clamped bbox dimensions for a segment, returning
+/// (x0, x1, y0, y1) or None if the bbox has zero area. Used both to
+/// estimate total rasterization work and to perform the actual rasterization,
+/// ensuring estimate and work never drift.
+fn clamped_bbox(
+    a: [f32; 2],
+    b: [f32; 2],
+    radius: f32,
+    width: u32,
+    height: u32,
+) -> Option<(usize, usize, usize, usize)> {
+    let (w, h) = (width as f32, height as f32);
+    let x0 = (a[0].min(b[0]) - radius).floor().clamp(0.0, w - 1.0) as usize;
+    let x1 = (a[0].max(b[0]) + radius).ceil().clamp(0.0, w - 1.0) as usize;
+    let y0 = (a[1].min(b[1]) - radius).floor().clamp(0.0, h - 1.0) as usize;
+    let y1 = (a[1].max(b[1]) + radius).ceil().clamp(0.0, h - 1.0) as usize;
+
+    // Only return if there's a non-empty area
+    if x0 <= x1 && y0 <= y1 {
+        Some((x0, x1, y0, y1))
+    } else {
+        None
+    }
+}
+
 /// Fills every pixel within `radius` of segment ab (Euclidean round brush).
 fn stamp_capsule(
     mask: &mut [bool],
@@ -113,11 +182,11 @@ fn stamp_capsule(
     radius: f32,
     value: bool,
 ) {
-    let (w, h) = (width as f32, height as f32);
-    let x0 = (a[0].min(b[0]) - radius).floor().clamp(0.0, w - 1.0) as usize;
-    let x1 = (a[0].max(b[0]) + radius).ceil().clamp(0.0, w - 1.0) as usize;
-    let y0 = (a[1].min(b[1]) - radius).floor().clamp(0.0, h - 1.0) as usize;
-    let y1 = (a[1].max(b[1]) + radius).ceil().clamp(0.0, h - 1.0) as usize;
+    let (x0, x1, y0, y1) = match clamped_bbox(a, b, radius, width, height) {
+        Some(bbox) => bbox,
+        None => return,
+    };
+
     let ab = [b[0] - a[0], b[1] - a[1]];
     let ab_len_sq = ab[0] * ab[0] + ab[1] * ab[1];
     let r_sq = radius * radius;
@@ -276,5 +345,37 @@ mod tests {
         apply_strokes(&mut mask, 8, 8, &[dab(4.0, 4.0, 2.0, false)]);
         // mask should be unchanged, all false
         assert!(mask.iter().all(|&b| !b));
+    }
+
+    #[test]
+    fn pathological_stroke_area_is_a_no_op() {
+        // 512 strokes x 2 points spanning the whole image at max radius:
+        // clamped bboxes each cover the full 64x64 image, total far past
+        // 32x image area. Must return untouched without rasterizing.
+        let mut mask = vec![false; 64 * 64];
+        let strokes: Vec<Stroke> = (0..MAX_STROKES)
+            .map(|_| Stroke {
+                erase: false,
+                radius: MAX_RADIUS,
+                points: vec![[0.0, 0.0], [63.0, 63.0]],
+            })
+            .collect();
+        apply_strokes(&mut mask, 64, 64, &strokes);
+        assert!(mask.iter().all(|&b| !b), "area bomb must not rasterize");
+    }
+
+    #[test]
+    fn honest_strokes_stay_under_the_area_cap() {
+        // A generous real session: 100 dabs at radius 24 on a small image.
+        let mut mask = vec![false; 256 * 256];
+        let strokes: Vec<Stroke> = (0..100)
+            .map(|i| Stroke {
+                erase: false,
+                radius: 24.0,
+                points: vec![[(i % 16) as f32 * 16.0, (i / 16) as f32 * 16.0]],
+            })
+            .collect();
+        apply_strokes(&mut mask, 256, 256, &strokes);
+        assert!(mask.iter().any(|&b| b), "honest strokes must rasterize");
     }
 }
