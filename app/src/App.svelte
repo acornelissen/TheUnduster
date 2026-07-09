@@ -403,8 +403,12 @@
     });
     if (typeof path !== "string") return;
     scanFileName = path.split(/[\\/]/).pop() ?? null;
-    // Capture the file extension to lock export format to the source format
-    scanFileExt = path.split(".").pop()?.toLowerCase() ?? null;
+    // Capture the file extension to lock export format to the source format.
+    // A name without a dot has no extension: leave null (filters omitted)
+    // rather than treating the whole name as one.
+    scanFileExt = scanFileName?.includes(".")
+      ? (scanFileName.split(".").pop()?.toLowerCase() ?? null)
+      : null;
     const previousId = info?.id;
     const hadRoll = roll !== null;
     roll = null;
@@ -509,19 +513,25 @@
 
   async function exportSingle() {
     if (!info || exportingSingle) return;
+    // The guard brackets the WHOLE operation including the save dialog:
+    // a second activation while the picker is open must not start a
+    // parallel dialog/export pair.
+    exportingSingle = true;
     error = null;
     singleExportNote = null;
-    const saveOptions: { defaultPath?: string; filters?: { name: string; extensions: string[] }[] } = {
-      defaultPath: scanFileName ?? undefined,
-    };
-    // Lock export format to the source format when known
-    if (scanFileExt) {
-      saveOptions.filters = [{ name: "Same format", extensions: [scanFileExt] }];
-    }
-    const dest = await save(saveOptions);
-    if (!dest) return;
-    exportingSingle = true;
     try {
+      const saveOptions: {
+        defaultPath?: string;
+        filters?: { name: string; extensions: string[] }[];
+      } = {
+        defaultPath: scanFileName ?? undefined,
+      };
+      // Lock export format to the source format when known
+      if (scanFileExt) {
+        saveOptions.filters = [{ name: "Same format", extensions: [scanFileExt] }];
+      }
+      const dest = await save(saveOptions);
+      if (!dest) return;
       const result = await invoke<number>("export_frame", { id: info.id, dest });
       singleExportNote = `exported ${result} changed pixel${result === 1 ? "" : "s"}`;
     } catch (e) {
