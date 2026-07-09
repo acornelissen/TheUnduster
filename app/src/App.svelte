@@ -150,7 +150,36 @@
     const un = listen<{ index: number }>("export-progress", (e) => {
       if (!roll) return;
       roll.frames[e.payload.index].exported = true;
+      exportDetail = null; // this frame is done; the next one narrates itself
     });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  // Un-healed approved frames re-run detect + heal during export -- minutes
+  // per frame with a real inpainting model. These events keep the export
+  // counter visibly alive between per-frame completions.
+  let exportDetail: string | null = $state(null);
+
+  $effect(() => {
+    const un = listen<{ index: number; stage: string }>("export-frame-stage", (e) => {
+      if (!roll) return;
+      exportDetail = `${roll.frames[e.payload.index].file_name}: ${e.payload.stage}`;
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  $effect(() => {
+    const un = listen<{ index: number; done: number; total: number }>(
+      "export-heal-progress",
+      (e) => {
+        if (!roll) return;
+        exportDetail = `${roll.frames[e.payload.index].file_name}: healing ${e.payload.done}/${e.payload.total}`;
+      },
+    );
     return () => {
       un.then((f) => f());
     };
@@ -169,6 +198,7 @@
   $effect(() => {
     const un = listen("export-done", () => {
       exporting = false;
+      exportDetail = null;
     });
     return () => {
       un.then((f) => f());
@@ -690,7 +720,8 @@
           {#if exporting}
             &mdash; exporting ({roll.frames.filter((f) => f.exported).length}/{roll.frames.filter(
               (f) => f.approved,
-            ).length})
+            ).length}){#if exportDetail}
+              &mdash; {exportDetail}{/if}
           {/if}
         {/if}
       </p>

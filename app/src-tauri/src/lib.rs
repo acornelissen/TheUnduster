@@ -743,6 +743,19 @@ struct ExportFrameError {
     message: String,
 }
 
+#[derive(serde::Serialize, Clone)]
+struct ExportFrameStage {
+    index: usize,
+    stage: &'static str,
+}
+
+#[derive(serde::Serialize, Clone)]
+struct ExportHealProgress {
+    index: usize,
+    done: usize,
+    total: usize,
+}
+
 /// Clears the roll-export flag when dropped, including on unwind, so a panic
 /// anywhere in the `export_approved` queue task can never wedge exporting
 /// permanently. Mirrors `ScanFlagGuard`.
@@ -838,10 +851,20 @@ fn export_approved(
             } else {
                 // Transient pipeline: decode, detect, heal, export -- one
                 // frame's pixels at a time, dropped at the closure's end.
+                // With a real inpainting model this path costs minutes per
+                // frame, so it narrates its stages; without the events the
+                // roll counter sits frozen and reads as a hang (field
+                // report: "hangs at image 2").
                 let detector = detector.clone();
                 let inpainter = inpainter.clone();
                 let threshold = frame_threshold;
+                let app_for_stages = app_for_task.clone();
                 tauri::async_runtime::spawn_blocking(move || {
+                    let stage = |s: &'static str| {
+                        let _ = app_for_stages
+                            .emit("export-frame-stage", ExportFrameStage { index, stage: s });
+                    };
+                    stage("detecting");
                     let image = images::Images::decode_stage(&path)?;
                     let probs = detector.detect(&image)?;
                     masks::validate_strokes(&frame_strokes)?;
@@ -853,10 +876,24 @@ fn export_approved(
                         HEAL_DILATE_RADIUS,
                         &frame_strokes,
                     );
+                    stage("healing");
                     let mut copy = (*image).clone();
                     inpainter
-                        .with_inpainter(|inp| fd_heal::heal(&mut copy, &mask, inp))?
+                        .with_inpainter(|inp| {
+                            fd_heal::heal_with_progress(
+                                &mut copy,
+                                &mask,
+                                inp,
+                                &mut |done, total| {
+                                    let _ = app_for_stages.emit(
+                                        "export-heal-progress",
+                                        ExportHealProgress { index, done, total },
+                                    );
+                                },
+                            )
+                        })?
                         .map_err(|e| e.to_string())?;
+                    stage("writing");
                     export::export_healed(&image, &copy, &mask, &dest).map(|_| ())
                 })
                 .await
