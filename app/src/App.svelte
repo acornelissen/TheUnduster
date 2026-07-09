@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
-  import { open } from "@tauri-apps/plugin-dialog";
+  import { open, save } from "@tauri-apps/plugin-dialog";
   import Viewer from "./lib/Viewer.svelte";
   import Filmstrip from "./lib/Filmstrip.svelte";
   import { nextUnapprovedIndex } from "./lib/roll-nav";
@@ -100,6 +100,9 @@
   let displayedIndex = $state(0);
   let scanDone = $state(false);
   let exporting = $state(false);
+  let exportingSingle = $state(false);
+  let scanFileName: string | null = $state(null);
+  let singleExportNote: string | null = $state(null);
   let thresholdSaveTimer: ReturnType<typeof setTimeout> | undefined;
 
   // Per-frame brush stroke undo/redo stacks, keyed by roll index
@@ -398,6 +401,7 @@
       filters: [{ name: "Scans", extensions: ["tif", "tiff", "png", "jpg", "jpeg"] }],
     });
     if (typeof path !== "string") return;
+    scanFileName = path.split(/[\\/]/).pop() ?? null;
     const previousId = info?.id;
     const hadRoll = roll !== null;
     roll = null;
@@ -439,6 +443,7 @@
     if (typeof dir !== "string") return;
     info = null;
     scanDone = false;
+    singleExportNote = null;
     try {
       roll = await invoke<RollInfo>("open_roll", { dir });
     } catch (e) {
@@ -495,6 +500,23 @@
       } catch (e) {
         error = String(e);
       }
+    }
+  }
+
+  async function exportSingle() {
+    if (!info || exportingSingle) return;
+    error = null;
+    singleExportNote = null;
+    const dest = await save({ defaultPath: scanFileName ?? undefined });
+    if (!dest) return;
+    exportingSingle = true;
+    try {
+      const result = await invoke<number>("export_frame", { id: info.id, dest });
+      singleExportNote = `exported ${result} changed pixel${result === 1 ? "" : "s"}`;
+    } catch (e) {
+      error = String(e);
+    } finally {
+      exportingSingle = false;
     }
   }
 
@@ -606,6 +628,7 @@
       return;
     }
     error = null;
+    singleExportNote = null;
     detecting = true;
     try {
       const report = await invoke<{ id: number; components_at_half: number }>("detect", {
@@ -677,6 +700,7 @@
       return;
     }
     error = null;
+    singleExportNote = null;
     healing = true;
     healProgress = null;
     try {
@@ -853,6 +877,11 @@
       <button onclick={requestHeal} disabled={loading !== null || isDetecting || isHealing || !info}>
         {isHealing ? "Healing..." : "Heal"}
       </button>
+      {#if info && !roll}
+        <button onclick={exportSingle} disabled={!info.healed || exportingSingle}>
+          {exportingSingle ? "Exporting..." : "Export"}
+        </button>
+      {/if}
       <label>
         Sensitivity
         <input
@@ -887,6 +916,9 @@
         {/if}
         {#if viewer?.brushStatus()}
           &mdash; {viewer.brushStatus()}
+        {/if}
+        {#if singleExportNote}
+          &mdash; {singleExportNote}
         {/if}
         {#if roll}
           &mdash; {roll.frames.filter((f) => f.approved).length}/{roll.frames.length} approved
