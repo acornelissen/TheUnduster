@@ -419,7 +419,11 @@ fn pixel_budget_bytes() -> usize {
 /// Closes least-recently-viewed activated frames until retained pixel bytes
 /// fit the budget. The keep window around `current` is never evicted, so
 /// the window's worst case (three very large frames) may exceed the budget;
-/// that degrades to OS paging, never to a crash.
+/// that degrades to OS paging, never to a crash. The pinned frame (the one
+/// job worker's active job, if any) is a fourth exempt frame beyond
+/// current+/-1, but it is similarly bounded -- one worker, one pin -- so it
+/// degrades the same way as the window overhang rather than opening an
+/// unbounded exemption.
 fn evict_over_budget(
     images: &State<'_, Mutex<Images>>,
     roll: &State<'_, roll::RollState>,
@@ -1181,15 +1185,19 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                 }
                 None => None,
             };
-            let (resident_id, image, level_dims) = match resident {
-                Some((id, img, dims)) => (Some(id), img, Some(dims)),
+            // The early resident id only gated the pin (already applied above
+            // via `image_id`) and the has-probs short-circuit; the write
+            // target below is resolved fresh after compute (see I3's comment
+            // at the write site), so it is not carried out of this match.
+            let (image, level_dims) = match resident {
+                Some((_id, img, dims)) => (img, Some(dims)),
                 None => {
                     let path = path.clone();
                     let img =
                         tauri::async_runtime::spawn_blocking(move || Images::decode_stage(&path))
                             .await
                             .map_err(|e| e.to_string())??;
-                    (None, img, None)
+                    (img, None)
                 }
             };
             let detector_state = app.state::<detect::DetectorState>();
@@ -1228,7 +1236,30 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
             })
             .await
             .map_err(|e| e.to_string())??;
-            if let (Some(id), Some(pyramid)) = (resident_id, pyramid) {
+            // Re-resolve the resident id AFTER compute, not before: the frame
+            // may have gone from non-resident to resident (the operator
+            // activated it mid-job) since `image_id` was read at job start.
+            // The file is unchanged either way, so a pyramid built now still
+            // validates against whichever id is current; `set_probs_built`
+            // rejects it otherwise.
+            let current_id = app.state::<roll::RollState>().image_id(index)?;
+            // A pyramid built off the early `level_dims` covers the common
+            // case (already resident at job start); a late-resident frame
+            // has no early `level_dims`, so fetch them now off the current id
+            // instead of leaving the registry write unpopulated.
+            let pyramid = match pyramid {
+                Some(pyramid) => Some(pyramid),
+                None => {
+                    let dims = current_id.and_then(|id| {
+                        images_state
+                            .lock()
+                            .ok()
+                            .and_then(|images| images.level_dims(id))
+                    });
+                    dims.map(|dims| build_prob_pyramid(&probs, &dims))
+                }
+            };
+            if let (Some(id), Some(pyramid)) = (current_id, pyramid) {
                 let mut images = images_state.lock().map_err(|e| e.to_string())?;
                 // A frame closed mid-job is benign for a background detect:
                 // the sidecar result below still lands.
@@ -1316,10 +1347,13 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                         cache::read_heal(&heal_cache_path, &image, &provenance)
                     {
                         let healed = std::sync::Arc::new(healed);
-                        // The pyramid only serves set_healed; skip the build
-                        // when there is no registry entry to feed.
-                        let pyramid = resident_id.map(|_| fd_tiles::Pyramid::build(&healed));
-                        return Ok::<_, String>((healed, pyramid, std::sync::Arc::new(mask)));
+                        // Always build: the write-target id is resolved AFTER
+                        // this closure returns (the frame may have gone
+                        // non-resident-to-resident mid-job), so building only
+                        // when `resident_id` was already Some would silently
+                        // drop the registry write for a late-resident frame.
+                        let pyramid = fd_tiles::Pyramid::build(&healed);
+                        return Ok::<_, String>((healed, Some(pyramid), std::sync::Arc::new(mask)));
                     }
 
                     // Probs mask: the registry's live detection first, then
@@ -1388,13 +1422,23 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                         eprintln!("[cache] heal write failed for frame {index} ({file_name}): {_e}");
                     }
                     let healed = std::sync::Arc::new(copy);
-                    let pyramid = resident_id.map(|_| fd_tiles::Pyramid::build(&healed));
-                    Ok((healed, pyramid, std::sync::Arc::new(mask)))
+                    // Always build; see the cache-hit branch above for why.
+                    let pyramid = fd_tiles::Pyramid::build(&healed);
+                    Ok((healed, Some(pyramid), std::sync::Arc::new(mask)))
                 })?
             })
             .await
             .map_err(|e| e.to_string())??;
-            if let (Some(id), Some(pyramid)) = (resident_id, pyramid) {
+            // Re-resolve the resident id AFTER compute, not before: the frame
+            // may have gone from non-resident to resident (the operator
+            // activated it mid-job) since `image_id` was read at job start.
+            // The file is the same either way, so the healed image's dims
+            // still validate against whichever id is current;
+            // `set_healed` rejects it otherwise. The early `resident_id` was
+            // only needed for the pin and to reuse a resident decode/mask as
+            // compute input -- both already happened above.
+            let current_id = app.state::<roll::RollState>().image_id(index)?;
+            if let (Some(id), Some(pyramid)) = (current_id, pyramid) {
                 let mut images = images_state.lock().map_err(|e| e.to_string())?;
                 // A frame closed mid-heal is benign here: the heal cache
                 // already holds the result for the next activation or export.
@@ -1417,7 +1461,15 @@ fn enqueue_job(
     // Bounds/roll validation before anything lands in the queue: errors when
     // no roll is open or the index is out of range.
     roll.image_id(index)?;
-    queue.enqueue(jobs::Job { kind, index }, front)?;
+    let generation = roll.generation();
+    queue.enqueue(
+        jobs::Job {
+            kind,
+            index,
+            generation,
+        },
+        front,
+    )?;
     let _ = app.emit("job-queued", JobEvent { index, kind });
     if queue
         .running
@@ -1427,20 +1479,24 @@ fn enqueue_job(
         return Ok(()); // a worker is already draining; it will reach this job
     }
     // The flag is set; any fallible setup from here must clear it before
-    // returning (the scan_roll discipline). Snapshot the generation this
-    // drain runs against -- see scan_roll's identical comment.
-    let generation = roll.generation();
+    // returning (the scan_roll discipline).
     let app_for_task = app.clone();
     tauri::async_runtime::spawn(async move {
         let _job_flag_guard = JobFlagGuard(app_for_task.clone());
         // Drains until empty; a poisoned queue lock also ends the drain.
         while let Ok(Some(job)) = app_for_task.state::<jobs::JobQueue>().pop() {
-            // Enforcement point: see scan_roll's identical check. The roll
-            // open/close paths also cleared the queue, so a job popped past
-            // a generation bump belongs to a torn-down roll; drop it.
-            if app_for_task.state::<roll::RollState>().generation() != generation {
-                break;
+            // Per-job check, not a snapshot-at-drain-start break: the drain
+            // loop pops before it can know whether the job belongs to the
+            // roll open when the worker started or a roll swapped in since.
+            // A stale-roll job is silently discarded (its siblings were
+            // already cleared from the queue by the roll swap; this only
+            // catches the one straggler popped mid-swap) while a job tagged
+            // with the CURRENT generation always runs, regardless of when
+            // this worker began draining.
+            if job.generation != app_for_task.state::<roll::RollState>().generation() {
+                continue;
             }
+            let generation = job.generation;
             match run_job(&app_for_task, generation, job).await {
                 Ok(()) => {
                     let _ = app_for_task.emit(

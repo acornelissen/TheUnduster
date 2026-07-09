@@ -15,6 +15,12 @@ pub enum JobKind {
 pub struct Job {
     pub kind: JobKind,
     pub index: usize,
+    /// The roll generation this job was enqueued against. Included in the
+    /// derived equality (and therefore in coalescing): the same frame index
+    /// in two different rolls is a different job, so a stale-roll job must
+    /// never coalesce with -- or be mistaken for -- a same-index job queued
+    /// after a roll swap.
+    pub generation: u64,
 }
 
 /// Per-roll job queue. One worker drains it (single-flight `running` flag,
@@ -111,7 +117,15 @@ mod tests {
     use super::*;
 
     fn job(kind: JobKind, index: usize) -> Job {
-        Job { kind, index }
+        job_gen(kind, index, 0)
+    }
+
+    fn job_gen(kind: JobKind, index: usize, generation: u64) -> Job {
+        Job {
+            kind,
+            index,
+            generation,
+        }
     }
 
     #[test]
@@ -127,6 +141,19 @@ mod tests {
         assert_eq!(q.pop().unwrap(), Some(job(JobKind::Detect, 1)));
         assert_eq!(q.pop().unwrap(), Some(job(JobKind::Heal, 1)));
         assert_eq!(q.pop().unwrap(), None);
+    }
+
+    #[test]
+    fn jobs_differing_only_by_generation_do_not_coalesce() {
+        let q = JobQueue::default();
+        assert!(q.enqueue(job_gen(JobKind::Heal, 1, 0), false).unwrap());
+        // Same kind and index, but a different roll generation: this is a
+        // distinct job (a straggler from the old roll must not coalesce with
+        // -- or be silently replaced by -- the new roll's job).
+        assert!(q.enqueue(job_gen(JobKind::Heal, 1, 1), false).unwrap());
+        assert_eq!(q.len().unwrap(), 2);
+        assert_eq!(q.pop().unwrap(), Some(job_gen(JobKind::Heal, 1, 0)));
+        assert_eq!(q.pop().unwrap(), Some(job_gen(JobKind::Heal, 1, 1)));
     }
 
     #[test]

@@ -182,6 +182,11 @@
 
   $effect(() => {
     const un = listen<{ index: number; kind: "detect" | "heal" }>("job-started", (e) => {
+      // Backend job events carry no roll identity. Only trust an event for a
+      // job this frontend session actually queued (job-queued is the sole
+      // entry creator) -- an index left over from a previous roll (or from
+      // one cleared by a roll swap) must not resurrect a jobStates entry.
+      if (!(e.payload.index in jobStates)) return;
       jobStates[e.payload.index] = { state: "running", kind: e.payload.kind };
     });
     return () => {
@@ -191,6 +196,11 @@
 
   $effect(() => {
     const un = listen<{ index: number; kind: "detect" | "heal" }>("job-done", (e) => {
+      // Backend job events carry no roll identity: see the job-started
+      // listener's comment. A job-done for an index this session never
+      // queued belongs to a torn-down roll and must not flip
+      // detected/info.healed for whatever now occupies that index.
+      if (!(e.payload.index in jobStates)) return;
       delete jobStates[e.payload.index];
       // Index-guarded on purpose: only refresh detections / mark healed when
       // the completed job belongs to the frame still on screen. Activity
@@ -214,6 +224,9 @@
     const un = listen<{ index: number; kind: "detect" | "heal"; message: string }>(
       "job-error",
       (e) => {
+        // Backend job events carry no roll identity: see the job-started
+        // listener's comment.
+        if (!(e.payload.index in jobStates)) return;
         delete jobStates[e.payload.index];
         const fileName = roll?.frames[e.payload.index]?.file_name ?? `frame ${e.payload.index}`;
         error = `Frame ${fileName}: ${e.payload.message}`;
@@ -396,6 +409,11 @@
         // best effort cleanup; any activated roll frames just linger in the
         // registry rather than blocking the scan the operator asked to open
       }
+      // The roll this queue state described is gone: without this, a stale
+      // entry surviving into single-image mode (or a future roll reusing the
+      // same index) could be mistaken for a live job by the guards in the
+      // job-started/job-done/job-error listeners below.
+      jobStates = {};
     }
     try {
       info = await invoke<ImageInfo>("open_image", { path });
@@ -434,6 +452,11 @@
       seeded[`roll:${i}`] = { strokes: f.strokes, redo: f.redo_strokes };
     });
     strokeStore = seeded;
+    // A new roll starts with an empty queue session: any entries left over
+    // from the previous roll (or single-image mode) describe jobs against
+    // frames that no longer exist in this roll's index space, and must not
+    // be mistaken for this roll's own in-flight work by the job listeners.
+    jobStates = {};
     currentIndex = 0;
     if (roll.frames.length > 0) {
       await activateCurrentFrame();
@@ -652,12 +675,6 @@
     if (!detected) {
       error = "Run detection before healing";
       return;
-    }
-    // Healing needs live probabilities; if only queue results exist, run
-    // detect first so the mask reflects the current threshold.
-    if (!detected) {
-      await requestDetect();
-      if (!detected) return; // detect failed; its error is already shown
     }
     error = null;
     healing = true;
