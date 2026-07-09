@@ -131,6 +131,94 @@ fn inpaint_defect(
     Ok(())
 }
 
+/// Fixed-size windowed inpainting: window interiors tile the defect bbox,
+/// margins supply context, and each window writes back only its interior
+/// defect pixels -- every masked pixel is filled exactly once, with no
+/// resampling, so grain scale and sharpness survive. Windows shift (never
+/// shrink) to stay inside the image; when the image itself is smaller than
+/// the window, edge-replicate padding fills the remainder, mirroring the
+/// detector's tile padding.
+fn inpaint_defect_windowed(
+    planes: &mut [Vec<f32>],
+    width: usize,
+    height: usize,
+    defect: &Defect,
+    mask: &[bool],
+    inpainter: &mut Inpainter,
+    n: usize,
+) -> Result<(), HealError> {
+    let margin = n / 8;
+    let interior = n - 2 * margin;
+    let (bx0, by0) = (defect.bbox.x0 as usize, defect.bbox.y0 as usize);
+    let (bx1, by1) = (defect.bbox.x1 as usize, defect.bbox.y1 as usize); // exclusive
+
+    let mut iy = by0;
+    while iy < by1 {
+        let iy1 = (iy + interior).min(by1);
+        let mut ix = bx0;
+        while ix < bx1 {
+            let ix1 = (ix + interior).min(bx1);
+            // Window start: interior minus margin, shifted into the image
+            // when possible (image >= n), otherwise anchored at 0 with
+            // edge-replicate covering the overhang.
+            let wx0 = window_start(ix, margin, n, width);
+            let wy0 = window_start(iy, margin, n, height);
+
+            // Assemble the nxn crop with edge-replicate for out-of-image.
+            let clamp_src = |v: isize, limit: usize| v.clamp(0, limit as isize - 1) as usize;
+            let mut crop = [vec![0f32; n * n], vec![0f32; n * n], vec![0f32; n * n]];
+            let mut crop_mask = vec![false; n * n];
+            for y in 0..n {
+                let sy = clamp_src(wy0 as isize + y as isize, height);
+                for x in 0..n {
+                    let sx = clamp_src(wx0 as isize + x as isize, width);
+                    for (c, plane) in crop.iter_mut().enumerate() {
+                        let src = if planes.len() == 1 {
+                            &planes[0]
+                        } else {
+                            &planes[c]
+                        };
+                        plane[y * n + x] = src[sy * width + sx];
+                    }
+                    crop_mask[y * n + x] = mask[sy * width + sx];
+                }
+            }
+            let filled = inpainter.inpaint(&crop, &crop_mask, n, n)?;
+
+            // Write back: defect pixels inside THIS window's interior only.
+            for &(px, py) in &defect.pixels {
+                let (px, py) = (px as usize, py as usize);
+                if px < ix || px >= ix1 || py < iy || py >= iy1 {
+                    continue;
+                }
+                let (lx, ly) = (px - wx0, py - wy0);
+                if lx >= n || ly >= n {
+                    continue; // interior clamped past the window; unreachable when image >= n
+                }
+                for (c, plane) in planes.iter_mut().enumerate() {
+                    let src_c = if c < 3 { c } else { 0 };
+                    plane[py * width + px] = filled[src_c][ly * n + lx];
+                }
+            }
+            ix = ix1;
+        }
+        iy = iy1;
+    }
+    Ok(())
+}
+
+/// Ideal window start is interior_start - margin; shift left/up to keep the
+/// whole window inside the image when it fits, clamp to 0 when it does not
+/// (edge-replicate covers the rest).
+fn window_start(interior_start: usize, margin: usize, n: usize, limit: usize) -> usize {
+    let ideal = interior_start.saturating_sub(margin);
+    if ideal + n <= limit {
+        ideal
+    } else {
+        limit.saturating_sub(n)
+    }
+}
+
 pub fn heal(
     img: &mut ImageBuf,
     mask: &[bool],
@@ -152,7 +240,12 @@ pub fn heal(
     for d in &defects {
         match inpainter.as_deref_mut() {
             Some(inp) if d.max_dim() > TINY_MAX_DIM => {
-                inpaint_defect(&mut planes, width, height, d, mask, inp)?;
+                match inp.window_size() {
+                    Some(n) => {
+                        inpaint_defect_windowed(&mut planes, width, height, d, mask, inp, n)?
+                    }
+                    None => inpaint_defect(&mut planes, width, height, d, mask, inp)?,
+                }
                 add_grain(&mut planes, width, height, d, mask);
                 report.inpainted += 1;
             }

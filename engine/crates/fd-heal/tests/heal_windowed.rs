@@ -1,0 +1,105 @@
+use std::path::PathBuf;
+
+use fd_heal::{heal, Inpainter};
+use fd_io::{ImageBuf, PixelData};
+
+fn fixtures() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures")
+}
+
+fn noisy_image(width: u32, height: u32) -> ImageBuf {
+    let n = (width * height * 3) as usize;
+    let mut state = 0x2545F4914F6CDD1Du64;
+    let data: Vec<u16> = (0..n)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 48) as u16
+        })
+        .collect();
+    ImageBuf {
+        width,
+        height,
+        channels: 3,
+        data: PixelData::U16(data),
+        icc: None,
+        exif: None,
+    }
+}
+
+fn fixed_inpainter() -> Inpainter {
+    Inpainter::load(
+        &fixtures().join("tiny-inpaint-fixed.onnx"),
+        fd_infer::Ep::Cpu,
+    )
+    .unwrap()
+}
+
+/// A defect wider than one 64px window (interior 48) forces multi-window
+/// tiling; every masked pixel must change (mean fill differs from noise
+/// with overwhelming probability) and every unmasked pixel must not.
+#[test]
+fn defect_wider_than_a_window_is_fully_filled() {
+    let mut img = noisy_image(200, 90);
+    let original = img.clone();
+    let mut mask = vec![false; 200 * 90];
+    for y in 30..60 {
+        for x in 20..180 {
+            mask[y * 200 + x] = true; // 160x30: spans 4 interiors horizontally
+        }
+    }
+    let report = heal(&mut img, &mask, Some(&mut fixed_inpainter())).unwrap();
+    assert_eq!(report.inpainted, 1);
+    let (PixelData::U16(a), PixelData::U16(b)) = (&original.data, &img.data) else {
+        panic!("depth changed");
+    };
+    let mut unchanged_masked = 0usize;
+    for i in 0..200 * 90 {
+        if mask[i] {
+            if (0..3).all(|c| a[i * 3 + c] == b[i * 3 + c]) {
+                unchanged_masked += 1;
+            }
+        } else {
+            for c in 0..3 {
+                assert_eq!(a[i * 3 + c], b[i * 3 + c], "pixel {i} changed outside mask");
+            }
+        }
+    }
+    // grain re-synthesis could coincidentally reproduce a value; allow a
+    // whisper of slack but any systematic gap (a missed window interior
+    // would leave 48x30 = 1440+ pixels untouched) must fail loudly
+    assert!(
+        unchanged_masked < 50,
+        "{unchanged_masked} masked pixels untouched -- a window was skipped"
+    );
+}
+
+/// Image smaller than the window in one dimension: edge-replicate padding
+/// must kick in rather than erroring or panicking.
+#[test]
+fn image_smaller_than_window_pads() {
+    let mut img = noisy_image(50, 40); // both dims < 64
+    let mut mask = vec![false; 50 * 40];
+    for y in 10..30 {
+        for x in 10..40 {
+            mask[y * 50 + x] = true;
+        }
+    }
+    let report = heal(&mut img, &mask, Some(&mut fixed_inpainter())).unwrap();
+    assert_eq!(report.inpainted, 1);
+}
+
+/// Corner-hugging defect (the 0cfe94b regression class) through the
+/// windowed path.
+#[test]
+fn corner_defect_windows_safely() {
+    let mut img = noisy_image(100, 70);
+    let mut mask = vec![false; 100 * 70];
+    for y in 40..70 {
+        for x in 60..100 {
+            mask[y * 100 + x] = true;
+        }
+    }
+    heal(&mut img, &mask, Some(&mut fixed_inpainter())).unwrap();
+}
