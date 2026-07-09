@@ -993,65 +993,99 @@
 
 <div class="shell">
   <header class="toolbar">
-    <button class="btn" onclick={openScan} disabled={loading !== null}>Open scan</button>
-    <button class="btn" onclick={openRoll} disabled={loading !== null}>Open roll</button>
-    {#if modelStatus !== "loaded"}
-      <button class="btn" onclick={downloadModel} disabled={modelStatus === "downloading"}>
-        {#if modelStatus === "missing"}
-          Download healing model (207 MB)
-        {:else if modelStatus === "available"}
-          Repair healing model
-        {:else if modelStatus === "downloading"}
-          Downloading...
-        {/if}
-      </button>
-    {/if}
-    {#if roll}
-      <button
-        class="btn"
-        onclick={approveAndAdvance}
-        disabled={roll.frames[currentIndex].approved}
-      >
-        {roll.frames[currentIndex].approved ? "Approved" : "Approve"}
-      </button>
-      <button
-        class="btn"
-        onclick={exportApproved}
-        disabled={exporting || roll.frames.every((f) => !f.approved)}
-      >
-        {exporting ? "Exporting..." : "Export approved"}
-      </button>
-      <button class="btn" onclick={healApproved} disabled={roll.frames.every((f) => !f.approved)}>
-        Heal approved
-      </button>
-    {/if}
+    <!-- File group: always visible -->
+    <div class="toolbar-group">
+      <button class="btn" title="Open scan" onclick={openScan} disabled={loading !== null}>Open scan</button>
+      <button class="btn" title="Open roll (folder)" onclick={openRoll} disabled={loading !== null}>Open roll</button>
+    </div>
+
+    <!-- Frame group: visible when info exists -->
     {#if info}
-      <button class="btn" onclick={requestDetect} disabled={loading !== null || isDetecting}>
-        {isDetecting ? "Detecting..." : "Detect"}
-      </button>
-      <button
-        class="btn"
-        onclick={requestHeal}
-        disabled={loading !== null || isDetecting || isHealing || !info}
-      >
-        {isHealing ? "Healing..." : "Heal"}
-      </button>
-      {#if info && !roll}
-        <button class="btn" onclick={exportSingle} disabled={!info.healed || exportingSingle}>
-          {exportingSingle ? "Exporting..." : "Export"}
+      <div class="toolbar-group">
+        <button class="btn" title="Detect (d)" onclick={requestDetect} disabled={loading !== null || isDetecting}>
+          {isDetecting ? "Detecting..." : "Detect"}
         </button>
-      {/if}
-      <label>
-        Sensitivity
-        <input
-          type="range"
-          min="0.05"
-          max="0.95"
-          step="0.01"
-          bind:value={overlay.threshold}
-          oninput={onThresholdInput}
-        />
-      </label>
+        <button
+          class="btn btn-primary"
+          title="Heal (h)"
+          onclick={requestHeal}
+          disabled={loading !== null || isDetecting || isHealing || !info}
+        >
+          {isHealing ? "Healing..." : "Heal"}
+        </button>
+        {#if !roll}
+          <button class="btn" title="Export" onclick={exportSingle} disabled={!info.healed || exportingSingle}>
+            {exportingSingle ? "Exporting..." : "Export"}
+          </button>
+        {/if}
+      </div>
+    {/if}
+
+    <!-- Roll group: visible when roll exists -->
+    {#if roll}
+      <div class="toolbar-group">
+        <button
+          class="btn"
+          title="Approve and advance (a)"
+          onclick={approveAndAdvance}
+          disabled={roll.frames[currentIndex].approved}
+        >
+          {roll.frames[currentIndex].approved ? "Approved" : "Approve"}
+        </button>
+        <button
+          class="btn btn-primary"
+          title="Heal approved"
+          onclick={healApproved}
+          disabled={roll.frames.every((f) => !f.approved)}
+        >
+          Heal approved
+        </button>
+        <button
+          class="btn"
+          title="Export approved"
+          onclick={exportApproved}
+          disabled={exporting || roll.frames.every((f) => !f.approved)}
+        >
+          {exporting ? "Exporting..." : "Export approved"}
+        </button>
+      </div>
+    {/if}
+
+    <!-- Adjust group: visible when info exists -->
+    {#if info}
+      <div class="toolbar-group">
+        <label>
+          Sensitivity
+          <input
+            type="range"
+            min="0.05"
+            max="0.95"
+            step="0.01"
+            bind:value={overlay.threshold}
+            oninput={onThresholdInput}
+          />
+          <span class="threshold-value">{overlay.threshold.toFixed(2)}</span>
+        </label>
+      </div>
+    {/if}
+
+    <!-- Model group: visible when modelStatus !== "loaded" -->
+    {#if modelStatus !== "loaded"}
+      <div class="toolbar-group">
+        <button class="btn" onclick={downloadModel} disabled={modelStatus === "downloading"}>
+          {#if modelStatus === "missing"}
+            Download healing model (207 MB)
+          {:else if modelStatus === "available"}
+            Repair healing model
+          {:else if modelStatus === "downloading"}
+            Downloading...
+          {/if}
+        </button>
+      </div>
+    {/if}
+
+    <!-- Status messages and error -->
+    {#if info}
       <p class="status" role="status">
         {#if detected && componentsAtHalf !== null}
           {componentsAtHalf} defect{componentsAtHalf === 1 ? "" : "s"} at 50%

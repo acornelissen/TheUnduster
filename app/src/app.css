@@ -150,3 +150,11 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
   padding: 1px var(--space-1);
   font-variant-numeric: tabular-nums;
 }
+
+/* Threshold value readout */
+.threshold-value {
+  font-variant-numeric: tabular-nums;
+  font-size: var(--text-sm);
+  color: var(--text-2);
+  margin-left: var(--space-1);
+}
