@@ -206,6 +206,19 @@
       // one cleared by a roll swap) must not resurrect a jobStates entry.
       if (!(e.payload.index in jobStates)) return;
       jobStates[e.payload.index] = { state: "running", kind: e.payload.kind };
+      // Heal-inputs capture happens at job START, not completion: the worker
+      // reads the frame's persisted threshold/strokes moments before this
+      // event fires, so these are the values the heal will actually use --
+      // input drift during a minutes-long heal must not be recorded as the
+      // heal's provenance. Keyed by the JOB's index (not currentIndex) so
+      // Heal-approved batch frames get proper captures too.
+      if (e.payload.kind === "heal" && roll) {
+        const frame = roll.frames[e.payload.index];
+        healInputs[`roll:${e.payload.index}`] = {
+          threshold: frame.threshold,
+          strokeCount: frame.strokes.length,
+        };
+      }
     });
     return () => {
       un.then((f) => f());
@@ -228,18 +241,8 @@
         if (e.payload.kind === "detect") {
           detected = true;
           void viewer?.refreshDetections(overlay.threshold);
-        } else {
-          if (info) info = { ...info, healed: true };
-          // Capture from the frame's PERSISTED values -- that is what the
-          // worker actually healed with, independent of whatever the
-          // threshold slider or stroke store show right now.
-          if (roll) {
-            const frame = roll.frames[e.payload.index];
-            healInputs[`roll:${e.payload.index}`] = {
-              threshold: frame.threshold,
-              strokeCount: frame.strokes.length,
-            };
-          }
+        } else if (info) {
+          info = { ...info, healed: true };
         }
       }
     });
@@ -426,13 +429,6 @@
       filters: [{ name: "Scans", extensions: ["tif", "tiff", "png", "jpg", "jpeg"] }],
     });
     if (typeof path !== "string") return;
-    scanFileName = path.split(/[\\/]/).pop() ?? null;
-    // Capture the file extension to lock export format to the source format.
-    // A name without a dot has no extension: leave null (filters omitted)
-    // rather than treating the whole name as one.
-    scanFileExt = scanFileName?.includes(".")
-      ? (scanFileName.split(".").pop()?.toLowerCase() ?? null)
-      : null;
     const previousId = info?.id;
     const hadRoll = roll !== null;
     roll = null;
@@ -457,6 +453,15 @@
       loading = null;
       return;
     }
+    // Only after a SUCCESSFUL open: a failed open leaves the previous image
+    // on screen, and its export must keep defaulting to the previous file's
+    // name and format, not the failed pick's.
+    scanFileName = path.split(/[\\/]/).pop() ?? null;
+    // A name without a dot has no extension: leave null (filters omitted)
+    // rather than treating the whole name as one.
+    scanFileExt = scanFileName?.includes(".")
+      ? (scanFileName.split(".").pop()?.toLowerCase() ?? null)
+      : null;
     detected = false;
     componentsAtHalf = null;
     singleExportNote = null;
@@ -859,6 +864,11 @@
     if (!key) return;
     strokeStore[key] = { strokes, redo };
     if (roll) {
+      // Mirror into the frame like onThresholdInput does for threshold:
+      // the heal-inputs captures read roll.frames[i].strokes as persisted
+      // truth, and without this mirror they would read the open-time seed
+      // forever (false "heal is stale" that no re-heal can clear).
+      roll.frames[displayedIndex].strokes = strokes;
       // `displayedIndex`, matching `strokeKey()` above: persist to the
       // sidecar entry for the frame actually on screen, not whichever frame
       // navigation may already be mid-switch towards.
