@@ -728,7 +728,15 @@ fn scan_roll(
     let generation = roll.generation();
     tauri::async_runtime::spawn(async move {
         let _scan_flag_guard = ScanFlagGuard(app_for_task.clone());
-        for index in indices {
+        // Two passes over the same index snapshot: thumbnails first (cheap,
+        // seconds each) so the filmstrip fills in immediately, then
+        // detections (slow, ~9s each) trickle in behind them. A frame whose
+        // decode fails in pass 1 has no pixels to detect on, so its index is
+        // recorded here and pass 2 skips it outright.
+        let mut failed_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        // Pass 1: thumbnails.
+        for &index in &indices {
             let roll_state = app_for_task.state::<roll::RollState>();
             // Enforcement point: a roll swap/close bumped the generation
             // counter since this task spawned, so `roll_dir`/`indices`
@@ -746,6 +754,7 @@ fn scan_roll(
                     let _ = roll_state.record_scan_result(generation, index, None, None);
                     let _ =
                         app_for_task.emit("roll-frame-error", RollFrameError { index, message: e });
+                    failed_indices.insert(index);
                     continue;
                 }
             };
@@ -757,13 +766,14 @@ fn scan_roll(
                 .and_then(|n| n.to_str())
                 .unwrap_or_default()
                 .to_string();
-            // Stage 1: decode + thumbnail only, so the filmstrip gets its
-            // preview within seconds; the (much slower) detection follows in
-            // stage 2. `prepared` crosses the await into stage 2 and drops at
-            // its end, so the "at most 1 queue frame in memory" bound holds.
             let thumb_path = roll::thumb_path(&roll_dir, &file_name);
+            if thumb_path.exists() {
+                // Backfill run: this frame already has a thumbnail from an
+                // earlier scan, so there's nothing to decode here.
+                continue;
+            }
             #[cfg(debug_assertions)]
-            eprintln!("[queue] frame {index} decode starting");
+            eprintln!("[queue] frame {index} thumbnail");
             let staged = tauri::async_runtime::spawn_blocking(move || {
                 let prepared = images::Images::prepare(&path)?;
                 let coarsest = prepared
@@ -777,52 +787,74 @@ fn scan_roll(
                     coarsest.height,
                     &thumb_path,
                 );
-                Ok::<_, String>((prepared, thumb))
+                Ok::<_, String>(thumb)
+                // `prepared` (pyramid + decoded pixels) drops here; pass 2
+                // decodes its own copy so at most one frame's pixels are
+                // resident at a time across the whole scan.
             })
             .await
             .map_err(|e| e.to_string())
             .and_then(|r| r);
 
-            let prepared = match staged {
-                Ok((prepared, thumb)) => {
-                    match thumb {
-                        Ok(()) => {
-                            let _ = app_for_task.emit("roll-thumb", RollThumb { index });
-                        }
-                        Err(e) => {
-                            let _ = app_for_task.emit(
-                                "roll-frame-error",
-                                RollFrameError {
-                                    index,
-                                    message: format!("thumbnail: {e}"),
-                                },
-                            );
-                        }
-                    }
-                    prepared
+            match staged {
+                Ok(Ok(())) => {
+                    let _ = app_for_task.emit("roll-thumb", RollThumb { index });
+                }
+                Ok(Err(e)) => {
+                    // Decode succeeded but the thumbnail write failed: the
+                    // frame still has pixels, so it still detects in pass 2.
+                    let _ = app_for_task.emit(
+                        "roll-frame-error",
+                        RollFrameError {
+                            index,
+                            message: format!("thumbnail: {e}"),
+                        },
+                    );
                 }
                 Err(message) => {
+                    // Decode itself failed: no pixels, so pass 2 can't
+                    // detect on this frame either.
                     let _ = roll_state.record_scan_result(generation, index, None, None);
                     let _ =
                         app_for_task.emit("roll-frame-error", RollFrameError { index, message });
+                    failed_indices.insert(index);
+                }
+            }
+        }
+
+        // Pass 2: detections.
+        for &index in &indices {
+            if failed_indices.contains(&index) {
+                continue;
+            }
+            let roll_state = app_for_task.state::<roll::RollState>();
+            if roll_state.generation() != generation {
+                break;
+            }
+            let path = match roll_state.frame_path(index) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = roll_state.record_scan_result(generation, index, None, None);
+                    let _ =
+                        app_for_task.emit("roll-frame-error", RollFrameError { index, message: e });
                     continue;
                 }
             };
-
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
             #[cfg(debug_assertions)]
             eprintln!("[queue] frame {index} detect starting");
-            // Stage 2: detection on the already-decoded frame. Only the
-            // decoded pixels cross into the closure: the display pyramid
-            // built for the thumbnail is over a gigabyte on a 168MP scan and
-            // detection never reads it, while inference itself is the app's
-            // peak-memory window -- keeping the pyramid alive through it
-            // helped push real color rolls into the OS memory killer.
-            let image = prepared.image;
-            drop(prepared.pyramid);
+            // No pyramid here (ff90566's export-queue shape): this pass only
+            // ever reads the decoded pixels for detection, so building the
+            // multi-resolution display pyramid would just waste memory/CPU.
             let detector = detector.clone();
             let detector_hash = detector.hash();
             let cache_path = roll::probs_cache_path(&roll_dir, &file_name);
             let outcome = tauri::async_runtime::spawn_blocking(move || {
+                let image = images::Images::decode_stage(&path)?;
                 let probs = detector.detect(&image)?;
                 let bboxes = images::components_from_probs(
                     &probs,
