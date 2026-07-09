@@ -48,18 +48,68 @@ def export_detector() -> None:
     )
 
 
-def export_inpaint() -> None:
+def export_inpaint(out_path: Path, *, size: int = 64, static: bool = False) -> None:
+    """Build the mean-fill inpaint graph (TinyInpaint: same op graph either way).
+
+    static=False reproduces the existing dynamic-height/width fixture.
+    static=True fixes every dim (no symbolic axes), as the LaMa fixed-
+    contract fixture requires.
+    """
     model = TinyInpaint().eval()
+    dynamic_shapes = (
+        None
+        if static
+        else {"image": {2: "h", 3: "w"}, "mask": {2: "h", 3: "w"}}
+    )
     torch.onnx.export(
         model,
-        (torch.zeros(1, 3, 64, 64), torch.zeros(1, 1, 64, 64)),
-        str(OUT / "tiny-inpaint.onnx"),
+        (torch.zeros(1, 3, size, size), torch.zeros(1, 1, size, size)),
+        str(out_path),
         input_names=["image", "mask"],
         output_names=["output"],
-        dynamic_shapes={"image": {2: "h", 3: "w"}, "mask": {2: "h", 3: "w"}},
+        dynamic_shapes=dynamic_shapes,
         opset_version=17,
         dynamo=True,
     )
+
+
+def append_output_scale(path: Path, scale: float) -> None:
+    """Graph-level surgery: multiply the model's single output by `scale`.
+
+    Kept separate from TinyInpaint/export_inpaint (rather than threading a
+    scale flag through the traced module) because the dynamo exporter embeds
+    each node's source file + line number as debug metadata; editing
+    TinyInpaint.forward to add a conditional scale would shift its line
+    numbers and change the *existing* tiny-inpaint.onnx fixture's bytes even
+    though the op graph is unchanged. Operating on the exported ONNX graph
+    instead leaves TinyInpaint, and therefore that fixture, untouched.
+    """
+    model = onnx.load(str(path))
+    graph = model.graph
+    (output,) = graph.output
+    original_name = output.name
+    scaled_name = f"{original_name}_scaled"
+
+    graph.node.append(
+        onnx.helper.make_node(
+            "Mul",
+            inputs=[original_name, "output_scale"],
+            outputs=[scaled_name],
+            name="node_output_scale",
+        )
+    )
+    graph.initializer.append(
+        onnx.helper.make_tensor("output_scale", onnx.TensorProto.FLOAT, [], [scale])
+    )
+    output.name = scaled_name
+    onnx.save(model, str(path))
+
+
+def make_fixed_inpaint_fixture(path: Path, size: int = 64) -> None:
+    """LaMa-contract fixture: static dims, output scaled to 0-255."""
+    export_inpaint(path, size=size, static=True)
+    embed_weights(path)
+    append_output_scale(path, 255.0)
 
 
 def embed_weights(path: Path) -> None:
@@ -87,9 +137,10 @@ def make_parity() -> None:
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     export_detector()
-    export_inpaint()
+    export_inpaint(OUT / "tiny-inpaint.onnx")
     embed_weights(OUT / "tiny-detector.onnx")
     embed_weights(OUT / "tiny-inpaint.onnx")
+    make_fixed_inpaint_fixture(OUT / "tiny-inpaint-fixed.onnx")
     make_parity()
     for f in sorted(OUT.iterdir()):
         print(f"{f.name}: {f.stat().st_size} bytes")
