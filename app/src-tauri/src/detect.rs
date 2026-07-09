@@ -4,10 +4,17 @@ use std::sync::{Arc, Mutex};
 use fd_infer::{Detector, Ep};
 use fd_io::ImageBuf;
 
+/// Loaded model together with its file SHA-256.
+#[cfg_attr(not(test), allow(dead_code))]
+struct LoadedDetector {
+    detector: Detector,
+    hash: [u8; 32],
+}
+
 /// Cheaply cloneable handle: Task 3's detect command clones it into a
 /// spawn_blocking closure (which needs 'static).
 #[derive(Clone)]
-pub struct DetectorState(Arc<Mutex<Option<Detector>>>);
+pub struct DetectorState(Arc<Mutex<Option<LoadedDetector>>>);
 
 impl Default for DetectorState {
     fn default() -> Self {
@@ -25,23 +32,43 @@ impl DetectorState {
         let det = Detector::load(path, Ep::CoreML)
             .or_else(|_| Detector::load(path, Ep::Cpu))
             .map_err(|e| e.to_string())?;
-        *self.0.lock().map_err(|e| e.to_string())? = Some(det);
+        let hash = crate::models::file_sha256(path)?;
+        *self.0.lock().map_err(|e| e.to_string())? = Some(LoadedDetector {
+            detector: det,
+            hash,
+        });
         Ok(())
     }
 
     pub fn detect(&self, img: &ImageBuf) -> Result<Vec<f32>, String> {
         let mut guard = self.0.lock().map_err(|e| e.to_string())?;
         match guard.as_mut() {
-            Some(det) => det.probabilities(img).map_err(|e| e.to_string()),
+            Some(loaded) => loaded
+                .detector
+                .probabilities(img)
+                .map_err(|e| e.to_string()),
             None => Err("no detector loaded".to_string()),
         }
     }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn hash(&self) -> Option<[u8; 32]> {
+        let guard = self.0.lock().ok()?;
+        guard.as_ref().map(|loaded| loaded.hash)
+    }
+}
+
+/// Loaded inpainting model together with its file SHA-256.
+#[cfg_attr(not(test), allow(dead_code))]
+struct LoadedInpainter {
+    inpainter: fd_heal::Inpainter,
+    hash: [u8; 32],
 }
 
 /// Cheaply cloneable handle to the (optional) inpainting model, mirroring
 /// DetectorState. None means heal_frame falls back to classical fill only.
 #[derive(Clone)]
-pub struct InpainterState(Arc<Mutex<Option<fd_heal::Inpainter>>>);
+pub struct InpainterState(Arc<Mutex<Option<LoadedInpainter>>>);
 
 impl Default for InpainterState {
     fn default() -> Self {
@@ -52,7 +79,11 @@ impl Default for InpainterState {
 impl InpainterState {
     pub fn load(&self, path: &Path) -> Result<(), String> {
         let inp = fd_heal::Inpainter::load(path, fd_infer::Ep::Cpu).map_err(|e| e.to_string())?;
-        *self.0.lock().map_err(|e| e.to_string())? = Some(inp);
+        let hash = crate::models::file_sha256(path)?;
+        *self.0.lock().map_err(|e| e.to_string())? = Some(LoadedInpainter {
+            inpainter: inp,
+            hash,
+        });
         Ok(())
     }
 
@@ -62,7 +93,13 @@ impl InpainterState {
         f: impl FnOnce(Option<&mut fd_heal::Inpainter>) -> R,
     ) -> Result<R, String> {
         let mut guard = self.0.lock().map_err(|e| e.to_string())?;
-        Ok(f(guard.as_mut()))
+        Ok(f(guard.as_mut().map(|loaded| &mut loaded.inpainter)))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn hash(&self) -> Option<[u8; 32]> {
+        let guard = self.0.lock().ok()?;
+        guard.as_ref().map(|loaded| loaded.hash)
     }
 }
 
@@ -134,5 +171,32 @@ mod tests {
         let state = InpainterState::default();
         assert!(!state.with_inpainter(|i| i.is_some()).unwrap());
         assert!(state.load(Path::new("/nonexistent/x.onnx")).is_err());
+    }
+
+    fn inpaint_fixture() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../engine/fixtures/tiny-inpaint.onnx")
+    }
+
+    #[test]
+    fn loaded_detector_exposes_file_hash() {
+        let state = DetectorState::default();
+        assert!(state.hash().is_none());
+        state.load(&fixture()).unwrap();
+        let h = state.hash().expect("hash after load");
+        // stable across loads of the same file
+        state.load(&fixture()).unwrap();
+        assert_eq!(state.hash().unwrap(), h);
+    }
+
+    #[test]
+    fn loaded_inpainter_exposes_file_hash() {
+        let state = InpainterState::default();
+        assert!(state.hash().is_none());
+        state.load(&inpaint_fixture()).unwrap();
+        let h = state.hash().expect("hash after load");
+        // stable across loads of the same file
+        state.load(&inpaint_fixture()).unwrap();
+        assert_eq!(state.hash().unwrap(), h);
     }
 }

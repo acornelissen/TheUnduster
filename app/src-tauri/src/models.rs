@@ -81,10 +81,10 @@ fn lama_tmp_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(models_dir(app)?.join("lama.onnx.tmp-unduster"))
 }
 
-/// Streams `path` through SHA-256 in 1MB chunks and compares against
-/// `expected_hex`. Streaming (rather than reading the whole file into
-/// memory) matters here: the model is ~200MB.
-pub fn verify_sha256(path: &Path, expected_hex: &str) -> Result<(), String> {
+/// Streams `path` through SHA-256 in 1MB chunks, returning the raw digest.
+/// Streaming (rather than reading the whole file into memory) matters here:
+/// the model is ~200MB.
+pub fn file_sha256(path: &Path) -> Result<[u8; 32], String> {
     let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1024 * 1024];
@@ -95,7 +95,18 @@ pub fn verify_sha256(path: &Path, expected_hex: &str) -> Result<(), String> {
         }
         hasher.update(&buf[..n]);
     }
-    let actual_hex = hex_encode(&hasher.finalize());
+    let digest = hasher.finalize();
+    let mut result = [0u8; 32];
+    result.copy_from_slice(&digest);
+    Ok(result)
+}
+
+/// Streams `path` through SHA-256 in 1MB chunks and compares against
+/// `expected_hex`. Streaming (rather than reading the whole file into
+/// memory) matters here: the model is ~200MB.
+pub fn verify_sha256(path: &Path, expected_hex: &str) -> Result<(), String> {
+    let digest = file_sha256(path)?;
+    let actual_hex = hex_encode(&digest);
     if actual_hex.eq_ignore_ascii_case(expected_hex) {
         Ok(())
     } else {
