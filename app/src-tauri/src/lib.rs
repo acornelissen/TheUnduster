@@ -96,6 +96,22 @@ struct DetectReport {
     components_at_half: usize,
 }
 
+/// Stats `path` for a cache stamp, or `None` on any stat failure. Every
+/// cache read/write site goes through this: a stat failure (permission
+/// error, race with a delete, etc.) skips the cache interaction entirely --
+/// it must never fail the surrounding operation, only cost it a cache hit or
+/// a cache write.
+fn stamp_or_skip(path: &std::path::Path) -> Option<cache::SourceStamp> {
+    match cache::source_stamp(path) {
+        Ok(s) => Some(s),
+        Err(_e) => {
+            #[cfg(debug_assertions)]
+            eprintln!("[cache] stamp failed for {}: {_e}", path.display());
+            None
+        }
+    }
+}
+
 /// Runs the fallible body of `detect`. Split out so `detect` can guarantee a
 /// terminal "ready" emit after this resolves, on every exit path (success or
 /// error alike) — the frontend gates its loading state on that emit and
@@ -127,19 +143,28 @@ async fn run_detect(
     // Resolved before spawn_blocking so the closure can write the probs
     // cache from the borrowed slice, before handing the Vec's ownership to
     // set_probs_built -- avoids cloning a 671MB vector for a 168MP frame.
-    let cache_path = roll
-        .frame_for_image(id)?
-        .map(|(roll_dir, file_name)| roll::probs_cache_path(&roll_dir, &file_name));
+    // The cache path and the source path (dir/file_name) both come from the
+    // same frame mapping: the source path is what the write is stamped
+    // against.
+    let cache_source = roll.frame_for_image(id)?.map(|(roll_dir, file_name)| {
+        let source_path = roll_dir.join(&file_name);
+        let cache_path = roll::probs_cache_path(&roll_dir, &file_name);
+        (cache_path, source_path)
+    });
     let detector = detector.inner().clone(); // DetectorState is Clone over an Arc
     let (probs, pyramid) = tauri::async_runtime::spawn_blocking(move || {
         // detect_hashed pairs the output with the hash of the model that
         // produced it under one lock -- see its doc comment -- so the cache
         // write below can never record a different model's hash.
         let (probs, hash) = detector.detect_hashed(&img)?;
-        if let Some(path) = &cache_path {
-            if let Err(_e) = cache::write_probs(path, &probs, img.width, img.height, &hash) {
-                #[cfg(debug_assertions)]
-                eprintln!("[cache] probs write failed for image {id}: {_e}");
+        if let Some((path, source_path)) = &cache_source {
+            if let Some(stamp) = stamp_or_skip(source_path) {
+                if let Err(_e) =
+                    cache::write_probs(path, &probs, img.width, img.height, &hash, &stamp)
+                {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[cache] probs write failed for image {id}: {_e}");
+                }
             }
         }
         let pyramid = build_prob_pyramid(&probs, &level_dims);
@@ -227,10 +252,14 @@ async fn run_heal(
     };
     // Resolved before spawn_blocking (owned values into the closure), mirroring
     // run_detect's cache_path resolution. `None` when the frame doesn't map to
-    // a roll (single-image mode): the heal cache is roll-only.
-    let cache_path = roll
-        .frame_for_image(id)?
-        .map(|(roll_dir, file_name)| roll::heal_cache_path(&roll_dir, &file_name));
+    // a roll (single-image mode): the heal cache is roll-only. A stat failure
+    // on the source also collapses to `None` here -- skip the cache
+    // interaction entirely rather than fail the heal.
+    let cache_path = roll.frame_for_image(id)?.and_then(|(roll_dir, file_name)| {
+        let source_path = roll_dir.join(&file_name);
+        let stamp = stamp_or_skip(&source_path)?;
+        Some((roll::heal_cache_path(&roll_dir, &file_name), stamp))
+    });
     // The CURRENT detector's hash: the thresholded probs in the registry came
     // from it. Zeros when none loaded -- that race (detector swapped between
     // detect and heal) is bead-tracked separately as unreachable in practice.
@@ -249,16 +278,23 @@ async fn run_heal(
             // while provenance says model A.
             inpainter.with_inpainter_hashed(|pair| {
                 let inpainter_hash = pair.as_ref().map(|(_, h)| *h).unwrap_or([0u8; 32]);
-                let provenance = cache::heal_provenance(
-                    threshold,
-                    HEAL_DILATE_RADIUS,
-                    &strokes,
-                    &detector_hash,
-                    &inpainter_hash,
-                );
+                // `path_and_provenance` is `None` whenever the frame isn't
+                // roll-backed or the source stat failed above -- in either
+                // case the cache interaction (read AND write) is skipped.
+                let path_and_provenance = cache_path.as_ref().map(|(path, stamp)| {
+                    let provenance = cache::heal_provenance(
+                        threshold,
+                        HEAL_DILATE_RADIUS,
+                        &strokes,
+                        &detector_hash,
+                        &inpainter_hash,
+                        stamp,
+                    );
+                    (path, provenance)
+                });
 
-                if let Some(path) = &cache_path {
-                    if let Some((healed, mask)) = cache::read_heal(path, &image, &provenance) {
+                if let Some((path, provenance)) = &path_and_provenance {
+                    if let Some((healed, mask)) = cache::read_heal(path, &image, provenance) {
                         let healed = std::sync::Arc::new(healed);
                         let pyramid = fd_tiles::Pyramid::build(&healed);
                         return Ok::<_, String>((
@@ -288,8 +324,8 @@ async fn run_heal(
                             .emit("heal-progress", HealProgress { id, done, total });
                     })
                     .map_err(|e| e.to_string())?;
-                if let Some(path) = &cache_path {
-                    if let Err(_e) = cache::write_heal(path, &image, &copy, &mask, &provenance) {
+                if let Some((path, provenance)) = &path_and_provenance {
+                    if let Err(_e) = cache::write_heal(path, &image, &copy, &mask, provenance) {
                         #[cfg(debug_assertions)]
                         eprintln!("[cache] heal write failed for image {id}: {_e}");
                     }
@@ -570,13 +606,15 @@ async fn activate_frame(
         (roll.frame_for_image(info.id)?, detector.hash())
     {
         let cache_path = roll::probs_cache_path(&roll_dir, &file_name);
+        let source_path = roll_dir.join(&file_name);
         let (width, height) = (info.width, info.height);
         let level_dims: Vec<(u32, u32)> = info.levels.iter().map(|l| (l.width, l.height)).collect();
         let app_for_restore = app.clone();
         let id = info.id;
         tauri::async_runtime::spawn(async move {
             let hit = tauri::async_runtime::spawn_blocking(move || {
-                cache::read_probs(&cache_path, width, height, &hash)
+                let stamp = stamp_or_skip(&source_path)?;
+                cache::read_probs(&cache_path, width, height, &hash, &stamp)
                     .map(|probs| (build_prob_pyramid(&probs, &level_dims), probs))
             })
             .await
@@ -873,12 +911,20 @@ fn scan_roll(
                 );
                 // Cache write is sequential with detection here (milliseconds
                 // against a ~9s detect); failures eprintln in debug only,
-                // never fail the scan.
-                if let Err(_e) =
-                    cache::write_probs(&cache_path, &probs, image.width, image.height, &hash)
-                {
-                    #[cfg(debug_assertions)]
-                    eprintln!("[queue] frame {index} probs cache write failed: {_e}");
+                // never fail the scan. A source stat failure skips the write
+                // outright (stamp_or_skip's contract).
+                if let Some(stamp) = stamp_or_skip(&path) {
+                    if let Err(_e) = cache::write_probs(
+                        &cache_path,
+                        &probs,
+                        image.width,
+                        image.height,
+                        &hash,
+                        &stamp,
+                    ) {
+                        #[cfg(debug_assertions)]
+                        eprintln!("[queue] frame {index} probs cache write failed: {_e}");
+                    }
                 }
                 Ok::<_, String>(bboxes)
                 // `image` (the full-res pixels) drops here, before the task
@@ -1062,26 +1108,37 @@ fn export_approved(
                     let image = images::Images::decode_stage(&path)?;
                     masks::validate_strokes(&frame_strokes)?;
 
+                    // A source stat failure skips the heal-cache interaction
+                    // (read AND write) entirely, falling straight through to
+                    // the transient detect/heal below -- it must never fail
+                    // the export.
+                    let stamp = stamp_or_skip(&path);
+
                     // Everything provenance-dependent happens inside the one
                     // with_inpainter_hashed lock, exactly as in run_heal: the
                     // inpainter hash and the model that actually heals (on a
                     // miss) must be the same observation.
                     inpainter.with_inpainter_hashed(|pair| {
                         let inpainter_hash = pair.as_ref().map(|(_, h)| *h).unwrap_or([0u8; 32]);
-                        let provenance = cache::heal_provenance(
-                            threshold,
-                            HEAL_DILATE_RADIUS,
-                            &frame_strokes,
-                            &detector_hash,
-                            &inpainter_hash,
-                        );
+                        let provenance = stamp.as_ref().map(|stamp| {
+                            cache::heal_provenance(
+                                threshold,
+                                HEAL_DILATE_RADIUS,
+                                &frame_strokes,
+                                &detector_hash,
+                                &inpainter_hash,
+                                stamp,
+                            )
+                        });
 
-                        if let Some((healed, mask)) =
-                            cache::read_heal(&cache_path, &image, &provenance)
-                        {
-                            stage("writing");
-                            return export::export_healed(&image, &healed, &mask, &dest)
-                                .map(|_| ());
+                        if let Some(provenance) = &provenance {
+                            if let Some((healed, mask)) =
+                                cache::read_heal(&cache_path, &image, provenance)
+                            {
+                                stage("writing");
+                                return export::export_healed(&image, &healed, &mask, &dest)
+                                    .map(|_| ());
+                            }
                         }
 
                         stage("detecting");
@@ -1106,13 +1163,15 @@ fn export_approved(
                         .map_err(|e| e.to_string())?;
                         // Cache the fresh heal so the next export or heal of
                         // this frame is instant.
-                        if let Err(_e) =
-                            cache::write_heal(&cache_path, &image, &copy, &mask, &provenance)
-                        {
-                            #[cfg(debug_assertions)]
-                            eprintln!(
-                                "[cache] heal write failed for frame {index} ({file_name}): {_e}"
-                            );
+                        if let Some(provenance) = &provenance {
+                            if let Err(_e) =
+                                cache::write_heal(&cache_path, &image, &copy, &mask, provenance)
+                            {
+                                #[cfg(debug_assertions)]
+                                eprintln!(
+                                    "[cache] heal write failed for frame {index} ({file_name}): {_e}"
+                                );
+                            }
                         }
                         stage("writing");
                         export::export_healed(&image, &copy, &mask, &dest).map(|_| ())
@@ -1248,13 +1307,20 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
             // correctly-paired detect below via detect_hashed).
             let detector_hash = detector_state.hash();
             let cache_path = roll::probs_cache_path(&roll_dir, &file_name);
+            let source_path = path.clone();
             let (probs, pyramid, bboxes) = tauri::async_runtime::spawn_blocking(move || {
+                // A stat failure skips the cache interaction entirely (both
+                // the lookup below and the write on a miss).
+                let stamp = stamp_or_skip(&source_path);
                 // A valid cache entry for the current detector replaces the
                 // (seconds-long) model run: a detect job means detection is
                 // wanted, not necessarily recomputed.
-                let cached = detector_hash.as_ref().and_then(|hash| {
-                    cache::read_probs(&cache_path, image.width, image.height, hash)
-                });
+                let cached = match (&detector_hash, &stamp) {
+                    (Some(hash), Some(stamp)) => {
+                        cache::read_probs(&cache_path, image.width, image.height, hash, stamp)
+                    }
+                    _ => None,
+                };
                 let probs = match cached {
                     Some(probs) => probs,
                     None => {
@@ -1263,15 +1329,18 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                         // doc comment -- so the cache write below can never
                         // record a different model's hash.
                         let (probs, hash) = detector.detect_hashed(&image)?;
-                        if let Err(_e) = cache::write_probs(
-                            &cache_path,
-                            &probs,
-                            image.width,
-                            image.height,
-                            &hash,
-                        ) {
-                            #[cfg(debug_assertions)]
-                            eprintln!("[jobs] frame {index} probs cache write failed: {_e}");
+                        if let Some(stamp) = &stamp {
+                            if let Err(_e) = cache::write_probs(
+                                &cache_path,
+                                &probs,
+                                image.width,
+                                image.height,
+                                &hash,
+                                stamp,
+                            ) {
+                                #[cfg(debug_assertions)]
+                                eprintln!("[jobs] frame {index} probs cache write failed: {_e}");
+                            }
                         }
                         probs
                     }
@@ -1382,32 +1451,47 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
             let inpainter = app.state::<detect::InpainterState>().inner().clone();
             let heal_cache_path = roll::heal_cache_path(&roll_dir, &file_name);
             let probs_cache_path = roll::probs_cache_path(&roll_dir, &file_name);
+            let source_path = path.clone();
             let app_for_progress = app.clone();
             let (healed, pyramid, mask) = tauri::async_runtime::spawn_blocking(move || {
+                // A stat failure skips every cache interaction below (heal
+                // read/write and probs read/write alike) -- never fails the
+                // job.
+                let stamp = stamp_or_skip(&source_path);
+
                 // Everything provenance-dependent happens inside the one
                 // with_inpainter_hashed lock, exactly as in run_heal and the
                 // export queue's transient path.
                 inpainter.with_inpainter_hashed(|pair| {
                     let inpainter_hash = pair.as_ref().map(|(_, h)| *h).unwrap_or([0u8; 32]);
-                    let provenance = cache::heal_provenance(
-                        threshold,
-                        HEAL_DILATE_RADIUS,
-                        &strokes,
-                        &detector_hash,
-                        &inpainter_hash,
-                    );
+                    let provenance = stamp.as_ref().map(|stamp| {
+                        cache::heal_provenance(
+                            threshold,
+                            HEAL_DILATE_RADIUS,
+                            &strokes,
+                            &detector_hash,
+                            &inpainter_hash,
+                            stamp,
+                        )
+                    });
 
-                    if let Some((healed, mask)) =
-                        cache::read_heal(&heal_cache_path, &image, &provenance)
-                    {
-                        let healed = std::sync::Arc::new(healed);
-                        // Always build: the write-target id is resolved AFTER
-                        // this closure returns (the frame may have gone
-                        // non-resident-to-resident mid-job), so building only
-                        // when `resident_id` was already Some would silently
-                        // drop the registry write for a late-resident frame.
-                        let pyramid = fd_tiles::Pyramid::build(&healed);
-                        return Ok::<_, String>((healed, Some(pyramid), std::sync::Arc::new(mask)));
+                    if let Some(provenance) = &provenance {
+                        if let Some((healed, mask)) =
+                            cache::read_heal(&heal_cache_path, &image, provenance)
+                        {
+                            let healed = std::sync::Arc::new(healed);
+                            // Always build: the write-target id is resolved AFTER
+                            // this closure returns (the frame may have gone
+                            // non-resident-to-resident mid-job), so building only
+                            // when `resident_id` was already Some would silently
+                            // drop the registry write for a late-resident frame.
+                            let pyramid = fd_tiles::Pyramid::build(&healed);
+                            return Ok::<_, String>((
+                                healed,
+                                Some(pyramid),
+                                std::sync::Arc::new(mask),
+                            ));
+                        }
                     }
 
                     // Probs mask: the registry's live detection first, then
@@ -1417,14 +1501,16 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                     let raw: Vec<bool> = match registry_mask {
                         Some(m) => m,
                         None => {
-                            let cached = detector_hash_opt.as_ref().and_then(|hash| {
-                                cache::read_probs(
+                            let cached = match (&detector_hash_opt, &stamp) {
+                                (Some(hash), Some(stamp)) => cache::read_probs(
                                     &probs_cache_path,
                                     image.width,
                                     image.height,
                                     hash,
-                                )
-                            });
+                                    stamp,
+                                ),
+                                _ => None,
+                            };
                             let probs = match cached {
                                 Some(p) => p,
                                 None => {
@@ -1434,17 +1520,20 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                                     // -- so the cache write below can never
                                     // record a different model's hash.
                                     let (probs, hash) = detector.detect_hashed(&image)?;
-                                    if let Err(_e) = cache::write_probs(
-                                        &probs_cache_path,
-                                        &probs,
-                                        image.width,
-                                        image.height,
-                                        &hash,
-                                    ) {
-                                        #[cfg(debug_assertions)]
-                                        eprintln!(
-                                            "[jobs] frame {index} probs cache write failed: {_e}"
-                                        );
+                                    if let Some(stamp) = &stamp {
+                                        if let Err(_e) = cache::write_probs(
+                                            &probs_cache_path,
+                                            &probs,
+                                            image.width,
+                                            image.height,
+                                            &hash,
+                                            stamp,
+                                        ) {
+                                            #[cfg(debug_assertions)]
+                                            eprintln!(
+                                                "[jobs] frame {index} probs cache write failed: {_e}"
+                                            );
+                                        }
                                     }
                                     probs
                                 }
@@ -1472,13 +1561,15 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                         }
                     })
                     .map_err(|e| e.to_string())?;
-                    if let Err(_e) =
-                        cache::write_heal(&heal_cache_path, &image, &copy, &mask, &provenance)
-                    {
-                        #[cfg(debug_assertions)]
-                        eprintln!(
-                            "[cache] heal write failed for frame {index} ({file_name}): {_e}"
-                        );
+                    if let Some(provenance) = &provenance {
+                        if let Err(_e) =
+                            cache::write_heal(&heal_cache_path, &image, &copy, &mask, provenance)
+                        {
+                            #[cfg(debug_assertions)]
+                            eprintln!(
+                                "[cache] heal write failed for frame {index} ({file_name}): {_e}"
+                            );
+                        }
                     }
                     let healed = std::sync::Arc::new(copy);
                     // Always build; see the cache-hit branch above for why.
@@ -1689,7 +1780,8 @@ mod roll_queue_tests {
         assert_eq!(state.frames_to_scan().unwrap(), vec![0, 1]);
         // Once its probs cache exists, a counted frame leaves the queue.
         let cache_path = roll::probs_cache_path(dir.path(), "a.png");
-        crate::cache::write_probs(&cache_path, &[0.5], 1, 1, &[7u8; 32]).unwrap();
+        let stamp = crate::cache::source_stamp(&dir.path().join("a.png")).unwrap();
+        crate::cache::write_probs(&cache_path, &[0.5], 1, 1, &[7u8; 32], &stamp).unwrap();
         assert_eq!(state.frames_to_scan().unwrap(), vec![1]);
     }
 

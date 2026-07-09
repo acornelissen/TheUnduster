@@ -11,14 +11,47 @@ use sha2::{Digest, Sha256};
 
 pub const PROBS_MAGIC: &[u8; 8] = b"UNDPROB1";
 
+/// Binds a cache entry to the identity of the source file it was produced
+/// from: size plus modification time (nanoseconds since the Unix epoch,
+/// truncated to u64). A rescan or in-place edit of the source changes at
+/// least one of these, so a stale cache entry can never be resurrected by
+/// simply re-reading the same path -- collision requires the same size AND
+/// the same nanosecond mtime, which is good enough against rescans/edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceStamp {
+    pub size: u64,
+    pub mtime_nanos: u64,
+}
+
+/// Stats `path` and returns its `SourceStamp`. A pre-epoch mtime maps to 0
+/// via the saturating duration_since -- fine, since that just means "very
+/// old" collides with other very-old files, an acceptable, exceedingly rare
+/// edge case for real film-scan files.
+pub fn source_stamp(path: &Path) -> Result<SourceStamp, String> {
+    let metadata = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let modified = metadata
+        .modified()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let mtime_nanos = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    Ok(SourceStamp {
+        size: metadata.len(),
+        mtime_nanos,
+    })
+}
+
 /// Writes width*height probabilities as u8 (round(p*255)), zstd-compressed,
-/// with the producing detector's file hash in the header. Atomic.
+/// with the producing detector's file hash and the source file's stamp in
+/// the header. Atomic.
 pub fn write_probs(
     path: &Path,
     probs: &[f32],
     width: u32,
     height: u32,
     detector_hash: &[u8; 32],
+    stamp: &SourceStamp,
 ) -> Result<(), String> {
     // Validate dimensions
     let expected_len = (width as usize)
@@ -38,10 +71,12 @@ pub fn write_probs(
     // Build header
     let mut header = Vec::new();
     header.extend_from_slice(PROBS_MAGIC);
-    header.extend_from_slice(&1u32.to_le_bytes()); // version
+    header.extend_from_slice(&2u32.to_le_bytes()); // version
     header.extend_from_slice(&width.to_le_bytes());
     header.extend_from_slice(&height.to_le_bytes());
     header.extend_from_slice(detector_hash);
+    header.extend_from_slice(&stamp.size.to_le_bytes());
+    header.extend_from_slice(&stamp.mtime_nanos.to_le_bytes());
 
     // Compress the quantized data
     let compressed =
@@ -76,13 +111,16 @@ pub fn write_probs(
 }
 
 /// Reads a probs cache written by write_probs. Returns None (never Err) when
-/// the file is absent, malformed, dimension-mismatched, or produced by a
-/// different detector -- malformed files are deleted on sight.
+/// the file is absent, malformed, dimension-mismatched, produced by a
+/// different detector, or stamped for a different source file -- malformed
+/// files (including any file with an unknown version, e.g. a pre-stamp v1
+/// file) are deleted on sight; well-formed-but-mismatched files are kept.
 pub fn read_probs(
     path: &Path,
     width: u32,
     height: u32,
     detector_hash: &[u8; 32],
+    stamp: &SourceStamp,
 ) -> Option<Vec<f32>> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
@@ -95,8 +133,10 @@ pub fn read_probs(
         None
     };
 
-    // Check minimum header size: magic(8) + version(4) + width(4) + height(4) + hash(32) + len(8) = 60
-    if bytes.len() < 60 {
+    // Check minimum header size:
+    // magic(8) + version(4) + width(4) + height(4) + hash(32) + size(8) +
+    // mtime(8) + len(8) = 76
+    if bytes.len() < 76 {
         return corrupt();
     }
 
@@ -108,7 +148,8 @@ pub fn read_probs(
     }
     offset += 8;
 
-    // Check version
+    // Check version. Any version other than the current one -- including a
+    // pre-stamp v1 file -- is unreadable and self-migrates by deletion.
     let version = u32::from_le_bytes([
         bytes[offset],
         bytes[offset + 1],
@@ -116,7 +157,7 @@ pub fn read_probs(
         bytes[offset + 3],
     ]);
     offset += 4;
-    if version != 1 {
+    if version != 2 {
         return corrupt();
     }
 
@@ -146,6 +187,16 @@ pub fn read_probs(
 
     if stored_hash != detector_hash {
         return None; // hash mismatch is not corruption
+    }
+
+    // Check the source stamp (size, mtime_nanos).
+    let stored_size = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+    let stored_mtime_nanos = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+
+    if stored_size != stamp.size || stored_mtime_nanos != stamp.mtime_nanos {
+        return None; // stamp mismatch is not corruption
     }
 
     // Read compressed length
@@ -199,7 +250,13 @@ pub fn read_probs(
     Some(probs)
 }
 
-pub const HEAL_MAGIC: &[u8; 8] = b"UNDHEAL1";
+// Bumped from UNDHEAL1 to UNDHEAL2 because the source stamp joined
+// provenance's hashed inputs: a pre-stamp heal file's provenance can never
+// match a provenance hash computed with the new formula, so it would
+// otherwise linger on disk unmatched forever instead of purging. Bumping the
+// magic makes it fail the structural check (corrupt) and delete on sight,
+// exactly like an old-version probs file.
+pub const HEAL_MAGIC: &[u8; 8] = b"UNDHEAL2";
 
 /// Header layout (all little-endian):
 /// magic(8) | version u32 | width u32 | height u32 | channels u8 | depth u8
@@ -210,12 +267,16 @@ const HEAL_HEADER_LEN: usize = 8 + 4 + 4 + 4 + 1 + 1 + 32 + 8;
 /// Provenance of a heal: any input that changes the output contributes.
 /// Strokes are canonicalized as serde_json bytes (deterministic for
 /// identical f32 bit patterns, which is exactly the invariant we want).
+/// Hashed in a fixed, documented order: threshold, dilate radius, strokes,
+/// detector hash, inpainter hash, then the source stamp (size LE, then
+/// mtime_nanos LE) last.
 pub fn heal_provenance(
     threshold: f32,
     dilate_radius: u32,
     strokes: &[crate::masks::Stroke],
     detector_hash: &[u8; 32],
     inpainter_hash: &[u8; 32],
+    source: &SourceStamp,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(threshold.to_le_bytes());
@@ -223,6 +284,8 @@ pub fn heal_provenance(
     hasher.update(serde_json::to_vec(strokes).unwrap_or_default());
     hasher.update(detector_hash);
     hasher.update(inpainter_hash);
+    hasher.update(source.size.to_le_bytes());
+    hasher.update(source.mtime_nanos.to_le_bytes());
     hasher.finalize().into()
 }
 
@@ -530,14 +593,22 @@ mod tests {
         (0..n).map(|i| ((i % 97) as f32) / 96.0).collect()
     }
 
+    fn stamp() -> SourceStamp {
+        SourceStamp {
+            size: 1234,
+            mtime_nanos: 5_678_901_234,
+        }
+    }
+
     #[test]
     fn probs_round_trip_within_quantization() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("a.probs");
         let probs = synth_probs(64 * 48);
         let hash = [7u8; 32];
-        write_probs(&p, &probs, 64, 48, &hash).unwrap();
-        let back = read_probs(&p, 64, 48, &hash).expect("cache readable");
+        let s = stamp();
+        write_probs(&p, &probs, 64, 48, &hash, &s).unwrap();
+        let back = read_probs(&p, 64, 48, &hash, &s).expect("cache readable");
         assert_eq!(back.len(), probs.len());
         for (a, b) in probs.iter().zip(&back) {
             assert!((a - b).abs() <= 0.5 / 255.0 + 1e-6, "{a} vs {b}");
@@ -549,18 +620,54 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("a.probs");
         let probs = synth_probs(16 * 16);
-        write_probs(&p, &probs, 16, 16, &[1u8; 32]).unwrap();
-        assert!(read_probs(&p, 16, 17, &[1u8; 32]).is_none()); // dims
+        let s = stamp();
+        write_probs(&p, &probs, 16, 16, &[1u8; 32], &s).unwrap();
+        assert!(read_probs(&p, 16, 17, &[1u8; 32], &s).is_none()); // dims
         assert!(p.exists(), "dim mismatch is not corruption; file kept");
-        assert!(read_probs(&p, 16, 16, &[2u8; 32]).is_none()); // detector changed
+        assert!(read_probs(&p, 16, 16, &[2u8; 32], &s).is_none()); // detector changed
         assert!(p.exists(), "hash mismatch is not corruption; file kept");
         let mut bytes = std::fs::read(&p).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xff;
         std::fs::write(&p, &bytes).unwrap();
-        assert!(read_probs(&p, 16, 16, &[1u8; 32]).is_none()); // corrupt payload
+        assert!(read_probs(&p, 16, 16, &[1u8; 32], &s).is_none()); // corrupt payload
         assert!(!p.exists(), "corrupt file deleted on sight");
-        assert!(read_probs(&p, 16, 16, &[1u8; 32]).is_none()); // absent -> None
+        assert!(read_probs(&p, 16, 16, &[1u8; 32], &s).is_none()); // absent -> None
+    }
+
+    #[test]
+    fn probs_reject_stamp_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.probs");
+        let probs = synth_probs(16 * 16);
+        let s = stamp();
+        write_probs(&p, &probs, 16, 16, &[1u8; 32], &s).unwrap();
+        let mismatched = SourceStamp {
+            size: s.size + 1,
+            mtime_nanos: s.mtime_nanos,
+        };
+        assert!(read_probs(&p, 16, 16, &[1u8; 32], &mismatched).is_none());
+        assert!(p.exists(), "stamp mismatch is not corruption; file kept");
+    }
+
+    #[test]
+    fn old_version_probs_purge_on_sight() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.probs");
+        let probs = synth_probs(16 * 16);
+        let s = stamp();
+        write_probs(&p, &probs, 16, 16, &[1u8; 32], &s).unwrap();
+
+        // Patch the version field (offset 8..12) from 2 down to 1 -- this
+        // simulates a pre-stamp cache file surviving an upgrade; it must be
+        // treated as corrupt (unknown/unsupported version) and purged, not
+        // silently reused without a stamp check.
+        let mut bytes = std::fs::read(&p).unwrap();
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&p, &bytes).unwrap();
+
+        assert!(read_probs(&p, 16, 16, &[1u8; 32], &s).is_none());
+        assert!(!p.exists(), "old version file is deleted on sight");
     }
 
     #[test]
@@ -569,14 +676,17 @@ mod tests {
         let p = dir.path().join("a.probs");
         let probs = synth_probs(16 * 16);
         let hash = [1u8; 32];
-        write_probs(&p, &probs, 16, 16, &hash).unwrap();
+        let s = stamp();
+        write_probs(&p, &probs, 16, 16, &hash, &s).unwrap();
 
-        // Overwrite the compressed_len field (offset 52..60) with u64::MAX.
+        // Overwrite the compressed_len field with u64::MAX. Header layout:
+        // magic(8) version(4) width(4) height(4) hash(32) size(8) mtime(8) len(8)
+        let len_off = 8 + 4 + 4 + 4 + 32 + 8 + 8;
         let mut bytes = std::fs::read(&p).unwrap();
-        bytes[52..60].copy_from_slice(&u64::MAX.to_le_bytes());
+        bytes[len_off..len_off + 8].copy_from_slice(&u64::MAX.to_le_bytes());
         std::fs::write(&p, &bytes).unwrap();
 
-        assert!(read_probs(&p, 16, 16, &hash).is_none());
+        assert!(read_probs(&p, 16, 16, &hash, &s).is_none());
         assert!(!p.exists(), "crafted length is treated as corruption");
     }
 
@@ -586,6 +696,7 @@ mod tests {
         let p = dir.path().join("a.probs");
         let width: u32 = 16;
         let height: u32 = 16; // expected decompressed size = 256 bytes
+        let s = stamp();
 
         // zstd frame that decompresses to 1MB of zeros -- wildly more than
         // the 256 bytes the header claims.
@@ -594,10 +705,12 @@ mod tests {
 
         let mut header = Vec::new();
         header.extend_from_slice(PROBS_MAGIC);
-        header.extend_from_slice(&1u32.to_le_bytes());
+        header.extend_from_slice(&2u32.to_le_bytes());
         header.extend_from_slice(&width.to_le_bytes());
         header.extend_from_slice(&height.to_le_bytes());
         header.extend_from_slice(&[3u8; 32]);
+        header.extend_from_slice(&s.size.to_le_bytes());
+        header.extend_from_slice(&s.mtime_nanos.to_le_bytes());
         header.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
         header.extend_from_slice(&compressed);
 
@@ -607,7 +720,7 @@ mod tests {
         // reject after the fact) -- we can only assert on the outcome:
         // rejection plus deletion, since allocation size isn't observable
         // from a test.
-        assert!(read_probs(&p, width, height, &[3u8; 32]).is_none());
+        assert!(read_probs(&p, width, height, &[3u8; 32], &s).is_none());
         assert!(
             !p.exists(),
             "oversized decompression is treated as corruption"
@@ -618,7 +731,7 @@ mod tests {
     fn probs_write_is_atomic() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("a.probs");
-        write_probs(&p, &synth_probs(8 * 8), 8, 8, &[0u8; 32]).unwrap();
+        write_probs(&p, &synth_probs(8 * 8), 8, 8, &[0u8; 32], &stamp()).unwrap();
         // no tmp siblings left behind
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -693,7 +806,7 @@ mod tests {
                 }
             }
         }
-        let prov = heal_provenance(0.5, 2, &[], &[3u8; 32], &[4u8; 32]);
+        let prov = heal_provenance(0.5, 2, &[], &[3u8; 32], &[4u8; 32], &stamp());
         write_heal(&p, &original, &healed, &mask, &prov).unwrap();
         let (back, back_mask) = read_heal(&p, &original, &prov).expect("cache hit");
         assert_eq!(back_mask, mask);
@@ -724,7 +837,7 @@ mod tests {
                 }
             }
         }
-        let prov = heal_provenance(0.5, 2, &[], &[3u8; 32], &[4u8; 32]);
+        let prov = heal_provenance(0.5, 2, &[], &[3u8; 32], &[4u8; 32], &stamp());
         write_heal(&p, &original, &healed, &mask, &prov).unwrap();
         let (back, back_mask) = read_heal(&p, &original, &prov).expect("cache hit");
         assert_eq!(back_mask, mask);
@@ -743,23 +856,29 @@ mod tests {
         let original = noisy16(16, 16);
         let healed = original.clone();
         let mask = vec![false; 256];
-        let prov = heal_provenance(0.5, 2, &[], &[3u8; 32], &[4u8; 32]);
+        let prov = heal_provenance(0.5, 2, &[], &[3u8; 32], &[4u8; 32], &stamp());
         write_heal(&p, &original, &healed, &mask, &prov).unwrap();
-        let other = heal_provenance(0.51, 2, &[], &[3u8; 32], &[4u8; 32]);
+        let other = heal_provenance(0.51, 2, &[], &[3u8; 32], &[4u8; 32], &stamp());
         assert!(read_heal(&p, &original, &other).is_none());
         assert!(p.exists(), "provenance miss keeps the file");
     }
 
     #[test]
     fn heal_provenance_distinguishes_every_input() {
-        let base = heal_provenance(0.5, 2, &[], &[0u8; 32], &[0u8; 32]);
+        let base = heal_provenance(0.5, 2, &[], &[0u8; 32], &[0u8; 32], &stamp());
         let stroke = crate::masks::Stroke {
             erase: false,
             radius: 5.0,
             points: vec![[1.0, 2.0]],
         };
-        assert_ne!(base, heal_provenance(0.6, 2, &[], &[0u8; 32], &[0u8; 32]));
-        assert_ne!(base, heal_provenance(0.5, 3, &[], &[0u8; 32], &[0u8; 32]));
+        assert_ne!(
+            base,
+            heal_provenance(0.6, 2, &[], &[0u8; 32], &[0u8; 32], &stamp())
+        );
+        assert_ne!(
+            base,
+            heal_provenance(0.5, 3, &[], &[0u8; 32], &[0u8; 32], &stamp())
+        );
         assert_ne!(
             base,
             heal_provenance(
@@ -767,11 +886,47 @@ mod tests {
                 2,
                 std::slice::from_ref(&stroke),
                 &[0u8; 32],
-                &[0u8; 32]
+                &[0u8; 32],
+                &stamp()
             )
         );
-        assert_ne!(base, heal_provenance(0.5, 2, &[], &[1u8; 32], &[0u8; 32]));
-        assert_ne!(base, heal_provenance(0.5, 2, &[], &[0u8; 32], &[1u8; 32]));
+        assert_ne!(
+            base,
+            heal_provenance(0.5, 2, &[], &[1u8; 32], &[0u8; 32], &stamp())
+        );
+        assert_ne!(
+            base,
+            heal_provenance(0.5, 2, &[], &[0u8; 32], &[1u8; 32], &stamp())
+        );
+        let other_stamp = SourceStamp {
+            size: stamp().size + 1,
+            mtime_nanos: stamp().mtime_nanos,
+        };
+        assert_ne!(
+            base,
+            heal_provenance(0.5, 2, &[], &[0u8; 32], &[0u8; 32], &other_stamp)
+        );
+    }
+
+    #[test]
+    fn old_magic_heal_purges() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.heal");
+        let original = noisy16(16, 16);
+        let healed = original.clone();
+        let mask = vec![false; 256];
+        let prov = heal_provenance(0.5, 2, &[], &[3u8; 32], &[4u8; 32], &stamp());
+        write_heal(&p, &original, &healed, &mask, &prov).unwrap();
+
+        // Patch the magic to the pre-stamp value -- a heal file written
+        // before the stamp was folded into provenance must not be reused;
+        // it should purge on first read, not linger unmatched forever.
+        let mut bytes = std::fs::read(&p).unwrap();
+        bytes[0..8].copy_from_slice(b"UNDHEAL1");
+        std::fs::write(&p, &bytes).unwrap();
+
+        assert!(read_heal(&p, &original, &prov).is_none());
+        assert!(!p.exists(), "old magic heal file is deleted on sight");
     }
 
     #[test]
@@ -781,7 +936,7 @@ mod tests {
         let original = noisy16(16, 16);
         let healed = original.clone();
         let mask = vec![false; 256];
-        let prov = heal_provenance(0.5, 2, &[], &[3u8; 32], &[4u8; 32]);
+        let prov = heal_provenance(0.5, 2, &[], &[3u8; 32], &[4u8; 32], &stamp());
         write_heal(&p, &original, &healed, &mask, &prov).unwrap();
 
         // Header layout: magic(8) version(4) width(4) height(4) channels(1)
@@ -809,7 +964,7 @@ mod tests {
         let healed = original.clone();
         let mut mask = vec![false; 256];
         mask[0] = true; // one masked pixel -> expects 1 * 3 * 2 = 6 bytes of values
-        let prov = heal_provenance(0.5, 2, &[], &[3u8; 32], &[4u8; 32]);
+        let prov = heal_provenance(0.5, 2, &[], &[3u8; 32], &[4u8; 32], &stamp());
         write_heal(&p, &original, &healed, &mask, &prov).unwrap();
 
         // Replace the values section with a zstd frame that decompresses to
