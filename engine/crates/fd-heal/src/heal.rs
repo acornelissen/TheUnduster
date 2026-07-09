@@ -65,11 +65,18 @@ fn inpaint_defect(
     let cy0 = (defect.bbox.y0 as usize).saturating_sub(pad);
     let cx1 = (defect.bbox.x1 as usize + pad).min(width);
     let cy1 = (defect.bbox.y1 as usize + pad).min(height);
-    // round crop dims down to a multiple of 8 (>= 8), extending toward origin if needed
+    // Round the crop span UP to a multiple of 8 so the crop contains the
+    // padded bbox whenever the image allows it (rounding DOWN shipped a
+    // field panic: an edge-hugging defect stuck out past the shrunken crop
+    // and the write-back below indexed beyond the crop buffer). Capped at
+    // the largest multiple of 8 that fits the image; when even that cannot
+    // cover the defect (a full-span defect on a non-multiple-of-8 image),
+    // the write-back's bounds guard degrades gracefully instead.
     let round8 = |a: usize, b: usize, limit: usize| -> (usize, usize) {
         let mut lo = a;
         let mut hi = b;
-        let dim = ((hi - lo).max(8) / 8) * 8;
+        let wanted = (hi - lo).max(8).div_ceil(8) * 8;
+        let dim = wanted.min(((limit / 8) * 8).max(8.min(limit)));
         if lo + dim <= limit {
             hi = lo + dim;
         } else {
@@ -105,12 +112,20 @@ fn inpaint_defect(
         }
     }
     let filled = inpainter.inpaint(&crop, &crop_mask, cw, chh)?;
-    // Write filled values back into working planes at THIS defect's pixels only.
+    // Write filled values back into working planes at THIS defect's pixels
+    // only. Pixels the crop could not cover (a full-span defect on an image
+    // whose dimension is not a multiple of 8) stay untouched: an unhealed
+    // sliver at the frame edge beats a panic or a wrapped read from the
+    // wrong crop row.
     for &(px, py) in &defect.pixels {
-        let (lx, ly) = (px as usize - cx0, py as usize - cy0);
+        let (px, py) = (px as usize, py as usize);
+        if px < cx0 || px >= cx1 || py < cy0 || py >= cy1 {
+            continue;
+        }
+        let (lx, ly) = (px - cx0, py - cy0);
         for (c, plane) in planes.iter_mut().enumerate() {
             let src_c = if c < 3 { c } else { 0 };
-            plane[py as usize * width + px as usize] = filled[src_c][ly * cw + lx];
+            plane[py * width + px] = filled[src_c][ly * cw + lx];
         }
     }
     Ok(())

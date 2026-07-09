@@ -121,3 +121,56 @@ fn healed_region_carries_grain() {
         var.sqrt()
     );
 }
+
+/// Regression: a large (inpaint-tier) defect hugging the image edge, on an
+/// image whose dimensions are not multiples of 8. The inpaint crop is
+/// rounded to a multiple of 8; if that rounding shrinks the crop below the
+/// defect's extent, the write-back indexed past the crop buffer and
+/// panicked (field report: brush stroke painted to the frame edge).
+#[test]
+fn edge_hugging_inpaint_defect_does_not_panic() {
+    let mut img = noisy_image(100, 50);
+    let original = img.clone();
+    let mut mask = vec![false; 100 * 50];
+    // 40x30 block hugging the bottom-right corner: bbox max_dim 40 >
+    // TINY_MAX_DIM, and the multiple-of-8 crop rounding cuts both the right
+    // and bottom defect extents, so unguarded write-back indexes past the
+    // crop buffer (not merely wrapping within it).
+    for y in 20..50 {
+        for x in 60..100 {
+            mask[y * 100 + x] = true;
+        }
+    }
+    let mut inpainter = Inpainter::load(&fixtures().join("tiny-inpaint.onnx"), fd_infer::Ep::Cpu)
+        .expect("fixture inpainter loads");
+    let report = heal(&mut img, &mask, Some(&mut inpainter)).expect("heal succeeds");
+    assert_eq!(report.inpainted, 1);
+    // bit-exactness outside the mask still holds
+    let (PixelData::U16(a), PixelData::U16(b)) = (&original.data, &img.data) else {
+        panic!("depth changed");
+    };
+    for i in 0..100 * 50 {
+        if !mask[i] {
+            for c in 0..3 {
+                assert_eq!(a[i * 3 + c], b[i * 3 + c], "pixel {i} changed outside mask");
+            }
+        }
+    }
+}
+
+/// Harder variant: the defect spans the full image width, so no multiple-of-8
+/// crop can contain it on a 100-wide image. The heal must degrade gracefully
+/// (edge slivers may stay unhealed) rather than panic.
+#[test]
+fn full_width_defect_does_not_panic() {
+    let mut img = noisy_image(100, 50);
+    let mut mask = vec![false; 100 * 50];
+    for y in 40..50 {
+        for x in 0..100 {
+            mask[y * 100 + x] = true;
+        }
+    }
+    let mut inpainter = Inpainter::load(&fixtures().join("tiny-inpaint.onnx"), fd_infer::Ep::Cpu)
+        .expect("fixture inpainter loads");
+    heal(&mut img, &mask, Some(&mut inpainter)).expect("heal succeeds");
+}
