@@ -358,9 +358,13 @@ fn components(
 fn open_roll(
     roll: State<'_, roll::RollState>,
     images: State<'_, Mutex<Images>>,
+    queue: State<'_, jobs::JobQueue>,
     dir: String,
 ) -> Result<roll::RollInfo, String> {
     let (info, stale_ids) = roll.open(std::path::Path::new(&dir))?;
+    // Queued jobs referenced the replaced roll's indices; drop them. An
+    // in-flight worker (if any) exits on its own via the generation check.
+    queue.clear()?;
     if !stale_ids.is_empty() {
         let mut images = images.lock().map_err(|e| e.to_string())?;
         for id in stale_ids {
@@ -379,8 +383,12 @@ fn open_roll(
 fn close_roll(
     roll: State<'_, roll::RollState>,
     images: State<'_, Mutex<Images>>,
+    queue: State<'_, jobs::JobQueue>,
 ) -> Result<(), String> {
     let stale_ids = roll.close()?;
+    // Queued jobs referenced the closed roll's indices; drop them. An
+    // in-flight worker (if any) exits on its own via the generation check.
+    queue.clear()?;
     if !stale_ids.is_empty() {
         let mut images = images.lock().map_err(|e| e.to_string())?;
         for id in stale_ids {
@@ -415,9 +423,13 @@ fn pixel_budget_bytes() -> usize {
 fn evict_over_budget(
     images: &State<'_, Mutex<Images>>,
     roll: &State<'_, roll::RollState>,
+    queue: &State<'_, jobs::JobQueue>,
     current: usize,
 ) -> Result<(), String> {
     let candidates = roll.eviction_candidates(current)?; // LRU first
+                                                         // The frame an active background job is operating on must not be pulled
+                                                         // out from under it, wherever it sits in the LRU order.
+    let pinned = queue.pinned()?;
     let mut sized: Vec<(usize, u64, usize)> = Vec::new();
     let mut total: usize = 0;
     {
@@ -435,6 +447,9 @@ fn evict_over_budget(
     for (idx, id, bytes) in sized {
         if total <= budget {
             break;
+        }
+        if Some(id) == pinned {
+            continue;
         }
         let mut images = images.lock().map_err(|e| e.to_string())?;
         images.close(id);
@@ -566,7 +581,8 @@ async fn activate_frame(
     }
 
     roll.touch(index)?;
-    evict_over_budget(&images, &roll, index)?;
+    let queue = app.state::<jobs::JobQueue>();
+    evict_over_budget(&images, &roll, &queue, index)?;
 
     let _ = app.emit(
         "app-progress",
@@ -1079,6 +1095,379 @@ fn export_approved(
     Ok(())
 }
 
+/// One background job's identity; the payload for the `job-queued`,
+/// `job-started`, and `job-done` events.
+#[derive(serde::Serialize, Clone)]
+struct JobEvent {
+    index: usize,
+    kind: jobs::JobKind,
+}
+
+#[derive(serde::Serialize, Clone)]
+struct JobError {
+    index: usize,
+    kind: jobs::JobKind,
+    message: String,
+}
+
+/// Clears the job-worker running flag when dropped, including on unwind, so
+/// a panic anywhere in the drain task can never wedge the queue permanently.
+/// Mirrors `ScanFlagGuard`.
+struct JobFlagGuard(tauri::AppHandle);
+
+impl Drop for JobFlagGuard {
+    fn drop(&mut self) {
+        self.0.state::<jobs::JobQueue>().clear_running();
+    }
+}
+
+/// Clears the job queue's eviction pin when dropped, so an early `?` in a
+/// job body can never leave a stale pin shielding a long-gone frame from
+/// eviction.
+struct PinGuard(tauri::AppHandle);
+
+impl Drop for PinGuard {
+    fn drop(&mut self) {
+        let _ = self.0.state::<jobs::JobQueue>().pin(None);
+    }
+}
+
+/// Runs the fallible body of one background job. Split out so the worker
+/// loop's done/error emission is a single match, mirroring the export
+/// queue's per-frame outcome shape.
+async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Result<(), String> {
+    let index = job.index;
+    let (path, file_name, threshold, strokes) =
+        app.state::<roll::RollState>().export_frame_meta(index)?;
+    let image_id = app.state::<roll::RollState>().image_id(index)?;
+    let _ = app.emit(
+        "job-started",
+        JobEvent {
+            index,
+            kind: job.kind,
+        },
+    );
+    // Cache paths are keyed by the frame's own roll directory, mirroring
+    // export_approved's transient path.
+    let roll_dir = path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""))
+        .to_path_buf();
+
+    match job.kind {
+        jobs::JobKind::Detect => {
+            let images_state = app.state::<Mutex<Images>>();
+            // Pin before reading registry Arcs so eviction cannot pull the
+            // entry out from under the job; the guard unpins on every exit.
+            let mut _pin_guard = None;
+            let resident = match image_id {
+                Some(id) => {
+                    app.state::<jobs::JobQueue>().pin(Some(id))?;
+                    _pin_guard = Some(PinGuard(app.clone()));
+                    let images = images_state.lock().map_err(|e| e.to_string())?;
+                    match images.image(id) {
+                        Some(img) => {
+                            if images.has_probs(id) {
+                                // Resident and already detected: nothing to do.
+                                return Ok(());
+                            }
+                            let level_dims = images
+                                .level_dims(id)
+                                .ok_or_else(|| format!("no image {id}"))?;
+                            Some((id, img, level_dims))
+                        }
+                        None => None, // stale id: fall through to a fresh decode
+                    }
+                }
+                None => None,
+            };
+            let (resident_id, image, level_dims) = match resident {
+                Some((id, img, dims)) => (Some(id), img, Some(dims)),
+                None => {
+                    let path = path.clone();
+                    let img =
+                        tauri::async_runtime::spawn_blocking(move || Images::decode_stage(&path))
+                            .await
+                            .map_err(|e| e.to_string())??;
+                    (None, img, None)
+                }
+            };
+            let detector_state = app.state::<detect::DetectorState>();
+            let detector = detector_state.inner().clone();
+            let detector_hash = detector_state.hash();
+            let cache_path = roll::probs_cache_path(&roll_dir, &file_name);
+            let (probs, pyramid, bboxes) = tauri::async_runtime::spawn_blocking(move || {
+                // A valid cache entry for the current detector replaces the
+                // (seconds-long) model run: a detect job means detection is
+                // wanted, not necessarily recomputed.
+                let cached = detector_hash.as_ref().and_then(|hash| {
+                    cache::read_probs(&cache_path, image.width, image.height, hash)
+                });
+                let (probs, fresh) = match cached {
+                    Some(probs) => (probs, false),
+                    None => (detector.detect(&image)?, true),
+                };
+                if fresh {
+                    if let Some(hash) = &detector_hash {
+                        if let Err(_e) =
+                            cache::write_probs(&cache_path, &probs, image.width, image.height, hash)
+                        {
+                            #[cfg(debug_assertions)]
+                            eprintln!("[jobs] frame {index} probs cache write failed: {_e}");
+                        }
+                    }
+                }
+                let bboxes = images::components_from_probs(
+                    &probs,
+                    image.width,
+                    image.height,
+                    SCAN_THRESHOLD,
+                );
+                let pyramid = level_dims.map(|dims| build_prob_pyramid(&probs, &dims));
+                Ok::<_, String>((probs, pyramid, bboxes))
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            if let (Some(id), Some(pyramid)) = (resident_id, pyramid) {
+                let mut images = images_state.lock().map_err(|e| e.to_string())?;
+                // A frame closed mid-job is benign for a background detect:
+                // the sidecar result below still lands.
+                images.set_probs_built(id, probs, pyramid);
+            }
+            let count = bboxes.len();
+            app.state::<roll::RollState>().record_scan_result(
+                generation,
+                index,
+                Some(count),
+                Some(bboxes.clone()),
+            )?;
+            // The existing scan event shape, so the filmstrip count/rings
+            // update exactly like a roll scan.
+            let _ = app.emit(
+                "roll-progress",
+                RollProgress {
+                    index,
+                    count: Some(count),
+                    bboxes: Some(bboxes),
+                },
+            );
+            Ok(())
+        }
+        jobs::JobKind::Heal => {
+            if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+                return Err(format!("threshold {threshold} out of range"));
+            }
+            masks::validate_strokes(&strokes)?;
+            let images_state = app.state::<Mutex<Images>>();
+            // Pin before reading registry Arcs; see the detect arm.
+            let mut _pin_guard = None;
+            let (resident_id, registry_image, registry_mask) = match image_id {
+                Some(id) => {
+                    app.state::<jobs::JobQueue>().pin(Some(id))?;
+                    _pin_guard = Some(PinGuard(app.clone()));
+                    let images = images_state.lock().map_err(|e| e.to_string())?;
+                    match images.image(id) {
+                        Some(img) => {
+                            // None until a detection is resident; the closure
+                            // below then falls back to the probs cache or a
+                            // fresh model run.
+                            let mask = images.threshold_mask(id, threshold);
+                            (Some(id), Some(img), mask)
+                        }
+                        None => (None, None, None), // stale id: fresh decode
+                    }
+                }
+                None => (None, None, None),
+            };
+            let image = match registry_image {
+                Some(img) => img,
+                None => {
+                    let path = path.clone();
+                    tauri::async_runtime::spawn_blocking(move || Images::decode_stage(&path))
+                        .await
+                        .map_err(|e| e.to_string())??
+                }
+            };
+            let detector_state = app.state::<detect::DetectorState>();
+            let detector = detector_state.inner().clone();
+            // The Option distinguishes "no detector loaded" (no cache IO) from
+            // the zeros sentinel run_heal folds into provenance.
+            let detector_hash_opt = detector_state.hash();
+            let detector_hash = detector_hash_opt.unwrap_or([0u8; 32]);
+            let inpainter = app.state::<detect::InpainterState>().inner().clone();
+            let heal_cache_path = roll::heal_cache_path(&roll_dir, &file_name);
+            let probs_cache_path = roll::probs_cache_path(&roll_dir, &file_name);
+            let app_for_progress = app.clone();
+            let (healed, pyramid, mask) = tauri::async_runtime::spawn_blocking(move || {
+                // Everything provenance-dependent happens inside the one
+                // with_inpainter_hashed lock, exactly as in run_heal and the
+                // export queue's transient path.
+                inpainter.with_inpainter_hashed(|pair| {
+                    let inpainter_hash = pair.as_ref().map(|(_, h)| *h).unwrap_or([0u8; 32]);
+                    let provenance = cache::heal_provenance(
+                        threshold,
+                        HEAL_DILATE_RADIUS,
+                        &strokes,
+                        &detector_hash,
+                        &inpainter_hash,
+                    );
+
+                    if let Some((healed, mask)) =
+                        cache::read_heal(&heal_cache_path, &image, &provenance)
+                    {
+                        let healed = std::sync::Arc::new(healed);
+                        // The pyramid only serves set_healed; skip the build
+                        // when there is no registry entry to feed.
+                        let pyramid = resident_id.map(|_| fd_tiles::Pyramid::build(&healed));
+                        return Ok::<_, String>((healed, pyramid, std::sync::Arc::new(mask)));
+                    }
+
+                    // Probs mask: the registry's live detection first, then
+                    // the probs cache, then a fresh model run (cached for
+                    // next time) -- only after the heal cache misses, so a
+                    // cached heal never pays for a detect.
+                    let raw: Vec<bool> = match registry_mask {
+                        Some(m) => m,
+                        None => {
+                            let cached = detector_hash_opt.as_ref().and_then(|hash| {
+                                cache::read_probs(
+                                    &probs_cache_path,
+                                    image.width,
+                                    image.height,
+                                    hash,
+                                )
+                            });
+                            let probs = match cached {
+                                Some(p) => p,
+                                None => {
+                                    let probs = detector.detect(&image)?;
+                                    if let Some(hash) = &detector_hash_opt {
+                                        if let Err(_e) = cache::write_probs(
+                                            &probs_cache_path,
+                                            &probs,
+                                            image.width,
+                                            image.height,
+                                            hash,
+                                        ) {
+                                            #[cfg(debug_assertions)]
+                                            eprintln!(
+                                                "[jobs] frame {index} probs cache write failed: {_e}"
+                                            );
+                                        }
+                                    }
+                                    probs
+                                }
+                            };
+                            probs.iter().map(|&p| p > threshold).collect()
+                        }
+                    };
+
+                    let mask = masks::compose_heal_mask(
+                        raw,
+                        image.width,
+                        image.height,
+                        HEAL_DILATE_RADIUS,
+                        &strokes,
+                    );
+                    let mut copy = (*image).clone(); // the original Arc stays pristine
+                    let inp = pair.map(|(inp, _)| inp);
+                    fd_heal::heal_with_progress(&mut copy, &mask, inp, &mut |done, total| {
+                        // Per-defect progress only for a resident frame: the
+                        // display contract keys heal-progress off a live
+                        // image id (the current-frame status line).
+                        if let Some(id) = resident_id {
+                            let _ = app_for_progress
+                                .emit("heal-progress", HealProgress { id, done, total });
+                        }
+                    })
+                    .map_err(|e| e.to_string())?;
+                    if let Err(_e) =
+                        cache::write_heal(&heal_cache_path, &image, &copy, &mask, &provenance)
+                    {
+                        #[cfg(debug_assertions)]
+                        eprintln!("[cache] heal write failed for frame {index} ({file_name}): {_e}");
+                    }
+                    let healed = std::sync::Arc::new(copy);
+                    let pyramid = resident_id.map(|_| fd_tiles::Pyramid::build(&healed));
+                    Ok((healed, pyramid, std::sync::Arc::new(mask)))
+                })?
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            if let (Some(id), Some(pyramid)) = (resident_id, pyramid) {
+                let mut images = images_state.lock().map_err(|e| e.to_string())?;
+                // A frame closed mid-heal is benign here: the heal cache
+                // already holds the result for the next activation or export.
+                images.set_healed(id, healed, pyramid, mask);
+            }
+            Ok(())
+        }
+    }
+}
+
+#[tauri::command]
+fn enqueue_job(
+    app: tauri::AppHandle,
+    roll: State<'_, roll::RollState>,
+    queue: State<'_, jobs::JobQueue>,
+    kind: jobs::JobKind,
+    index: usize,
+    front: bool,
+) -> Result<(), String> {
+    // Bounds/roll validation before anything lands in the queue: errors when
+    // no roll is open or the index is out of range.
+    roll.image_id(index)?;
+    queue.enqueue(jobs::Job { kind, index }, front)?;
+    let _ = app.emit("job-queued", JobEvent { index, kind });
+    if queue
+        .running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(()); // a worker is already draining; it will reach this job
+    }
+    // The flag is set; any fallible setup from here must clear it before
+    // returning (the scan_roll discipline). Snapshot the generation this
+    // drain runs against -- see scan_roll's identical comment.
+    let generation = roll.generation();
+    let app_for_task = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _job_flag_guard = JobFlagGuard(app_for_task.clone());
+        // Drains until empty; a poisoned queue lock also ends the drain.
+        while let Ok(Some(job)) = app_for_task.state::<jobs::JobQueue>().pop() {
+            // Enforcement point: see scan_roll's identical check. The roll
+            // open/close paths also cleared the queue, so a job popped past
+            // a generation bump belongs to a torn-down roll; drop it.
+            if app_for_task.state::<roll::RollState>().generation() != generation {
+                break;
+            }
+            match run_job(&app_for_task, generation, job).await {
+                Ok(()) => {
+                    let _ = app_for_task.emit(
+                        "job-done",
+                        JobEvent {
+                            index: job.index,
+                            kind: job.kind,
+                        },
+                    );
+                }
+                Err(message) => {
+                    let _ = app_for_task.emit(
+                        "job-error",
+                        JobError {
+                            index: job.index,
+                            kind: job.kind,
+                            message,
+                        },
+                    );
+                }
+            }
+        }
+        let _ = app_for_task.emit("queue-idle", ());
+    });
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1087,6 +1476,7 @@ pub fn run() {
         .manage(detect::DetectorState::default())
         .manage(detect::InpainterState::default())
         .manage(roll::RollState::default())
+        .manage(jobs::JobQueue::default())
         .manage(models::ModelDownloadState::default())
         .invoke_handler(tauri::generate_handler![
             log_js_error,
@@ -1106,6 +1496,7 @@ pub fn run() {
             export_frame,
             scan_roll,
             export_approved,
+            enqueue_job,
             models::inpainter_status,
             models::download_inpaint_model
         ])

@@ -288,6 +288,14 @@ impl Images {
         self.entries.get(&id).is_some_and(|e| e.healed.is_some())
     }
 
+    /// True once a detection has stored probabilities for this image. The
+    /// job worker's detect-skip check: answering "already detected?" through
+    /// `threshold_mask` would clone a native-resolution Vec<bool> just to
+    /// discard it.
+    pub fn has_probs(&self, id: u64) -> bool {
+        self.entries.get(&id).is_some_and(|e| e.probs.is_some())
+    }
+
     /// (original, healed, mask) for export verification and encoding.
     // Exercised by tests; the export path that consumes this wires up in a
     // later task.

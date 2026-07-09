@@ -23,12 +23,10 @@ pub struct Job {
 #[derive(Default)]
 pub struct JobQueue {
     queue: Mutex<VecDeque<Job>>,
-    #[allow(dead_code)]
     pub running: AtomicBool,
     pinned: Mutex<Option<u64>>,
 }
 
-#[allow(dead_code)]
 impl JobQueue {
     /// Enqueues a job, with optional front-priority insertion. Returns true if
     /// the job was newly enqueued, false if an equal job was already queued
@@ -73,12 +71,16 @@ impl JobQueue {
     }
 
     /// Returns the number of jobs currently in the queue.
+    // Exercised by tests; no production caller yet.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn len(&self) -> Result<usize, String> {
         let queue = self.queue.lock().map_err(|e| e.to_string())?;
         Ok(queue.len())
     }
 
     /// Returns true if the queue is empty.
+    // Exercised by tests; no production caller yet.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_empty(&self) -> Result<bool, String> {
         let queue = self.queue.lock().map_err(|e| e.to_string())?;
         Ok(queue.is_empty())
