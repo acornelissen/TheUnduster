@@ -110,6 +110,16 @@ impl JobQueue {
     pub fn clear_running(&self) {
         self.running.store(false, Ordering::SeqCst);
     }
+
+    /// Attempts to claim the running flag (false -> true). Returns true on
+    /// success. Shared by `enqueue_job`'s initial claim and the worker's
+    /// clear-then-recheck exit handshake, so both sites use the identical
+    /// compare_exchange ordering.
+    pub fn try_start(&self) -> bool {
+        self.running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
 }
 
 #[cfg(test)]
@@ -163,6 +173,15 @@ mod tests {
         q.enqueue(job(JobKind::Heal, 1), false).unwrap();
         assert_eq!(q.clear().unwrap(), 2);
         assert!(q.is_empty().unwrap());
+    }
+
+    #[test]
+    fn try_start_wins_once_until_cleared() {
+        let q = JobQueue::default();
+        assert!(q.try_start()); // false -> true: wins
+        assert!(!q.try_start()); // already true: loses
+        q.clear_running();
+        assert!(q.try_start()); // false again: wins
     }
 
     #[test]

@@ -772,194 +772,265 @@ fn scan_roll(
     let generation = roll.generation();
     tauri::async_runtime::spawn(async move {
         let _scan_flag_guard = ScanFlagGuard(app_for_task.clone());
-        // Two passes over the same index snapshot: thumbnails first (cheap,
-        // seconds each) so the filmstrip fills in immediately, then
-        // detections (slow, ~9s each) trickle in behind them. A frame whose
-        // decode fails in pass 1 has no pixels to detect on, so its index is
-        // recorded here and pass 2 skips it outright.
-        let mut failed_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        // Bounded re-arm loop, closing the lost-wakeup window between the
+        // final frame of a drain and the scanning flag actually clearing: if
+        // `open_roll` swaps in roll B while roll A's scan is still draining,
+        // B's own `scan_roll` call sees `scanning == true`, returns its
+        // idempotent Ok, and never scans -- unless this task notices the new
+        // roll's frames after it finishes A's and re-arms itself. Capped at
+        // 3 re-arms against a pathological caller that keeps swapping rolls
+        // faster than a single re-arm can drain; each iteration still
+        // re-resolves generation, indices, AND roll_dir fresh, since a
+        // re-arm can hand this task an entirely different roll.
+        const MAX_REARMS: u32 = 3;
+        let mut generation = generation;
+        let mut roll_dir = roll_dir;
+        let mut indices = indices;
+        let mut rearms = 0u32;
+        'rearm: loop {
+            // Two passes over the same index snapshot: thumbnails first (cheap,
+            // seconds each) so the filmstrip fills in immediately, then
+            // detections (slow, ~9s each) trickle in behind them. A frame whose
+            // decode fails in pass 1 has no pixels to detect on, so its index is
+            // recorded here and pass 2 skips it outright.
+            let mut failed_indices: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
 
-        // Pass 1: thumbnails.
-        for &index in &indices {
-            let roll_state = app_for_task.state::<roll::RollState>();
-            // Enforcement point: a roll swap/close bumped the generation
-            // counter since this task spawned, so `roll_dir`/`indices`
-            // (captured once, above) no longer describe the roll that's
-            // open now. Stop rather than writing this frame's thumbnail
-            // into the old roll's directory or its result into the new
-            // roll's sidecar. `ScanFlagGuard` clears the scanning flag on
-            // the way out, so a fresh scan of the new roll can start.
-            if roll_state.generation() != generation {
-                break;
-            }
-            let path = match roll_state.frame_path(index) {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = roll_state.record_scan_result(generation, index, None, None);
-                    let _ =
-                        app_for_task.emit("roll-frame-error", RollFrameError { index, message: e });
-                    failed_indices.insert(index);
+            // Pass 1: thumbnails.
+            for &index in &indices {
+                let roll_state = app_for_task.state::<roll::RollState>();
+                // Enforcement point: a roll swap/close bumped the generation
+                // counter since this task spawned, so `roll_dir`/`indices`
+                // (captured once, above) no longer describe the roll that's
+                // open now. Stop rather than writing this frame's thumbnail
+                // into the old roll's directory or its result into the new
+                // roll's sidecar. `ScanFlagGuard` clears the scanning flag on
+                // the way out, so a fresh scan of the new roll can start.
+                if roll_state.generation() != generation {
+                    break;
+                }
+                let path = match roll_state.frame_path(index) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = roll_state.record_scan_result(generation, index, None, None);
+                        let _ = app_for_task
+                            .emit("roll-frame-error", RollFrameError { index, message: e });
+                        failed_indices.insert(index);
+                        continue;
+                    }
+                };
+                // Thumbnails are keyed by file name, not index (see
+                // `roll::thumb_path`), so indices that shift across sessions
+                // never pair a frame with another image's stale thumbnail.
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let thumb_path = roll::thumb_path(&roll_dir, &file_name);
+                if thumb_path.exists() {
+                    // Backfill run: this frame already has a thumbnail from an
+                    // earlier scan, so there's nothing to decode here.
                     continue;
                 }
-            };
-            // Thumbnails are keyed by file name, not index (see
-            // `roll::thumb_path`), so indices that shift across sessions
-            // never pair a frame with another image's stale thumbnail.
-            let file_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default()
-                .to_string();
-            let thumb_path = roll::thumb_path(&roll_dir, &file_name);
-            if thumb_path.exists() {
-                // Backfill run: this frame already has a thumbnail from an
-                // earlier scan, so there's nothing to decode here.
-                continue;
-            }
-            #[cfg(debug_assertions)]
-            eprintln!("[queue] frame {index} thumbnail");
-            let staged = tauri::async_runtime::spawn_blocking(move || {
-                let prepared = images::Images::prepare(&path)?;
-                let coarsest = prepared
-                    .pyramid
-                    .levels
-                    .last()
-                    .expect("pyramid always has at least one level");
-                let thumb = roll::write_thumbnail(
-                    &coarsest.rgba,
-                    coarsest.width,
-                    coarsest.height,
-                    &thumb_path,
-                );
-                Ok::<_, String>(thumb)
-                // `prepared` (pyramid + decoded pixels) drops here; pass 2
-                // decodes its own copy so at most one frame's pixels are
-                // resident at a time across the whole scan.
-            })
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|r| r);
-
-            match staged {
-                Ok(Ok(())) => {
-                    let _ = app_for_task.emit("roll-thumb", RollThumb { index });
-                }
-                Ok(Err(e)) => {
-                    // Decode succeeded but the thumbnail write failed: the
-                    // frame still has pixels, so it still detects in pass 2.
-                    let _ = app_for_task.emit(
-                        "roll-frame-error",
-                        RollFrameError {
-                            index,
-                            message: format!("thumbnail: {e}"),
-                        },
+                #[cfg(debug_assertions)]
+                eprintln!("[queue] frame {index} thumbnail");
+                let staged = tauri::async_runtime::spawn_blocking(move || {
+                    let prepared = images::Images::prepare(&path)?;
+                    let coarsest = prepared
+                        .pyramid
+                        .levels
+                        .last()
+                        .expect("pyramid always has at least one level");
+                    let thumb = roll::write_thumbnail(
+                        &coarsest.rgba,
+                        coarsest.width,
+                        coarsest.height,
+                        &thumb_path,
                     );
-                }
-                Err(message) => {
-                    // Decode itself failed: no pixels, so pass 2 can't
-                    // detect on this frame either.
-                    let _ = roll_state.record_scan_result(generation, index, None, None);
-                    let _ =
-                        app_for_task.emit("roll-frame-error", RollFrameError { index, message });
-                    failed_indices.insert(index);
-                }
-            }
-        }
+                    Ok::<_, String>(thumb)
+                    // `prepared` (pyramid + decoded pixels) drops here; pass 2
+                    // decodes its own copy so at most one frame's pixels are
+                    // resident at a time across the whole scan.
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r);
 
-        // Pass 2: detections.
-        for &index in &indices {
-            if failed_indices.contains(&index) {
-                continue;
+                match staged {
+                    Ok(Ok(())) => {
+                        let _ = app_for_task.emit("roll-thumb", RollThumb { index });
+                    }
+                    Ok(Err(e)) => {
+                        // Decode succeeded but the thumbnail write failed: the
+                        // frame still has pixels, so it still detects in pass 2.
+                        let _ = app_for_task.emit(
+                            "roll-frame-error",
+                            RollFrameError {
+                                index,
+                                message: format!("thumbnail: {e}"),
+                            },
+                        );
+                    }
+                    Err(message) => {
+                        // Decode itself failed: no pixels, so pass 2 can't
+                        // detect on this frame either.
+                        let _ = roll_state.record_scan_result(generation, index, None, None);
+                        let _ = app_for_task
+                            .emit("roll-frame-error", RollFrameError { index, message });
+                        failed_indices.insert(index);
+                    }
+                }
             }
-            let roll_state = app_for_task.state::<roll::RollState>();
-            if roll_state.generation() != generation {
-                break;
-            }
-            let path = match roll_state.frame_path(index) {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = roll_state.record_scan_result(generation, index, None, None);
-                    let _ =
-                        app_for_task.emit("roll-frame-error", RollFrameError { index, message: e });
+
+            // Pass 2: detections.
+            for &index in &indices {
+                if failed_indices.contains(&index) {
                     continue;
                 }
-            };
-            let file_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default()
-                .to_string();
-            #[cfg(debug_assertions)]
-            eprintln!("[queue] frame {index} detect starting");
-            // No pyramid here (ff90566's export-queue shape): this pass only
-            // ever reads the decoded pixels for detection, so building the
-            // multi-resolution display pyramid would just waste memory/CPU.
-            let detector = detector.clone();
-            let cache_path = roll::probs_cache_path(&roll_dir, &file_name);
-            let outcome = tauri::async_runtime::spawn_blocking(move || {
-                let image = images::Images::decode_stage(&path)?;
-                // detect_hashed pairs the output with the hash of the model
-                // that produced it under one lock -- see its doc comment --
-                // so the cache write below can never record a different
-                // model's hash.
-                let (probs, hash) = detector.detect_hashed(&image)?;
-                let bboxes = images::components_from_probs(
-                    &probs,
-                    image.width,
-                    image.height,
-                    SCAN_THRESHOLD,
-                );
-                // Cache write is sequential with detection here (milliseconds
-                // against a ~9s detect); failures eprintln in debug only,
-                // never fail the scan. A source stat failure skips the write
-                // outright (stamp_or_skip's contract).
-                if let Some(stamp) = stamp_or_skip(&path) {
-                    if let Err(_e) = cache::write_probs(
-                        &cache_path,
+                let roll_state = app_for_task.state::<roll::RollState>();
+                if roll_state.generation() != generation {
+                    break;
+                }
+                let path = match roll_state.frame_path(index) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = roll_state.record_scan_result(generation, index, None, None);
+                        let _ = app_for_task
+                            .emit("roll-frame-error", RollFrameError { index, message: e });
+                        continue;
+                    }
+                };
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                #[cfg(debug_assertions)]
+                eprintln!("[queue] frame {index} detect starting");
+                // No pyramid here (ff90566's export-queue shape): this pass only
+                // ever reads the decoded pixels for detection, so building the
+                // multi-resolution display pyramid would just waste memory/CPU.
+                let detector = detector.clone();
+                let cache_path = roll::probs_cache_path(&roll_dir, &file_name);
+                let outcome = tauri::async_runtime::spawn_blocking(move || {
+                    let image = images::Images::decode_stage(&path)?;
+                    // detect_hashed pairs the output with the hash of the model
+                    // that produced it under one lock -- see its doc comment --
+                    // so the cache write below can never record a different
+                    // model's hash.
+                    let (probs, hash) = detector.detect_hashed(&image)?;
+                    let bboxes = images::components_from_probs(
                         &probs,
                         image.width,
                         image.height,
-                        &hash,
-                        &stamp,
-                    ) {
-                        #[cfg(debug_assertions)]
-                        eprintln!("[queue] frame {index} probs cache write failed: {_e}");
+                        SCAN_THRESHOLD,
+                    );
+                    // Cache write is sequential with detection here (milliseconds
+                    // against a ~9s detect); failures eprintln in debug only,
+                    // never fail the scan. A source stat failure skips the write
+                    // outright (stamp_or_skip's contract).
+                    if let Some(stamp) = stamp_or_skip(&path) {
+                        if let Err(_e) = cache::write_probs(
+                            &cache_path,
+                            &probs,
+                            image.width,
+                            image.height,
+                            &hash,
+                            &stamp,
+                        ) {
+                            #[cfg(debug_assertions)]
+                            eprintln!("[queue] frame {index} probs cache write failed: {_e}");
+                        }
+                    }
+                    Ok::<_, String>(bboxes)
+                    // `image` (the full-res pixels) drops here, before the task
+                    // moves to the next frame.
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r);
+
+                match outcome {
+                    Ok(bboxes) => {
+                        let count = bboxes.len();
+                        let _ = roll_state.record_scan_result(
+                            generation,
+                            index,
+                            Some(count),
+                            Some(bboxes.clone()),
+                        );
+                        let _ = app_for_task.emit(
+                            "roll-progress",
+                            RollProgress {
+                                index,
+                                count: Some(count),
+                                bboxes: Some(bboxes),
+                            },
+                        );
+                    }
+                    Err(message) => {
+                        let _ = roll_state.record_scan_result(generation, index, None, None);
+                        let _ = app_for_task
+                            .emit("roll-frame-error", RollFrameError { index, message });
                     }
                 }
-                Ok::<_, String>(bboxes)
-                // `image` (the full-res pixels) drops here, before the task
-                // moves to the next frame.
-            })
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|r| r);
-
-            match outcome {
-                Ok(bboxes) => {
-                    let count = bboxes.len();
-                    let _ = roll_state.record_scan_result(
-                        generation,
-                        index,
-                        Some(count),
-                        Some(bboxes.clone()),
-                    );
-                    let _ = app_for_task.emit(
-                        "roll-progress",
-                        RollProgress {
-                            index,
-                            count: Some(count),
-                            bboxes: Some(bboxes),
-                        },
-                    );
-                }
-                Err(message) => {
-                    let _ = roll_state.record_scan_result(generation, index, None, None);
-                    let _ =
-                        app_for_task.emit("roll-frame-error", RollFrameError { index, message });
-                }
             }
+            // roll-done fires once per drain iteration, not once per task. That
+            // matches the existing frontend contract (it sets scanDone = true on
+            // receipt) and is harmless to repeat on a re-arm: the second receipt
+            // is an idempotent no-op set, not a second "scan started" signal.
+            let _ = app_for_task.emit("roll-done", ());
+
+            // Clear-then-recheck handshake, mirroring the job worker's. Clear
+            // the flag before re-resolving frames_to_scan, so any open_roll that
+            // lands after this clear is guaranteed to observe scanning == false
+            // rather than finding the flag held and returning its idempotent Ok
+            // without scanning.
+            let roll_state = app_for_task.state::<roll::RollState>();
+            roll_state.clear_scanning();
+
+            if rearms >= MAX_REARMS {
+                #[cfg(debug_assertions)]
+                eprintln!("[scan] re-arm cap ({MAX_REARMS}) reached; not re-arming further");
+                break 'rearm;
+            }
+
+            // Re-resolve under the CURRENT generation -- not the one this
+            // iteration started with. If open_roll swapped in a different roll
+            // while the drain above was running, frames_to_scan() and dir() now
+            // describe that new roll, which is exactly the case this loop
+            // exists to catch: without it, the new roll's own scan_roll call
+            // would have seen scanning == true, returned Ok, and never scanned.
+            let next_generation = roll_state.generation();
+            let setup = roll_state
+                .dir()
+                .and_then(|dir| Ok((dir, roll_state.frames_to_scan()?)));
+            let (next_roll_dir, next_indices) = match setup {
+                Ok(v) => v,
+                Err(_) => break 'rearm, // no roll open (or lookup failed): nothing to re-arm for
+            };
+            if next_indices.is_empty() {
+                break 'rearm;
+            }
+
+            // Only one of this task's re-arm and a racing scan_roll's own
+            // compare_exchange may win the flag back. On loss, the racing call
+            // already spawned (or is about to spawn) its own task that will
+            // scan next_indices itself, so this task must not also proceed.
+            if roll_state
+                .scanning
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                break 'rearm;
+            }
+
+            generation = next_generation;
+            roll_dir = next_roll_dir;
+            indices = next_indices;
+            rearms += 1;
         }
-        let _ = app_for_task.emit("roll-done", ());
     });
     Ok(())
 }
@@ -995,6 +1066,14 @@ struct ExportFlagGuard(tauri::AppHandle);
 
 impl Drop for ExportFlagGuard {
     fn drop(&mut self) {
+        // Unlike scan_roll and the job worker, this clear gets no
+        // clear-then-recheck handshake: the accepted window here is the
+        // frontend's Export button being disabled for the whole export, so
+        // a second invoke can only race in after the button re-enables,
+        // which is after this clear has already happened and been observed.
+        // A racing second `export_approved` call in that narrow window
+        // reconverges on the first run's already-emitted events rather than
+        // losing a wakeup, so there is nothing here to close.
         self.0.state::<roll::RollState>().clear_exporting();
     }
 }
@@ -1658,11 +1737,7 @@ fn enqueue_job(
             generation,
         },
     );
-    if queue
-        .running
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    if !queue.try_start() {
         return Ok(()); // a worker is already draining; it will reach this job
     }
     // The flag is set; any fallible setup from here must clear it before
@@ -1676,50 +1751,105 @@ fn enqueue_job(
     let spawn_generation = generation;
     tauri::async_runtime::spawn(async move {
         let _job_flag_guard = JobFlagGuard(app_for_task.clone());
-        // Drains until empty; a poisoned queue lock also ends the drain.
-        while let Ok(Some(job)) = app_for_task.state::<jobs::JobQueue>().pop() {
-            // Per-job check, not a snapshot-at-drain-start break: the drain
-            // loop pops before it can know whether the job belongs to the
-            // roll open when the worker started or a roll swapped in since.
-            // A stale-roll job is silently discarded (its siblings were
-            // already cleared from the queue by the roll swap; this only
-            // catches the one straggler popped mid-swap) while a job tagged
-            // with the CURRENT generation always runs, regardless of when
-            // this worker began draining.
-            if job.generation != app_for_task.state::<roll::RollState>().generation() {
-                continue;
-            }
-            let generation = job.generation;
-            match run_job(&app_for_task, generation, job).await {
-                Ok(()) => {
-                    let _ = app_for_task.emit(
-                        "job-done",
-                        JobEvent {
-                            index: job.index,
-                            kind: job.kind,
-                            generation,
-                        },
-                    );
+        // Labeled so the exit handshake below can `continue 'drain` to adopt
+        // a straggler without re-entering the whole spawn.
+        'drain: loop {
+            // Drains until empty; a poisoned queue lock also ends the drain
+            // (falls through to the handshake below with a None-shaped pop,
+            // same as a genuinely empty queue).
+            while let Ok(Some(job)) = app_for_task.state::<jobs::JobQueue>().pop() {
+                // Per-job check, not a snapshot-at-drain-start break: the
+                // drain loop pops before it can know whether the job belongs
+                // to the roll open when the worker started or a roll swapped
+                // in since. A stale-roll job is silently discarded (its
+                // siblings were already cleared from the queue by the roll
+                // swap; this only catches the one straggler popped
+                // mid-swap) while a job tagged with the CURRENT generation
+                // always runs, regardless of when this worker began
+                // draining.
+                if job.generation != app_for_task.state::<roll::RollState>().generation() {
+                    continue;
                 }
-                Err(message) => {
-                    let _ = app_for_task.emit(
-                        "job-error",
-                        JobError {
-                            index: job.index,
-                            kind: job.kind,
-                            message,
-                            generation,
-                        },
-                    );
+                let generation = job.generation;
+                match run_job(&app_for_task, generation, job).await {
+                    Ok(()) => {
+                        let _ = app_for_task.emit(
+                            "job-done",
+                            JobEvent {
+                                index: job.index,
+                                kind: job.kind,
+                                generation,
+                            },
+                        );
+                    }
+                    Err(message) => {
+                        let _ = app_for_task.emit(
+                            "job-error",
+                            JobError {
+                                index: job.index,
+                                kind: job.kind,
+                                message,
+                                generation,
+                            },
+                        );
+                    }
                 }
             }
+
+            // Clear-then-recheck handshake, closing the lost-wakeup window
+            // between `pop()` returning None and the flag actually clearing
+            // (a caller's `enqueue_job` could observe `running == true` in
+            // that gap, coalesce into the queue, and see the flag already
+            // taken -- so it would return without spawning a drain, and
+            // this worker was about to exit without seeing the new job).
+            let queue = app_for_task.state::<jobs::JobQueue>();
+
+            // Step 1: pop() just returned None. Clear the flag now, before
+            // re-checking the queue, so any enqueue that lands from this
+            // point on is guaranteed to observe `running == false` if it
+            // arrives after this clear (the guard's later duplicate clear
+            // on drop is harmless -- clearing an already-clear flag is a
+            // no-op).
+            queue.clear_running();
+
+            // Step 2: re-check the queue under the now-cleared flag. If
+            // it's still empty (or the lock is poisoned), no job could have
+            // landed and lost its wakeup: nothing enqueued between step 1
+            // and here would have found `running == true`, so nothing was
+            // silently dropped. This worker is the one that gets to emit
+            // the terminal idle event.
+            let still_empty = queue.is_empty().unwrap_or(true);
+            if still_empty {
+                let _ = app_for_task.emit(
+                    "queue-idle",
+                    QueueIdlePayload {
+                        generation: spawn_generation,
+                    },
+                );
+                break 'drain;
+            }
+
+            // Step 3: the queue is non-empty, which means either (a) this
+            // worker's own clear in step 1 raced an enqueue that landed a
+            // job right after, or (b) that same enqueue also re-armed the
+            // flag itself and spawned its own drain task. Only one of this
+            // worker and that racing enqueue may resume draining, so settle
+            // it with the same compare_exchange primitive both sides use.
+            if queue.try_start() {
+                // Won: the racing enqueue's `job-queued` event already
+                // fired and its own try_start lost (or hasn't run yet), so
+                // this worker adopts the straggler and keeps draining under
+                // the same flag acquisition. No idle event yet -- the queue
+                // is not idle.
+                continue 'drain;
+            }
+            // Lost: the racing enqueue's try_start won first and spawned
+            // its own worker, which will run this exact handshake and emit
+            // its own queue-idle when it eventually drains empty. Emitting
+            // here too would be a duplicate terminal event for a worker
+            // that no longer owns the flag, so this one exits silently.
+            break 'drain;
         }
-        let _ = app_for_task.emit(
-            "queue-idle",
-            QueueIdlePayload {
-                generation: spawn_generation,
-            },
-        );
     });
     Ok(())
 }
