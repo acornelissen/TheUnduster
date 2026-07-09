@@ -130,6 +130,21 @@ pub fn thumb_path(dir: &Path, file_name: &str) -> PathBuf {
     thumbs_dir(dir).join(format!("{file_name}.png"))
 }
 
+#[allow(dead_code)]
+pub fn cache_dir(dir: &Path) -> PathBuf {
+    sidecar_dir(dir).join("cache")
+}
+
+#[allow(dead_code)]
+pub fn probs_cache_path(dir: &Path, file_name: &str) -> PathBuf {
+    cache_dir(dir).join(format!("{file_name}.probs"))
+}
+
+#[allow(dead_code)]
+pub fn heal_cache_path(dir: &Path, file_name: &str) -> PathBuf {
+    cache_dir(dir).join(format!("{file_name}.heal"))
+}
+
 fn list_image_files(dir: &Path) -> Result<Vec<String>, String> {
     let read = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut names: Vec<String> = Vec::new();
@@ -628,6 +643,27 @@ impl RollState {
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
     }
+
+    /// Maps a registry image id back to its roll directory and file name.
+    /// Returns Ok(None) when no frame has this id -- either no roll is open
+    /// (a normal cache-miss condition, not an error) or the frame was evicted.
+    /// This deviates from sibling accessors: "no roll" is Ok(None), not Err,
+    /// because id-keyed commands (detect, heal) expect closed rolls to be
+    /// a benign cache-miss, not a failure.
+    #[allow(dead_code)]
+    pub fn frame_for_image(&self, id: u64) -> Result<Option<(PathBuf, String)>, String> {
+        let guard = self.roll.lock().map_err(|e| e.to_string())?;
+        let roll = match guard.as_ref() {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        for frame in &roll.frames {
+            if frame.image_id == Some(id) {
+                return Ok(Some((roll.dir.clone(), frame.file_name.clone())));
+            }
+        }
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -925,6 +961,21 @@ mod state_tests {
         state.set_strokes(0, strokes.clone(), vec![]).unwrap();
         let (_, _, _, meta_strokes) = state.export_frame_meta(0).unwrap();
         assert_eq!(meta_strokes, strokes);
+    }
+
+    #[test]
+    fn frame_for_image_maps_ids_to_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in ["a.png", "b.png"] {
+            std::fs::write(dir.path().join(n), b"x").unwrap();
+        }
+        let state = RollState::default();
+        state.open(dir.path()).unwrap();
+        state.set_image_id(1, 42).unwrap();
+        let (d, name) = state.frame_for_image(42).unwrap().expect("mapped");
+        assert_eq!(d, dir.path());
+        assert_eq!(name, "b.png");
+        assert!(state.frame_for_image(7).unwrap().is_none());
     }
 }
 
