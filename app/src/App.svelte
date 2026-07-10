@@ -1475,7 +1475,7 @@
       <div class="toolbar-group">
         {#if roll.frames[currentIndex].approved}
           <button class="btn" title="Unapprove (shift-a)" onclick={unapproveCurrent}>
-            <Icon name="approve" /> Unapprove
+            <Icon name="unapprove" /> Unapprove
           </button>
         {:else}
           <button class="btn" title="Approve and advance (a)" onclick={approveAndAdvance}>
