@@ -1209,6 +1209,7 @@ struct ExportHealProgress {
 #[derive(serde::Serialize, Clone)]
 struct ExportProgress {
     index: usize,
+    generation: u64,
 }
 
 /// Clears the job-worker running flag when dropped, including on unwind, so
@@ -1732,11 +1733,22 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
 
             // set_exported re-checks the generation under its own lock; the
             // worker's top-of-loop check plus this makes a roll-swap-mid-export
-            // land nowhere.
-            let _ = app
+            // land nowhere. The narration emit is gated on that write actually
+            // landing: a discarded write means the roll was swapped mid-export,
+            // and unconditionally emitting here would tell the frontend's
+            // listener to badge a frame that may not even belong to this
+            // export anymore -- a false "out" badge on the new roll's
+            // same-index frame, or an out-of-bounds write if the new roll is
+            // shorter. `generation` in the payload lets the listener apply the
+            // same guard the job-* events already use, belt-and-braces with
+            // this gate.
+            if app
                 .state::<roll::RollState>()
-                .set_exported(generation, index);
-            let _ = app.emit("export-progress", ExportProgress { index });
+                .set_exported(generation, index)
+                .is_ok()
+            {
+                let _ = app.emit("export-progress", ExportProgress { index, generation });
+            }
             Ok(())
         }
         jobs::JobKind::Prefetch => {

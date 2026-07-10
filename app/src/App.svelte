@@ -461,8 +461,14 @@
   });
 
   $effect(() => {
-    const un = listen<{ index: number }>("export-progress", (e) => {
+    const un = listen<{ index: number; generation: number }>("export-progress", (e) => {
       if (!roll) return;
+      // Same guard shape as the job-* listeners: generation is the primary
+      // check (a swap mid-export must not badge the new roll's same-index
+      // frame), and the bounds check is belt-and-braces against a shorter
+      // new roll -- without it this indexing would throw a TypeError.
+      if (e.payload.generation !== rollGeneration) return;
+      if (e.payload.index < 0 || e.payload.index >= roll.frames.length) return;
       roll.frames[e.payload.index].exported = true;
       exportDetail = null; // this frame is done; the next one narrates itself
     });
