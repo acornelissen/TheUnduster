@@ -187,7 +187,13 @@
   const isDetecting = $derived(detecting || rollDetecting);
   const isHealing = $derived(healing || rollHealing);
   // Count of queued jobs (all states, all frames) for the status line.
-  const queuedJobCount = $derived(Object.keys(jobStates).length);
+  // Prefetch is excluded: routine neighbor warm-ups fire on every roll
+  // navigation, and counting them keeps the status line churning while the
+  // operator is just browsing. The filmstrip dots and the queue panel still
+  // show prefetch jobs.
+  const queuedJobCount = $derived(
+    Object.values(jobStates).filter((j) => j.kind !== "prefetch").length,
+  );
   // True only while an export job is actually running (not merely queued).
   // Feeds the status-activity slot so a live heal narrates itself during a
   // mixed batch instead of the slot showing bare "exporting" for an export
