@@ -900,7 +900,9 @@
   }
 
   async function requestDetect() {
-    if (!info || isDetecting) return;
+    // `detected` matches the button's disabled state so the d key agrees
+    // with the toolbar: probabilities exist, the slider re-thresholds live.
+    if (!info || isDetecting || detected) return;
     // Roll mode: the background queue owns the run. Enqueue and return --
     // `detecting`/`detected` follow the job-started/job-done events instead
     // of this call's resolution. The queue is roll-only (jobs run against a
@@ -1295,8 +1297,13 @@
     <!-- Frame group: visible when info exists -->
     {#if info}
       <div class="toolbar-group">
-        <button class="btn" title="Detect (d)" onclick={requestDetect} disabled={loading !== null || isDetecting}>
-          <Icon name="detect" /> {isDetecting ? "Detecting..." : "Detect"}
+        <button
+          class="btn"
+          title={detected ? "Already detected; the slider re-thresholds live" : "Detect (d)"}
+          onclick={requestDetect}
+          disabled={loading !== null || isDetecting || detected}
+        >
+          <Icon name="detect" /> {isDetecting ? "Detecting..." : detected ? "Detected" : "Detect"}
         </button>
         <button
           class="btn btn-primary"
