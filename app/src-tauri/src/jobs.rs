@@ -85,9 +85,9 @@ impl JobQueue {
         Ok(queue.len())
     }
 
-    /// Returns true if the queue is empty.
-    // Exercised by tests; no production caller yet.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Returns true if the queue is empty. The worker's clear-then-recheck
+    /// exit handshake depends on this re-check happening after the running
+    /// flag clears.
     pub fn is_empty(&self) -> Result<bool, String> {
         let queue = self.queue.lock().map_err(|e| e.to_string())?;
         Ok(queue.is_empty())
