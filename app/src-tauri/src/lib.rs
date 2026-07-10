@@ -1825,6 +1825,55 @@ fn spawn_worker_if_idle(app: &tauri::AppHandle, spawn_generation: u64) {
     });
 }
 
+/// Builds the app menu for the main window: the platform's default menu set
+/// (app menu with Quit, Edit with clipboard shortcuts, Window, Help, and on
+/// macOS a "File" submenu that ships with only Close Window) with two more
+/// items -- Open Scan.../Open Roll... -- appended to that existing File
+/// submenu.
+///
+/// Built from `Menu::default(handle)` rather than a bare `MenuBuilder` menu:
+/// the latter replaces the whole menu bar, which on macOS drops the app menu
+/// (Quit, About, hide/services) and the Edit menu (cut/copy/paste, needed by
+/// the threshold input and any future text field) entirely. `Menu::default`
+/// is the only way in this tauri version to keep those, since neither it nor
+/// the File submenu it creates carries a fixed id to `Menu::get` by --
+/// `items()`'s positional order is the only handle available, so the macOS
+/// layout `[app, File, Edit, View, Window, Help]` (see
+/// `tauri::menu::Menu::default`'s source) is relied on directly and asserted
+/// against by name as a guard.
+fn build_menu(handle: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    use tauri::menu::{Menu, MenuItemBuilder, PredefinedMenuItem};
+
+    let menu = Menu::default(handle)?;
+
+    let file_submenu = menu
+        .items()?
+        .into_iter()
+        .find_map(|item| {
+            let submenu = item.as_submenu()?.clone();
+            (submenu.text().ok()?.trim_start_matches('&') == "File").then_some(submenu)
+        })
+        .ok_or_else(|| {
+            tauri::Error::AssetNotFound("default menu has no \"File\" submenu".into())
+        })?;
+
+    let open_scan = MenuItemBuilder::with_id("open-scan", "Open Scan...")
+        .accelerator("CmdOrCtrl+O")
+        .build(handle)?;
+    let open_roll = MenuItemBuilder::with_id("open-roll", "Open Roll...")
+        .accelerator("CmdOrCtrl+Shift+O")
+        .build(handle)?;
+
+    // Prepended (position 0) so the two app-specific actions read first,
+    // above the platform-provided Close Window; a separator keeps them
+    // visually distinct from it.
+    file_submenu.insert(&PredefinedMenuItem::separator(handle)?, 0)?;
+    file_submenu.insert(&open_roll, 0)?;
+    file_submenu.insert(&open_scan, 0)?;
+
+    Ok(menu)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1835,6 +1884,16 @@ pub fn run() {
         .manage(roll::RollState::default())
         .manage(jobs::JobQueue::default())
         .manage(models::ModelDownloadState::default())
+        .menu(build_menu)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "open-scan" => {
+                let _ = app.emit("menu-open-scan", ());
+            }
+            "open-roll" => {
+                let _ = app.emit("menu-open-roll", ());
+            }
+            _ => {}
+        })
         .invoke_handler(tauri::generate_handler![
             log_js_error,
             open_image,

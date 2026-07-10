@@ -10,6 +10,7 @@
   import Toasts from "./lib/Toasts.svelte";
   import LogPanel from "./lib/LogPanel.svelte";
   import QueuePanel from "./lib/QueuePanel.svelte";
+  import ShortcutsPanel from "./lib/ShortcutsPanel.svelte";
   import { composeQueueEntries, type QueueProgress } from "./lib/queue";
   import { routeDrop, type PathKind } from "./lib/drop";
   import { nextUnapprovedIndex } from "./lib/roll-nav";
@@ -58,6 +59,7 @@
   let activityLog: { id: number; time: string; level: string; message: string }[] = $state([]);
   let logOpen = $state(false);
   let queueOpen = $state(false);
+  let shortcutsOpen = $state(false);
 
   // The last queue_snapshot response, raw (unfiltered). Refreshed when the
   // queue panel opens and on every job event while it stays open; filtered
@@ -602,6 +604,28 @@
     };
   });
 
+  // Native File menu items emit these instead of invoking a command
+  // directly, so the picker flow (permission prompt, dialog) stays owned by
+  // the webview exactly as it is from the toolbar buttons -- the menu only
+  // triggers the same picker functions a click would.
+  $effect(() => {
+    const un = listen("menu-open-scan", () => {
+      void openScan();
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  $effect(() => {
+    const un = listen("menu-open-roll", () => {
+      void openRoll();
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
   async function openScan() {
     const path = await open({
       multiple: false,
@@ -1140,21 +1164,33 @@
     }
   }
 
-  // One side panel at a time: opening either closes the other, so the two
-  // fixed right-side panels can never stack. Opening the queue panel also
-  // fetches a fresh snapshot -- the event-driven refreshes above only run
-  // while the panel is already open.
+  // One panel at a time: opening any of the three closes the other two, so
+  // the fixed right-side panels and the centered shortcuts modal can never
+  // stack. Opening the queue panel also fetches a fresh snapshot -- the
+  // event-driven refreshes above only run while the panel is already open.
   function toggleQueue() {
     queueOpen = !queueOpen;
     if (queueOpen) {
       logOpen = false;
+      shortcutsOpen = false;
       void refreshQueueSnapshot();
     }
   }
 
   function toggleLog() {
     logOpen = !logOpen;
-    if (logOpen) queueOpen = false;
+    if (logOpen) {
+      queueOpen = false;
+      shortcutsOpen = false;
+    }
+  }
+
+  function toggleShortcuts() {
+    shortcutsOpen = !shortcutsOpen;
+    if (shortcutsOpen) {
+      logOpen = false;
+      queueOpen = false;
+    }
   }
 
   function isTypingTarget(target: EventTarget | null): boolean {
@@ -1189,15 +1225,28 @@
       onStrokesChange(result.strokes, result.redo);
       return;
     }
-    // Escape closes whichever side panel is open -- but only when one is,
-    // and never when the brush already consumed the keypress (the Viewer's
+    // `?` toggles the shortcuts overlay -- shifted on most layouts already,
+    // so this matches the produced character rather than also requiring
+    // e.shiftKey (which would miss layouts where `?` isn't shift-2/-slash).
+    // isTypingTarget still guards: typing a literal `?` in a text field must
+    // not pop the panel open.
+    if (e.key === "?" && !isTypingTarget(e.target)) {
+      e.preventDefault();
+      toggleShortcuts();
+      return;
+    }
+    // Escape closes whichever panel is open -- but only when one is, and
+    // never when the brush already consumed the keypress (the Viewer's
     // canvas-scoped handler runs before this window handler bubbles and
     // calls preventDefault to turn the brush off; one Escape should do one
-    // thing). Queue first if both are somehow open (the toggles make them
-    // mutually exclusive, but belt-and-braces keeps the order defined).
-    if (e.key === "Escape" && (queueOpen || logOpen) && !e.defaultPrevented) {
+    // thing). Shortcuts first (it's a modal sitting above everything else),
+    // then queue, then log -- the toggles make all three mutually exclusive,
+    // but belt-and-braces keeps the order defined.
+    if (e.key === "Escape" && (shortcutsOpen || queueOpen || logOpen) && !e.defaultPrevented) {
       e.preventDefault();
-      if (queueOpen) {
+      if (shortcutsOpen) {
+        shortcutsOpen = false;
+      } else if (queueOpen) {
         queueOpen = false;
       } else {
         logOpen = false;
@@ -1406,6 +1455,9 @@
 {/if}
 {#if queueOpen}
   <QueuePanel entries={queueEntries} id="job-queue-panel" />
+{/if}
+{#if shortcutsOpen}
+  <ShortcutsPanel onClose={() => (shortcutsOpen = false)} />
 {/if}
 
 <style>
