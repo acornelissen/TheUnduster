@@ -1699,6 +1699,12 @@ fn spawn_worker_if_idle(app: &tauri::AppHandle, spawn_generation: u64) {
     // The flag is set; any fallible setup from here must clear it before
     // returning (the scan_roll discipline).
     let app_for_task = app.clone();
+    // The worker's identity for its terminal queue-idle emit: the generation
+    // at SPAWN (the `spawn_generation` parameter). Reading the current
+    // generation at emit time instead would let an old worker's final idle
+    // race a roll swap, read the NEW generation, pass the frontend's filter,
+    // and wipe the new roll's live job entries -- the exact hole the
+    // generation guard exists to close.
     tauri::async_runtime::spawn(async move {
         let _job_flag_guard = JobFlagGuard(app_for_task.clone());
         // Labeled so the exit handshake below can `continue 'drain` to adopt
