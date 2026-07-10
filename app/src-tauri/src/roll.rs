@@ -508,6 +508,31 @@ impl RollState {
         Ok(previous)
     }
 
+    /// Records the frame's live registry id only if the frame has none.
+    /// Returns true when the id was recorded, false when the frame already
+    /// had one -- the caller lost the race and must close its own image.
+    /// Check and set are one operation under the roll lock, so two racers
+    /// can never both believe they won.
+    ///
+    /// Prefetch-only counterpart to `set_image_id`: a background warm-up
+    /// racing an activation of the same frame must LOSE the tie, never
+    /// supersede -- superseding would close the image the activation just
+    /// put on screen. Activation keeps `set_image_id`'s supersede semantics
+    /// (latest activation wins, superseded image closed) unchanged.
+    pub fn set_image_id_if_absent(&self, index: usize, id: u64) -> Result<bool, String> {
+        let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
+        let roll = guard.as_mut().ok_or("no roll open")?;
+        let frame = roll
+            .frames
+            .get_mut(index)
+            .ok_or_else(|| format!("no frame {index}"))?;
+        if frame.image_id.is_some() {
+            return Ok(false);
+        }
+        frame.image_id = Some(id);
+        Ok(true)
+    }
+
     pub fn frame_path(&self, index: usize) -> Result<PathBuf, String> {
         let guard = self.roll.lock().map_err(|e| e.to_string())?;
         let roll = guard.as_ref().ok_or("no roll open")?;
@@ -958,6 +983,27 @@ mod state_tests {
         assert_eq!(state.set_image_id(0, 9).unwrap(), Some(7)); // superseded
         assert_eq!(state.set_image_id(0, 9).unwrap(), None); // same id: nothing to close
         assert_eq!(state.image_id(0).unwrap(), Some(9));
+    }
+
+    #[test]
+    fn set_image_id_if_absent_loses_to_an_existing_id() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"x").unwrap();
+        let state = RollState::default();
+        state.open(dir.path()).unwrap();
+        // Empty slot: the if-absent set wins and records the id.
+        assert!(state.set_image_id_if_absent(0, 7).unwrap());
+        assert_eq!(state.image_id(0).unwrap(), Some(7));
+        // Occupied slot: the if-absent set loses -- the existing id stays,
+        // never superseded. This is the prefetch tie-loss contract: an
+        // activation that landed first keeps its (displayed) image.
+        assert!(!state.set_image_id_if_absent(0, 9).unwrap());
+        assert_eq!(state.image_id(0).unwrap(), Some(7));
+        // Bad index still errors rather than reading as a lost tie.
+        assert!(state
+            .set_image_id_if_absent(5, 1)
+            .unwrap_err()
+            .contains("no frame"));
     }
 
     #[test]

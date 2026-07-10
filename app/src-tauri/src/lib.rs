@@ -519,21 +519,19 @@ fn evict_over_budget(
 }
 
 /// Decode + build-pyramid + registry-insert core shared by `activate_frame`'s
-/// fresh-decode path and the `Prefetch` job arm. Neither the reuse path
-/// (already resident) nor activation's UI-contract steps -- the "decoding"
-/// progress emit, the probs-cache restore, `roll.touch`, `evict_over_budget`,
-/// and the terminal "ready" emit -- live here: those differ between
-/// "the operator is waiting on this frame" and "warm this frame quietly in
-/// the background", so callers keep them.
+/// fresh-decode path and the `Prefetch` job arm. Registry insert only, no
+/// roll bookkeeping: the two callers resolve a same-frame decode race in
+/// opposite directions (activation supersedes and closes the loser via
+/// `set_image_id`; prefetch loses ties via `set_image_id_if_absent` and
+/// closes its own image), so which id the frame ends up pointing at is the
+/// caller's decision, not this core's.
 ///
 /// `on_decoded` fires (if given) right after decode, before the
 /// (comparatively fast) pyramid build -- `activate_frame` uses it to emit
 /// the "building-pyramid" progress stage; `Prefetch` passes `None` since it
 /// emits no progress at all.
-async fn decode_and_register(
+async fn decode_and_insert(
     images: &State<'_, Mutex<Images>>,
-    roll: &State<'_, roll::RollState>,
-    index: usize,
     path: std::path::PathBuf,
     on_decoded: Option<impl FnOnce() + Send + 'static>,
 ) -> Result<ImageInfo, String> {
@@ -550,14 +548,27 @@ async fn decode_and_register(
             .map_err(|e| e.to_string())?
     };
     let prepared = Prepared { image, pyramid };
-    let info = {
-        let mut images = images.lock().map_err(|e| e.to_string())?;
-        images.insert(prepared)
-    };
-    // Concurrent activations/prefetches of the same frame each decode
-    // independently; whichever lands later replaces the frame's id, and the
-    // superseded image must be closed or it is orphaned in the registry
-    // (about a gigabyte of leaked pixels per rapid re-click on a 168MP scan).
+    let mut images = images.lock().map_err(|e| e.to_string())?;
+    Ok(images.insert(prepared))
+}
+
+/// `activate_frame`'s fresh-decode path: `decode_and_insert` plus the
+/// activation-only supersede step. Neither the reuse path (already resident)
+/// nor activation's other UI-contract steps -- the "decoding" progress emit,
+/// the probs-cache restore, `roll.touch`, `evict_over_budget`, and the
+/// terminal "ready" emit -- live here; `activate_frame` keeps them.
+async fn decode_and_register(
+    images: &State<'_, Mutex<Images>>,
+    roll: &State<'_, roll::RollState>,
+    index: usize,
+    path: std::path::PathBuf,
+    on_decoded: Option<impl FnOnce() + Send + 'static>,
+) -> Result<ImageInfo, String> {
+    let info = decode_and_insert(images, path, on_decoded).await?;
+    // Concurrent activations of the same frame each decode independently;
+    // whichever lands later replaces the frame's id, and the superseded
+    // image must be closed or it is orphaned in the registry (about a
+    // gigabyte of leaked pixels per rapid re-click on a 168MP scan).
     if let Some(superseded) = roll.set_image_id(index, info.id)? {
         let mut images = images.lock().map_err(|e| e.to_string())?;
         images.close(superseded);
@@ -1670,23 +1681,43 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                     return Ok(());
                 }
             }
-            // The pin slot holds an image id, and this frame has none yet (it
-            // is not resident -- that was just ruled out above), so there is
-            // nothing to pin until after decode+insert produces one. A
-            // concurrent activate_frame's evict_over_budget could in
-            // principle run in the gap between this insert and the pin below
-            // and evict the frame just inserted; that is a wasted decode, not
-            // a safety problem -- it can only ever evict a NON-current,
-            // NON-pinned frame (evict_over_budget always skips the pinned id
-            // and the caller's keep-window), so the displayed frame is never
-            // at risk either way.
             let roll_state = app.state::<roll::RollState>();
             let queue = app.state::<jobs::JobQueue>();
-            let info =
-                decode_and_register(&images_state, &roll_state, index, path, None::<fn()>).await?;
+            let info = decode_and_insert(&images_state, path, None::<fn()>).await?;
+            // Tie-loss registration, NOT activation's supersede: the operator
+            // can step onto this very frame while the decode above is in
+            // flight, and their activate_frame races this job with its own
+            // decode. If activation lands first, its id is the image on
+            // screen -- a supersede here (set_image_id) would return that id
+            // as "superseded" and close it out from under the viewer: blank
+            // tiles until navigate-away-and-back. set_image_id_if_absent
+            // does the has-an-id check and the set as one operation under
+            // the roll lock, so exactly one racer wins; there is no
+            // check-then-act window in which both can. The full interleaving
+            // (prefetch decode straddling an activation of the same frame)
+            // spans two tasks and real decodes, so it is not unit-testable;
+            // the tie-loss primitive itself is covered by
+            // roll::state_tests::set_image_id_if_absent_loses_to_an_existing_id.
+            if !roll_state.set_image_id_if_absent(index, info.id)? {
+                // Lost: an activation (or an earlier racer) owns this frame
+                // now. Close our own freshly-inserted image -- nothing
+                // references it, and leaving it would orphan a full frame of
+                // pixels in the registry.
+                let mut images = images_state.lock().map_err(|e| e.to_string())?;
+                images.close(info.id);
+                return Ok(());
+            }
             queue.pin(Some(info.id))?;
             // Unpins on every exit past this point, including an early `?`
-            // from `current_index()` below.
+            // from `current_index()` below. The pin slot holds an image id,
+            // so it cannot be taken before decode+insert produces one; a
+            // concurrent activate_frame's evict_over_budget could in
+            // principle evict this frame in the gap between the if-absent
+            // set above and this pin. That is a wasted decode (the next
+            // visit re-decodes), never a display problem: eviction only ever
+            // closes ids reached through eviction_candidates, which excludes
+            // the current frame's keep-window, and the displayed image's id
+            // is by definition inside it.
             let _pin_guard = PinGuard(app.clone());
             // Protect the frame actually on screen, not this prefetch job's
             // own index -- `current_index` is the roll's most-recently-touched
