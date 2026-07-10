@@ -3,10 +3,19 @@
  * open roll's frames); kept here so the running-first, snapshot-ordered,
  * dedupe-by-key logic has direct test coverage without mounting Svelte. */
 
+/** Progress for the single running job, attached only to its entry (see
+ * `composeQueueEntries`). `{ done, total }` for a job reporting numeric
+ * progress (heal jobs, and export jobs during their heal stage); `{ stage }`
+ * for a job that only reports a named phase (export jobs outside the heal
+ * stage). Detect jobs have no progress signal yet, so their running entry
+ * never carries this field. */
+export type QueueProgress = { done: number; total: number } | { stage: string };
+
 export interface QueueEntry {
   key: string;
   label: string;
   state: "running" | "queued";
+  progress?: QueueProgress;
 }
 
 export interface RunningJob {
@@ -30,6 +39,7 @@ export function composeQueueEntries(
   running: RunningJob[],
   snapshot: SnapshotJob[],
   frames: { file_name: string }[],
+  runningProgress?: QueueProgress | null,
 ): QueueEntry[] {
   const label = (index: number, kind: string) =>
     `${frames[index]?.file_name ?? `frame ${index}`} — ${kind}`;
@@ -38,6 +48,7 @@ export function composeQueueEntries(
     key: `${j.kind}:${j.index}`,
     label: label(j.index, j.kind),
     state: "running",
+    ...(runningProgress ? { progress: runningProgress } : {}),
   }));
   const runningKeys = new Set(runningEntries.map((e) => e.key));
 

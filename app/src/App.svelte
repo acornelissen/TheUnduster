@@ -8,7 +8,7 @@
   import Toasts from "./lib/Toasts.svelte";
   import LogPanel from "./lib/LogPanel.svelte";
   import QueuePanel from "./lib/QueuePanel.svelte";
-  import { composeQueueEntries } from "./lib/queue";
+  import { composeQueueEntries, type QueueProgress } from "./lib/queue";
   import { nextUnapprovedIndex } from "./lib/roll-nav";
   import type { Level } from "./lib/viewport";
   import { undoStroke, redoStroke, type StrokeData } from "./lib/brush";
@@ -125,6 +125,13 @@
     number,
     { state: "queued" | "running"; kind: "detect" | "heal" | "export" }
   > = $state({});
+  // Progress for the currently running queue job, attributed by "currently
+  // running" since the worker is single-flight (see lib/queue.ts's
+  // QueueProgress doc comment). One slot, not keyed by index: only one job
+  // is ever running at a time, so there is never more than one progress to
+  // show. Reset to null on job-started (a new job's progress starts fresh)
+  // and cleared on job-done/job-error/queue-idle.
+  let queueProgress: QueueProgress | null = $state(null);
   // The generation the currently-open roll was opened under (from
   // `open_roll`'s response). Primary guard for the job-* listeners below:
   // every job event now carries the generation it was enqueued/run against,
@@ -139,6 +146,10 @@
       if (info && e.payload.id === info.id) {
         healProgress = { done: e.payload.done, total: e.payload.total };
       }
+      // Queue attribution: the worker is single-flight, so this event always
+      // belongs to whichever job is currently running -- no id/index guard
+      // needed here (unlike the displayed-frame branch above).
+      queueProgress = { done: e.payload.done, total: e.payload.total };
     });
     return () => {
       un.then((f) => f());
@@ -309,6 +320,7 @@
         // index was never actually queued this session.
         if (!(e.payload.index in jobStates)) return;
         jobStates[e.payload.index] = { state: "running", kind: e.payload.kind };
+        queueProgress = null; // a newly started job's progress starts fresh
         // Heal-inputs capture happens at job START, not completion: the worker
         // reads the frame's persisted threshold/strokes moments before this
         // event fires, so these are the values the heal will actually use --
@@ -339,6 +351,7 @@
         // job-started listener's comment.
         if (!(e.payload.index in jobStates)) return;
         delete jobStates[e.payload.index];
+        queueProgress = null;
         // Index-guarded on purpose: only refresh detections / mark healed when
         // the completed job belongs to the frame still on screen. Activity
         // flags themselves are derived (see `rollDetecting`/`rollHealing`), so
@@ -373,6 +386,7 @@
       // job-started listener's comment.
       if (!(e.payload.index in jobStates)) return;
       delete jobStates[e.payload.index];
+      queueProgress = null;
       // A failed export frame's narration must not linger once the job is
       // gone -- export-progress won't fire to clear it for this frame.
       if (e.payload.kind === "export") exportDetail = null;
@@ -394,6 +408,7 @@
     const un = listen<{ generation: number }>("queue-idle", (e) => {
       if (e.payload.generation !== rollGeneration) return;
       if (queueOpen) void refreshQueueSnapshot();
+      queueProgress = null; // the worker stopped, so nothing is running now
       // Grace-period cleanup instead of a blanket wipe: a same-generation
       // idle can race an enqueue whose job a fresh worker is about to run
       // (the worker's emit happens after its empty-check releases the lock).
@@ -442,6 +457,7 @@
     const un = listen<{ index: number; stage: string }>("export-frame-stage", (e) => {
       if (!roll) return;
       exportDetail = `${roll.frames[e.payload.index].file_name}: ${e.payload.stage}`;
+      queueProgress = { stage: e.payload.stage };
     });
     return () => {
       un.then((f) => f());
@@ -454,6 +470,7 @@
       (e) => {
         if (!roll) return;
         exportDetail = `${roll.frames[e.payload.index].file_name}: healing ${e.payload.done}/${e.payload.total}`;
+        queueProgress = { done: e.payload.done, total: e.payload.total };
       },
     );
     return () => {
@@ -1043,7 +1060,7 @@
     const pending = queueSnapshot.filter(
       (j) => j.generation === rollGeneration && j.index >= 0 && j.index < r.frames.length,
     );
-    return composeQueueEntries(running, pending, r.frames);
+    return composeQueueEntries(running, pending, r.frames, queueProgress);
   });
 
   function onStrokesChange(strokes: StrokeData[], redo: StrokeData[]) {

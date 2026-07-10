@@ -39,4 +39,35 @@ describe("composeQueueEntries", () => {
       { key: "heal:1", label: "b.tif — heal", state: "queued" },
     ]);
   });
+
+  it("attaches done/total progress to the running entry", () => {
+    const running = [{ index: 0, kind: "heal" as const }];
+    const progress = { done: 3, total: 10 };
+    expect(composeQueueEntries(running, [], frames, progress)).toEqual([
+      { key: "heal:0", label: "a.tif — heal", state: "running", progress },
+    ]);
+  });
+
+  it("attaches stage progress to the running entry", () => {
+    const running = [{ index: 1, kind: "export" as const }];
+    const progress = { stage: "writing" };
+    expect(composeQueueEntries(running, [], frames, progress)).toEqual([
+      { key: "export:1", label: "b.tif — export", state: "running", progress },
+    ]);
+  });
+
+  it("never attaches progress to a queued entry", () => {
+    const snapshot = [{ index: 0, kind: "detect" as const }];
+    const progress = { done: 1, total: 2 };
+    const result = composeQueueEntries([], snapshot, frames, progress);
+    expect(result).toEqual([{ key: "detect:0", label: "a.tif — detect", state: "queued" }]);
+    expect(result[0]).not.toHaveProperty("progress");
+  });
+
+  it("omits progress when none is given", () => {
+    const running = [{ index: 0, kind: "heal" as const }];
+    const result = composeQueueEntries(running, [], frames);
+    expect(result).toEqual([{ key: "heal:0", label: "a.tif — heal", state: "running" }]);
+    expect(result[0]).not.toHaveProperty("progress");
+  });
 });
