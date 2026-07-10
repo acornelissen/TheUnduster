@@ -419,6 +419,15 @@ fn open_roll(
 /// scan while a roll was open: `App.svelte`'s `openScan` previously just
 /// nulled the client-side `roll` reference, leaking any activated frame ids
 /// server-side.
+/// Stats `path` and reports whether it is a file or a directory, so the
+/// frontend's drop handler can route a dropped path to `openScanPath` or
+/// `openRollPath` without hand-rolling its own filesystem checks.
+#[tauri::command]
+fn path_kind(path: String) -> Result<String, String> {
+    let meta = std::fs::metadata(&path).map_err(|e| format!("{path}: {e}"))?;
+    Ok(if meta.is_dir() { "dir" } else { "file" }.to_string())
+}
+
 #[tauri::command]
 fn close_roll(
     roll: State<'_, roll::RollState>,
@@ -1837,6 +1846,7 @@ pub fn run() {
             components,
             open_roll,
             close_roll,
+            path_kind,
             activate_frame,
             set_frame_threshold,
             approve_frame,
@@ -1945,6 +1955,27 @@ mod roll_queue_tests {
             .unwrap_err();
         assert!(err.contains("roll changed"));
         assert_eq!(state.frames_to_scan().unwrap(), vec![0]); // B untouched
+    }
+
+    #[test]
+    fn path_kind_reports_dir_for_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(path_kind(dir.path().display().to_string()).unwrap(), "dir");
+    }
+
+    #[test]
+    fn path_kind_reports_file_for_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("a.png");
+        std::fs::write(&file_path, b"x").unwrap();
+        assert_eq!(path_kind(file_path.display().to_string()).unwrap(), "file");
+    }
+
+    #[test]
+    fn path_kind_errors_on_a_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert!(path_kind(missing.display().to_string()).is_err());
     }
 
     #[test]
