@@ -825,9 +825,15 @@
           threshold: overlay.threshold,
         });
         if (info?.id !== id) return true; // stale: a newer frame is active, but not a miss
+        // Fill the Viewer's live detections BEFORE flipping `detected`:
+        // markerSource switches sources on the flip, and the frame-switch
+        // reset left `detections` empty, so flipping first would paint a
+        // rings-less frame if anything redraws mid-refetch. (refreshDetections
+        // also feeds liveDefectCount via onDetectionsChange.)
+        await viewer?.refreshDetections(overlay.threshold);
+        if (info?.id !== id) return true; // stale: frame changed during the refresh
         detected = true;
         liveDefectCount = components.length;
-        void viewer?.refreshDetections(overlay.threshold);
         return true;
       } catch {
         return false;
