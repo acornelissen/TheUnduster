@@ -5,12 +5,16 @@
     right,
     logOpen = false,
     onToggleLog = null,
+    queueOpen = false,
+    onToggleQueue = null,
   }: {
     left: string;
     activity: string | null;
     right: string;
     logOpen?: boolean;
     onToggleLog?: (() => void) | null;
+    queueOpen?: boolean;
+    onToggleQueue?: (() => void) | null;
   } = $props();
 </script>
 
@@ -23,9 +27,19 @@
   </span>
   <span class="zone zone-right">
     <span class="zone-right-text">{right}</span>
+    {#if onToggleQueue}
+      <button
+        class="btn btn-toggle"
+        onclick={onToggleQueue}
+        aria-expanded={queueOpen}
+        aria-controls="job-queue-panel"
+      >
+        Queue
+      </button>
+    {/if}
     {#if onToggleLog}
       <button
-        class="btn btn-log"
+        class="btn btn-toggle"
         onclick={onToggleLog}
         aria-expanded={logOpen}
         aria-controls="activity-log-panel"
@@ -83,7 +97,7 @@
     background: var(--accent);
     flex: 0 0 auto;
   }
-  .btn-log {
+  .btn-toggle {
     flex: 0 0 auto;
     font-size: var(--text-xs);
     min-height: 24px;

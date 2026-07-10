@@ -7,6 +7,8 @@
   import StatusBar from "./lib/StatusBar.svelte";
   import Toasts from "./lib/Toasts.svelte";
   import LogPanel from "./lib/LogPanel.svelte";
+  import QueuePanel from "./lib/QueuePanel.svelte";
+  import { composeQueueEntries } from "./lib/queue";
   import { nextUnapprovedIndex } from "./lib/roll-nav";
   import type { Level } from "./lib/viewport";
   import { undoStroke, redoStroke, type StrokeData } from "./lib/brush";
@@ -52,6 +54,26 @@
   let toastList: Toast[] = $state([]);
   let activityLog: { id: number; time: string; level: string; message: string }[] = $state([]);
   let logOpen = $state(false);
+  let queueOpen = $state(false);
+
+  // The last queue_snapshot response, raw (unfiltered). Refreshed when the
+  // queue panel opens and on every job event while it stays open; filtered
+  // to the open roll's generation and index bounds in `queueEntries` below
+  // so a stale fetch can never show another roll's jobs.
+  interface QueueJob {
+    kind: "detect" | "heal" | "export";
+    index: number;
+    generation: number;
+  }
+  let queueSnapshot: QueueJob[] = $state([]);
+
+  async function refreshQueueSnapshot() {
+    try {
+      queueSnapshot = await invoke<QueueJob[]>("queue_snapshot");
+    } catch (e) {
+      pushError(String(e));
+    }
+  }
 
   // Every error site funnels through here: pushes an error toast and logs
   // it to the activity log (capped at 100, oldest dropped first). Message
@@ -266,6 +288,7 @@
         // just before a roll swap can land after the swap and be mistaken
         // for a job against the NEW roll's same-index frame.
         if (e.payload.generation !== rollGeneration) return;
+        if (queueOpen) void refreshQueueSnapshot();
         jobStates[e.payload.index] = { state: "queued", kind: e.payload.kind };
       },
     );
@@ -279,6 +302,7 @@
       "job-started",
       (e) => {
         if (e.payload.generation !== rollGeneration) return;
+        if (queueOpen) void refreshQueueSnapshot();
         // Index-in-jobStates guard stays as belt-and-braces: generation is
         // the primary check above, but this also covers pre-generation
         // edges (e.g. an event racing a listener re-subscribe) where an
@@ -310,6 +334,7 @@
       "job-done",
       (e) => {
         if (e.payload.generation !== rollGeneration) return;
+        if (queueOpen) void refreshQueueSnapshot();
         // Index-in-jobStates guard stays as belt-and-braces: see the
         // job-started listener's comment.
         if (!(e.payload.index in jobStates)) return;
@@ -343,6 +368,7 @@
       generation: number;
     }>("job-error", (e) => {
       if (e.payload.generation !== rollGeneration) return;
+      if (queueOpen) void refreshQueueSnapshot();
       // Index-in-jobStates guard stays as belt-and-braces: see the
       // job-started listener's comment.
       if (!(e.payload.index in jobStates)) return;
@@ -367,6 +393,7 @@
     // may have raced a roll swap (see job-queued listener's comment).
     const un = listen<{ generation: number }>("queue-idle", (e) => {
       if (e.payload.generation !== rollGeneration) return;
+      if (queueOpen) void refreshQueueSnapshot();
       // Grace-period cleanup instead of a blanket wipe: a same-generation
       // idle can race an enqueue whose job a fresh worker is about to run
       // (the worker's emit happens after its empty-check releases the lock).
@@ -1002,6 +1029,23 @@
     });
   });
 
+  // Queue panel rows: running jobs from jobStates (live event-driven truth
+  // for "started"), queued jobs from the last queue_snapshot (the backend
+  // queue is the only order source for pending work). Pure composition and
+  // dedupe live in lib/queue.ts (tested there); this derived only filters
+  // the raw snapshot to the open roll's generation and index bounds first.
+  const queueEntries = $derived.by(() => {
+    const r = roll;
+    if (!r) return [];
+    const running = Object.entries(jobStates)
+      .filter(([, v]) => v.state === "running")
+      .map(([k, v]) => ({ index: Number(k), kind: v.kind }));
+    const pending = queueSnapshot.filter(
+      (j) => j.generation === rollGeneration && j.index >= 0 && j.index < r.frames.length,
+    );
+    return composeQueueEntries(running, pending, r.frames);
+  });
+
   function onStrokesChange(strokes: StrokeData[], redo: StrokeData[]) {
     const key = strokeKey();
     if (!key) return;
@@ -1021,6 +1065,23 @@
         },
       );
     }
+  }
+
+  // One side panel at a time: opening either closes the other, so the two
+  // fixed right-side panels can never stack. Opening the queue panel also
+  // fetches a fresh snapshot -- the event-driven refreshes above only run
+  // while the panel is already open.
+  function toggleQueue() {
+    queueOpen = !queueOpen;
+    if (queueOpen) {
+      logOpen = false;
+      void refreshQueueSnapshot();
+    }
+  }
+
+  function toggleLog() {
+    logOpen = !logOpen;
+    if (logOpen) queueOpen = false;
   }
 
   function isTypingTarget(target: EventTarget | null): boolean {
@@ -1055,14 +1116,19 @@
       onStrokesChange(result.strokes, result.redo);
       return;
     }
-    // Escape closes the activity log panel -- but only when it's open, and
-    // never when the brush already consumed the keypress (the Viewer's
+    // Escape closes whichever side panel is open -- but only when one is,
+    // and never when the brush already consumed the keypress (the Viewer's
     // canvas-scoped handler runs before this window handler bubbles and
     // calls preventDefault to turn the brush off; one Escape should do one
-    // thing).
-    if (e.key === "Escape" && logOpen && !e.defaultPrevented) {
+    // thing). Queue first if both are somehow open (the toggles make them
+    // mutually exclusive, but belt-and-braces keeps the order defined).
+    if (e.key === "Escape" && (queueOpen || logOpen) && !e.defaultPrevented) {
       e.preventDefault();
-      logOpen = false;
+      if (queueOpen) {
+        queueOpen = false;
+      } else {
+        logOpen = false;
+      }
       return;
     }
     if (!roll) return;
@@ -1228,7 +1294,9 @@
       activity={statusActivity}
       right={statusRight}
       {logOpen}
-      onToggleLog={() => (logOpen = !logOpen)}
+      onToggleLog={toggleLog}
+      {queueOpen}
+      onToggleQueue={toggleQueue}
     />
   {/if}
 </div>
@@ -1236,6 +1304,9 @@
 <Toasts toasts={toastList} onDismiss={dismissToastById} />
 {#if logOpen}
   <LogPanel entries={activityLog} id="activity-log-panel" />
+{/if}
+{#if queueOpen}
+  <QueuePanel entries={queueEntries} id="job-queue-panel" />
 {/if}
 
 <style>
