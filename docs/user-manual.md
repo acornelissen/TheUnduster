@@ -54,6 +54,8 @@ When you open a roll, a filmstrip of thumbnails appears along the bottom. Use `,
 
 Press `a` to approve the current frame and jump to the next frame that hasn't been approved yet. Approving marks a frame as done and ready to export.
 
+Changed your mind? Press `shift-a`, or click the "Unapprove" button that replaces "Approve" on an approved frame, to un-approve it. This doesn't advance to another frame — you stay put.
+
 Each thumbnail can show small badges in its corners:
 
 - A checkmark means the frame is approved.
@@ -114,6 +116,7 @@ Press `?` at any time to open the in-app shortcuts panel. It's the authoritative
 | --- | --- |
 | `,` / `.` | Previous/next frame |
 | `a` | Approve and advance |
+| `shift-a` | Unapprove |
 
 **Everywhere**
 

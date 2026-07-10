@@ -986,18 +986,50 @@
     }
   }
 
+  // Inverse of approveAndAdvance: un-marks the current frame without
+  // advancing. Un-approving is a correction, not a step forward through the
+  // roll -- the operator stays put on the frame they just changed their mind
+  // about.
+  async function unapproveCurrent() {
+    if (!roll) return;
+    const frame = roll.frames[currentIndex];
+    frame.approved = false;
+    try {
+      await invoke("unapprove_frame", { index: currentIndex });
+    } catch (e) {
+      pushError(String(e));
+    }
+  }
+
   function onThresholdInput() {
     if (!roll) return;
     roll.frames[currentIndex].threshold = overlay.threshold;
     clearTimeout(thresholdSaveTimer);
+    // Captured now, not read back out of `currentIndex`/`rollGeneration`
+    // after the debounce: the operator can navigate to a different frame, or
+    // close/open a roll, while this timer is pending, and the invoke below
+    // must save/mirror against the frame it was scheduled for, never
+    // whichever frame happens to sit at the same index in a roll opened
+    // afterward.
+    const index = currentIndex;
+    const generation = rollGeneration;
+    const threshold = overlay.threshold;
     thresholdSaveTimer = setTimeout(() => {
       thresholdSaveTimer = undefined;
-      invoke("set_frame_threshold", {
-        index: currentIndex,
-        threshold: overlay.threshold,
-      }).catch((e) => {
-        pushError(String(e));
-      });
+      invoke<number | null>("set_frame_threshold", { index, threshold })
+        .then((count) => {
+          // Mirror-back guard, same shape as the job-event generation checks
+          // above: a stale generation means the roll was swapped while this
+          // sat debounced, so `roll.frames[index]` -- if it even exists --
+          // belongs to a different roll and must not be touched.
+          if (count === null || !roll || generation !== rollGeneration) return;
+          const frame = roll.frames[index];
+          if (frame === undefined) return;
+          frame.defect_count = count;
+        })
+        .catch((e) => {
+          pushError(String(e));
+        });
     }, 300);
   }
 
@@ -1381,7 +1413,14 @@
       stepFrame(1);
     } else if (e.key === "a" || e.key === "A") {
       e.preventDefault();
-      void approveAndAdvance();
+      // shift-a un-approves in place; plain a keeps its existing
+      // approve-and-advance behavior (including on an already-approved
+      // frame, where it just advances to the next unapproved one).
+      if (e.shiftKey) {
+        void unapproveCurrent();
+      } else {
+        void approveAndAdvance();
+      }
     }
   }
 </script>
@@ -1433,14 +1472,15 @@
     <!-- Roll group: visible when roll exists -->
     {#if roll}
       <div class="toolbar-group">
-        <button
-          class="btn"
-          title="Approve and advance (a)"
-          onclick={approveAndAdvance}
-          disabled={roll.frames[currentIndex].approved}
-        >
-          <Icon name="approve" /> {roll.frames[currentIndex].approved ? "Approved" : "Approve"}
-        </button>
+        {#if roll.frames[currentIndex].approved}
+          <button class="btn" title="Unapprove (shift-a)" onclick={unapproveCurrent}>
+            <Icon name="approve" /> Unapprove
+          </button>
+        {:else}
+          <button class="btn" title="Approve and advance (a)" onclick={approveAndAdvance}>
+            <Icon name="approve" /> Approve
+          </button>
+        {/if}
         <button
           class="btn btn-primary"
           title="Heal approved"

@@ -63,6 +63,7 @@
       <ul>
         <li><kbd class="kbd">,</kbd> <kbd class="kbd">.</kbd> previous/next frame</li>
         <li><kbd class="kbd">a</kbd> approve and advance</li>
+        <li><kbd class="kbd">shift-a</kbd> unapprove</li>
       </ul>
     </section>
     <section>
