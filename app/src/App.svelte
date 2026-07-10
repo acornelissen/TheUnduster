@@ -4,6 +4,7 @@
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { open, save } from "@tauri-apps/plugin-dialog";
   import Viewer from "./lib/Viewer.svelte";
+  import Icon from "./lib/Icon.svelte";
   import Filmstrip from "./lib/Filmstrip.svelte";
   import StatusBar from "./lib/StatusBar.svelte";
   import Toasts from "./lib/Toasts.svelte";
@@ -1233,15 +1234,19 @@
   <header class="toolbar">
     <!-- File group: always visible -->
     <div class="toolbar-group">
-      <button class="btn" title="Open scan" onclick={openScan} disabled={loading !== null}>Open scan</button>
-      <button class="btn" title="Open roll (folder)" onclick={openRoll} disabled={loading !== null}>Open roll</button>
+      <button class="btn" title="Open scan" onclick={openScan} disabled={loading !== null}>
+        <Icon name="scan" /> Open scan
+      </button>
+      <button class="btn" title="Open roll (folder)" onclick={openRoll} disabled={loading !== null}>
+        <Icon name="roll" /> Open roll
+      </button>
     </div>
 
     <!-- Frame group: visible when info exists -->
     {#if info}
       <div class="toolbar-group">
         <button class="btn" title="Detect (d)" onclick={requestDetect} disabled={loading !== null || isDetecting}>
-          {isDetecting ? "Detecting..." : "Detect"}
+          <Icon name="detect" /> {isDetecting ? "Detecting..." : "Detect"}
         </button>
         <button
           class="btn btn-primary"
@@ -1249,11 +1254,11 @@
           onclick={requestHeal}
           disabled={loading !== null || isDetecting || isHealing || !info}
         >
-          {isHealing ? "Healing..." : "Heal"}
+          <Icon name="heal" /> {isHealing ? "Healing..." : "Heal"}
         </button>
         {#if !roll}
           <button class="btn" title="Export" onclick={exportSingle} disabled={!info.healed || exportingSingle}>
-            {exportingSingle ? "Exporting..." : "Export"}
+            <Icon name="export" /> {exportingSingle ? "Exporting..." : "Export"}
           </button>
         {/if}
       </div>
@@ -1268,7 +1273,7 @@
           onclick={approveAndAdvance}
           disabled={roll.frames[currentIndex].approved}
         >
-          {roll.frames[currentIndex].approved ? "Approved" : "Approve"}
+          <Icon name="approve" /> {roll.frames[currentIndex].approved ? "Approved" : "Approve"}
         </button>
         <button
           class="btn btn-primary"
@@ -1276,7 +1281,7 @@
           onclick={healApproved}
           disabled={roll.frames.every((f) => !f.approved)}
         >
-          Heal approved
+          <Icon name="heal" /> Heal approved
         </button>
         <button
           class="btn"
@@ -1284,7 +1289,7 @@
           onclick={exportApproved}
           disabled={roll.frames.every((f) => !f.approved)}
         >
-          Export approved
+          <Icon name="export" /> Export approved
         </button>
       </div>
     {/if}
@@ -1311,6 +1316,7 @@
     {#if modelStatus !== "loaded"}
       <div class="toolbar-group">
         <button class="btn" onclick={downloadModel} disabled={modelStatus === "downloading"}>
+          <Icon name="download" />
           {#if modelStatus === "missing"}
             Download healing model (207 MB)
           {:else if modelStatus === "available"}
@@ -1353,8 +1359,8 @@
         </svg>
         <p class="empty-title">no scan open</p>
         <div class="empty-actions">
-          <button class="btn" onclick={openScan}>Open scan</button>
-          <button class="btn" onclick={openRoll}>Open roll</button>
+          <button class="btn" onclick={openScan}><Icon name="scan" /> Open scan</button>
+          <button class="btn" onclick={openRoll}><Icon name="roll" /> Open roll</button>
         </div>
         <p class="hint">or drop a scan or a roll folder anywhere in this window</p>
       </div>

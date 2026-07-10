@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import Icon from "./Icon.svelte";
   import { fitZoom, visibleTiles, ringsFor, wheelZoomFactor, TILE, type Level } from "./viewport";
   import { TileRenderer, probPathFor, type StrokeSegment } from "./renderer";
   import {
@@ -601,7 +602,7 @@
           onclick={() => {
             toggleBrush("paint");
             canvas.focus();
-          }}>Paint</button
+          }}><Icon name="paint" /> Paint</button
         >
         <button
           class="btn"
@@ -612,7 +613,7 @@
           onclick={() => {
             toggleBrush("erase");
             canvas.focus();
-          }}>Erase</button
+          }}><Icon name="erase" /> Erase</button
         >
         <button
           class="btn"
@@ -623,7 +624,7 @@
           onclick={() => {
             toggleOverlay();
             canvas.focus();
-          }}>Overlay</button
+          }}><Icon name="overlay" /> Overlay</button
         >
         {#if brushMode !== "off"}
           <span class="radius-readout">{brushRadius}px</span>

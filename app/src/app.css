@@ -66,6 +66,10 @@ body {
 
 /* Buttons */
 .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-1);
   font: inherit;
   background: var(--bg-2);
   color: var(--text-1);
