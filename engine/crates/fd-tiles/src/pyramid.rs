@@ -58,9 +58,18 @@ fn base_rgba(img: &ImageBuf) -> Vec<u8> {
     out
 }
 
+/// Output dims of one 2x downsample step. THE halving rule: `Pyramid::build`
+/// levels follow exactly this, and `downsample_2x` derives its output size
+/// from it, so any dims-only consumer (e.g. the disk cache's header-level
+/// shape validation, which must not touch pixels) shares the single source
+/// of truth instead of reimplementing the rounding.
+pub fn downsample_dims(width: u32, height: u32) -> (u32, u32) {
+    (width.div_ceil(2).max(1), height.div_ceil(2).max(1))
+}
+
 /// 2x2 box-average downsample of an RGBA buffer. Returns (rgba, w, h).
 pub fn downsample_2x(rgba: &[u8], width: u32, height: u32) -> (Vec<u8>, u32, u32) {
-    let (nw, nh) = (width.div_ceil(2).max(1), height.div_ceil(2).max(1));
+    let (nw, nh) = downsample_dims(width, height);
     let mut out = vec![255u8; (nw * nh * 4) as usize];
     for oy in 0..nh {
         for ox in 0..nw {
@@ -134,5 +143,30 @@ impl Pyramid {
             height: h,
             rgba,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downsample_dims_matches_downsample_2x_output_dims() {
+        // Pin the pure dims rule against the real downsample's returned
+        // dims across odd/even/edge sizes, so a change to either that
+        // breaks their agreement fails here instead of silently letting
+        // dims-only consumers (the disk cache's shape validation) drift.
+        let sizes = [1u32, 2, 3, 4, 5, 7, 8, 511, 512, 513, 1000, 1001];
+        for &w in &sizes {
+            for &h in &sizes {
+                let rgba = vec![0u8; (w * h * 4) as usize];
+                let (_, real_w, real_h) = downsample_2x(&rgba, w, h);
+                assert_eq!(
+                    downsample_dims(w, h),
+                    (real_w, real_h),
+                    "dims rule disagrees with downsample_2x at {w}x{h}"
+                );
+            }
+        }
     }
 }

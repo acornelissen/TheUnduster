@@ -558,10 +558,12 @@ fn touch_pyramid_cache_file(path: &std::path::Path) {
 /// `set_image_id_if_absent` and closes its own image), so which id the
 /// frame ends up pointing at is the caller's decision, not this core's.
 ///
-/// `on_decoded` fires (if given) right after decode, before the pyramid
-/// step -- `activate_frame` uses it to emit the "building-pyramid" progress
-/// stage; `Prefetch` passes `None` since it emits no progress at all. On a
-/// cache hit the step is near-instant, but the same event fires regardless
+/// `on_decoded` fires (if given) right after the decode, before the pyramid
+/// step -- inside the blocking closure, between `decode_stage` and the cache
+/// read, so it marks the decode->pyramid boundary whether the pyramid then
+/// comes from the cache or a build. `activate_frame` uses it to emit the
+/// "building-pyramid" progress stage; `Prefetch` passes `None` since it
+/// emits no progress at all. On a cache hit the stage is just near-instant
 /// -- no new event is added for the hit/miss distinction.
 ///
 /// The pyramid cache path mirrors the heal cache's exactly: keyed by the
@@ -592,25 +594,25 @@ async fn decode_and_insert(
             // write -- and never fails activation; only a build is attempted.
             let stamp = stamp_or_skip(&path);
             let image = Images::decode_stage(&path)?;
+            if let Some(on_decoded) = on_decoded {
+                on_decoded();
+            }
 
             if let (Some(cache_path), Some(stamp)) = (cache_path.as_ref(), stamp.as_ref()) {
-                if let Some(pyramid) = cache::read_pyramid(cache_path, stamp) {
-                    // A cache hit is only trustworthy once its shape is
-                    // validated against the image that was actually just
-                    // decoded: a well-formed-per-level file whose shape
-                    // doesn't cohere with a true Pyramid::build output is the
-                    // corrupt class (delete + fall through to a fresh build),
-                    // not the stamp-mismatch-keep class -- see
-                    // `pyramid_shape_is_coherent`'s doc comment for why an
-                    // incoherent shape is unsafe to hand to `tile()`.
-                    if cache::pyramid_shape_is_coherent(&pyramid, image.width, image.height) {
-                        // Touch-on-read here, inside the blocking stage: it's a
-                        // single cheap syscall on a file we just proved we can
-                        // read, not worth a second background hop.
-                        touch_pyramid_cache_file(cache_path);
-                        return Ok((image, pyramid, None));
-                    }
-                    let _ = std::fs::remove_file(cache_path);
+                // read_pyramid validates the full shape (level 0 equals the
+                // just-decoded image's dims, every level the exact halving
+                // of the previous, correct termination) in a header-only
+                // pre-pass before decompressing anything; an incoherent or
+                // corrupt file is deleted inside the read and returns None,
+                // falling through to a fresh build here.
+                if let Some(pyramid) =
+                    cache::read_pyramid(cache_path, stamp, (image.width, image.height))
+                {
+                    // Touch-on-read here, inside the blocking stage: it's a
+                    // single cheap syscall on a file we just proved we can
+                    // read, not worth a second background hop.
+                    touch_pyramid_cache_file(cache_path);
+                    return Ok((image, pyramid, None));
                 }
             }
 
@@ -623,10 +625,6 @@ async fn decode_and_insert(
         })
         .await
         .map_err(|e| e.to_string())??;
-
-    if let Some(on_decoded) = on_decoded {
-        on_decoded();
-    }
 
     // Fire-and-forget write + prune: only on a fresh build (a cache hit has
     // nothing new to persist) with a usable stamp+cache_path pair. Never

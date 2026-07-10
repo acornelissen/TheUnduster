@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use fd_tiles::{downsample_2x, Level, Pyramid, TILE_SIZE};
+use fd_tiles::{downsample_dims, Level, Pyramid, TILE_SIZE};
 use sha2::{Digest, Sha256};
 
 pub const PROBS_MAGIC: &[u8; 8] = b"UNDPROB1";
@@ -46,6 +46,49 @@ pub fn source_stamp(path: &Path) -> Result<SourceStamp, String> {
         size: metadata.len(),
         mtime_nanos,
     })
+}
+
+/// Atomic write shared by all three cache codecs (probs/heal/pyramid):
+/// create the parent dir, write a temp file beside the destination, rename
+/// into place. The temp name carries the pid plus a process-wide counter so
+/// two concurrent writers of the SAME destination (e.g. activation and
+/// prefetch both freshly building the same frame's pyramid) each write
+/// their own temp file instead of interleaving into one -- a fixed temp
+/// name would let the loser's bytes tear the winner's mid-write, leaving a
+/// corrupt (self-healing on next read, but wasted) cache entry. The rename
+/// itself stays last-writer-wins, which is fine: both writers hold
+/// equivalent freshly-built content for the same stamp.
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("bad path: {}", path.display()))?;
+    let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = path.with_file_name(format!(
+        "{}.tmp-unduster-{}-{}",
+        file_name,
+        std::process::id(),
+        seq
+    ));
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+
+    std::fs::write(&tmp_path, bytes).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("write tmp failed: {e}")
+    })?;
+
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("rename failed: {e}")
+    })?;
+
+    Ok(())
 }
 
 /// Writes width*height probabilities as u8 (round(p*255)), zstd-compressed,
@@ -92,28 +135,7 @@ pub fn write_probs(
     header.extend_from_slice(&compressed_len.to_le_bytes());
     header.extend_from_slice(&compressed);
 
-    // Write atomically
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| format!("bad path: {}", path.display()))?;
-    let tmp_path = path.with_file_name(format!("{}.tmp-unduster", file_name));
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    }
-
-    std::fs::write(&tmp_path, &header).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp_path);
-        format!("write tmp failed: {e}")
-    })?;
-
-    std::fs::rename(&tmp_path, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp_path);
-        format!("rename failed: {e}")
-    })?;
-
-    Ok(())
+    atomic_write(path, &header)
 }
 
 /// Reads a probs cache written by write_probs. Returns None (never Err) when
@@ -386,28 +408,7 @@ pub fn write_heal(
     header.extend_from_slice(&(values_compressed.len() as u64).to_le_bytes());
     header.extend_from_slice(&values_compressed);
 
-    // Write atomically.
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| format!("bad path: {}", path.display()))?;
-    let tmp_path = path.with_file_name(format!("{}.tmp-unduster", file_name));
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    }
-
-    std::fs::write(&tmp_path, &header).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp_path);
-        format!("write tmp failed: {e}")
-    })?;
-
-    std::fs::rename(&tmp_path, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp_path);
-        format!("rename failed: {e}")
-    })?;
-
-    Ok(())
+    atomic_write(path, &header)
 }
 
 /// Reconstructs the healed image (original + patch) IF the cache entry
@@ -658,36 +659,45 @@ pub fn write_pyramid(path: &Path, pyramid: &Pyramid, stamp: &SourceStamp) -> Res
         header.extend_from_slice(&compressed);
     }
 
-    // Write atomically: same temp+rename dance as write_probs/write_heal.
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| format!("bad path: {}", path.display()))?;
-    let tmp_path = path.with_file_name(format!("{}.tmp-unduster", file_name));
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    }
-
-    std::fs::write(&tmp_path, &header).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp_path);
-        format!("write tmp failed: {e}")
-    })?;
-
-    std::fs::rename(&tmp_path, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp_path);
-        format!("rename failed: {e}")
-    })?;
-
-    Ok(())
+    atomic_write(path, &header)
 }
 
 /// Reads a cached pyramid. None on: missing file, stamp mismatch
 /// (source changed -- file kept, house mismatch-keep rule), or corrupt
-/// structure (file deleted on sight). Every level's rgba length is
-/// validated as width*height*4 with checked arithmetic, and each
-/// decompression is bounded to that expected size.
-pub fn read_pyramid(path: &Path, stamp: &SourceStamp) -> Option<Pyramid> {
+/// structure OR incoherent shape (file deleted on sight).
+///
+/// `expected_level0` is the just-decoded source image's dims; the caller
+/// always has them because the native decode is unconditional and precedes
+/// the cache read. Shape validation runs as a header-only pre-pass BEFORE
+/// any decompression: the per-level layout (width | height | comp_len |
+/// payload) makes payloads skippable, so the pre-pass walks every level's
+/// dims triple first and checks that level 0 equals `expected_level0`, that
+/// every subsequent level is exactly `fd_tiles::downsample_dims` of the
+/// previous (the single source of truth `Pyramid::build`'s own downsample
+/// derives its dims from), and that the chain terminates exactly where
+/// `Pyramid::build` would stop (last level's longest side <= `TILE_SIZE`,
+/// no level before or after that point). Only a file whose whole shape
+/// checks out gets a single byte decompressed.
+///
+/// Pre-pass ordering is the aggregate-bomb defense: without it, a planted
+/// 32-level non-halving file with ~2GB-claiming headers backed by tiny
+/// zstd'd zeros would materialize ~64GB transiently before any shape
+/// verdict. With it, a file must present a full coherent halving chain from
+/// the real image dims to earn decompression, which bounds the aggregate
+/// decompressed size to ~4/3 of level 0 by construction (a geometric series
+/// in quarters: 1 + 1/4 + 1/16 + ... < 4/3). Shape violations are the
+/// corrupt class, not mismatch-keep: unlike a stamp mismatch, an incoherent
+/// file can never become valid by retrying the same read later. An
+/// incoherent shape is also unsafe to hand to `Pyramid::tile` (its grid
+/// arithmetic assumes levels a real build produced).
+///
+/// Every level's rgba length is validated as width*height*4 with checked
+/// arithmetic, and each decompression is bounded to that expected size.
+pub fn read_pyramid(
+    path: &Path,
+    stamp: &SourceStamp,
+    expected_level0: (u32, u32),
+) -> Option<Pyramid> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(_) => return None, // absent file is not corruption
@@ -738,8 +748,19 @@ pub fn read_pyramid(path: &Path, stamp: &SourceStamp) -> Option<Pyramid> {
         return None; // stamp mismatch is not corruption
     }
 
-    let mut levels = Vec::with_capacity(level_count as usize);
-    for _ in 0..level_count {
+    // PASS 1: header-only structure + shape walk. Payloads are skipped by
+    // offset arithmetic; nothing is decompressed until the entire chain of
+    // dims has been proven coherent (see the doc comment for why this
+    // ordering is the bomb defense, not a style choice).
+    struct LevelHeader {
+        width: u32,
+        height: u32,
+        payload_start: usize,
+        payload_end: usize,
+        expected_len: usize,
+    }
+    let mut headers: Vec<LevelHeader> = Vec::with_capacity(level_count as usize);
+    for i in 0..level_count {
         if bytes.len() < offset + PYRAMID_LEVEL_HEADER_LEN {
             return corrupt();
         }
@@ -751,12 +772,30 @@ pub fn read_pyramid(path: &Path, stamp: &SourceStamp) -> Option<Pyramid> {
         let comp_len = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
         offset += 8;
 
-        let comp_end = match (offset as u64).checked_add(comp_len) {
+        let payload_start = offset;
+        let payload_end = match (offset as u64).checked_add(comp_len) {
             Some(e) if e <= bytes.len() as u64 => e as usize,
             _ => return corrupt(), // crafted/oversized length or truncated file
         };
-        let compressed = &bytes[offset..comp_end];
-        offset = comp_end;
+        offset = payload_end;
+
+        // Shape: level 0 must match the just-decoded image; every later
+        // level must be exactly the halving of the one before it, and a
+        // later level may only exist if the previous one was still above
+        // TILE_SIZE (Pyramid::build would have stopped otherwise).
+        if i == 0 {
+            if (width, height) != expected_level0 {
+                return corrupt();
+            }
+        } else {
+            let prev = headers.last().expect("i > 0 implies a previous header");
+            if prev.width.max(prev.height) <= TILE_SIZE {
+                return corrupt(); // extra level past the terminal one
+            }
+            if (width, height) != downsample_dims(prev.width, prev.height) {
+                return corrupt();
+            }
+        }
 
         let expected_len = match (width as usize)
             .checked_mul(height as usize)
@@ -766,29 +805,21 @@ pub fn read_pyramid(path: &Path, stamp: &SourceStamp) -> Option<Pyramid> {
             None => return corrupt(),
         };
 
-        // Cap the claimed size BEFORE handing it to the decompressor: the
-        // capacity below is allocated eagerly (see MAX_PYRAMID_LEVEL_BYTES),
-        // so an unchecked header-claimed size is a memory-DoS lever.
+        // Cap the claimed size BEFORE it can ever reach the decompressor:
+        // zstd::bulk::decompress allocates its capacity argument eagerly,
+        // so an unchecked header-claimed size is a memory-DoS lever. With
+        // shape validation pinning level 0 to the real image dims this is
+        // defense in depth, not the primary guard.
         if expected_len > MAX_PYRAMID_LEVEL_BYTES {
             return corrupt();
         }
 
-        // Bounded decompression: a frame that decompresses to more than
-        // expected_len errors, catching both decompress-bombs and a
-        // dimensions/payload disagreement in one shot. Equal-but-short
-        // payloads are caught by the length check right after.
-        let rgba = match zstd::bulk::decompress(compressed, expected_len) {
-            Ok(r) => r,
-            Err(_) => return corrupt(),
-        };
-        if rgba.len() != expected_len {
-            return corrupt();
-        }
-
-        levels.push(Level {
+        headers.push(LevelHeader {
             width,
             height,
-            rgba,
+            payload_start,
+            payload_end,
+            expected_len,
         });
     }
 
@@ -797,62 +828,38 @@ pub fn read_pyramid(path: &Path, stamp: &SourceStamp) -> Option<Pyramid> {
         return corrupt();
     }
 
-    Some(Pyramid { levels })
-}
-
-/// True when `pyramid` is a well-formed, fully coherent display pyramid for
-/// an image of `image_width`x`image_height`: level 0's dims match the
-/// decoded image exactly, and every subsequent level is exactly the
-/// halving of the previous under `Pyramid::build`'s own rule (reusing
-/// `fd_tiles::downsample_2x`'s dims so this can never drift from the real
-/// rounding), terminating exactly where `Pyramid::build` would stop (the
-/// last level's longest side <= `TILE_SIZE`, and no level after that).
-///
-/// This is a stricter check than `read_pyramid`'s per-level structural
-/// validation: a file can pass every per-level check (magic, version,
-/// length-matches-payload) while still being shape-incoherent -- e.g. a
-/// level 1 that doesn't halve level 0, or a level0 that doesn't match the
-/// image that was actually decoded. Two concrete costs of skipping this:
-/// `Pyramid::tile`'s `l.width - x0` subtraction assumes a self-consistent
-/// grid derived from a coherent pyramid and can underflow/panic against an
-/// engineered level; and an incoherent file can claim up to
-/// `MAX_PYRAMID_LEVELS` (32) levels each near `MAX_PYRAMID_LEVEL_BYTES` (2
-/// GiB), an aggregate zstd-bomb far beyond any real pyramid -- full halving
-/// coherence bounds the aggregate to ~4/3 of level 0 by construction (a
-/// geometric series in quarters: 1 + 1/4 + 1/16 + ... < 4/3).
-///
-/// A cache-read pyramid MUST pass this before it ever reaches `tile()`;
-/// failure is the corrupt class (delete + fall through to a fresh build),
-/// not the mismatch-keep class -- unlike a stamp mismatch, a well-formed
-/// per-level-but-incoherent-shape file can never become valid by retrying
-/// the same read later.
-pub fn pyramid_shape_is_coherent(pyramid: &Pyramid, image_width: u32, image_height: u32) -> bool {
-    let Some(level0) = pyramid.levels.first() else {
-        return false;
-    };
-    if level0.width != image_width || level0.height != image_height {
-        return false;
-    }
-
-    let mut prev = level0;
-    for level in &pyramid.levels[1..] {
-        // Pyramid::build only ever appends another level while the
-        // previous one's longest side still exceeds TILE_SIZE; a level
-        // beyond that point is one Pyramid::build would never have built.
-        if prev.width.max(prev.height) <= TILE_SIZE {
-            return false;
-        }
-        let (_, expected_w, expected_h) = downsample_2x(&prev.rgba, prev.width, prev.height);
-        if level.width != expected_w || level.height != expected_h {
-            return false;
-        }
-        prev = level;
-    }
-
-    // The last level must actually be terminal -- Pyramid::build stops
+    // The last level must actually be terminal: Pyramid::build stops
     // exactly when the longest side drops to TILE_SIZE or below, never
-    // earlier and never later.
-    prev.width.max(prev.height) <= TILE_SIZE
+    // earlier (missing levels) and never later (checked per level above).
+    let last = headers.last().expect("level_count >= 1");
+    if last.width.max(last.height) > TILE_SIZE {
+        return corrupt();
+    }
+
+    // PASS 2: bounded decompression, only now that the whole shape is
+    // proven coherent.
+    let mut levels = Vec::with_capacity(headers.len());
+    for header in &headers {
+        let compressed = &bytes[header.payload_start..header.payload_end];
+        // Bounded decompression: a payload that decompresses to more than
+        // expected_len errors, catching both decompress-bombs and a
+        // dimensions/payload disagreement in one shot. Equal-but-short
+        // payloads are caught by the length check right after.
+        let rgba = match zstd::bulk::decompress(compressed, header.expected_len) {
+            Ok(r) => r,
+            Err(_) => return corrupt(),
+        };
+        if rgba.len() != header.expected_len {
+            return corrupt();
+        }
+        levels.push(Level {
+            width: header.width,
+            height: header.height,
+            rgba,
+        });
+    }
+
+    Some(Pyramid { levels })
 }
 
 /// Deletes the oldest-mtime `*.pyr` files under `dir` until the total size
@@ -1324,10 +1331,40 @@ mod tests {
         }
     }
 
+    /// Coherent two-level fixture: 1000x1000 (> TILE_SIZE=512) halving to
+    /// 500x500 (terminal) -- a shape `Pyramid::build` would really produce,
+    /// which read_pyramid's header pre-pass now insists on.
     fn synth_pyramid() -> fd_tiles::Pyramid {
         fd_tiles::Pyramid {
-            levels: vec![synth_level(4, 4, 11), synth_level(2, 2, 97)],
+            levels: vec![synth_level(1000, 1000, 11), synth_level(500, 500, 97)],
         }
+    }
+
+    const SYNTH_DIMS: (u32, u32) = (1000, 1000);
+
+    /// Hand-crafts an on-disk pyramid file with the given per-level claimed
+    /// dims, each backed by a VALID zstd payload whose decompressed length
+    /// matches the claim. Valid payloads make the shape tests strict: if
+    /// the header pre-pass were removed, these files would decompress
+    /// cleanly and read_pyramid would return Some, failing the tests'
+    /// `is_none()` -- garbage payloads could not tell that regression apart
+    /// from a decompression failure (both are the corrupt class).
+    fn craft_pyramid_file(p: &Path, s: &SourceStamp, dims: &[(u32, u32)]) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(PYRAMID_MAGIC);
+        bytes.extend_from_slice(&PYRAMID_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&s.size.to_le_bytes());
+        bytes.extend_from_slice(&s.mtime_nanos.to_le_bytes());
+        for &(w, h) in dims {
+            let rgba = vec![0u8; (w as usize) * (h as usize) * 4];
+            let compressed = zstd::encode_all(&rgba[..], 1).unwrap();
+            bytes.extend_from_slice(&w.to_le_bytes());
+            bytes.extend_from_slice(&h.to_le_bytes());
+            bytes.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(&compressed);
+        }
+        std::fs::write(p, &bytes).unwrap();
     }
 
     #[test]
@@ -1337,13 +1374,30 @@ mod tests {
         let pyramid = synth_pyramid();
         let s = stamp();
         write_pyramid(&p, &pyramid, &s).unwrap();
-        let back = read_pyramid(&p, &s).expect("cache readable");
+        let back = read_pyramid(&p, &s, SYNTH_DIMS).expect("cache readable");
         assert_eq!(back.levels.len(), pyramid.levels.len());
         for (a, b) in pyramid.levels.iter().zip(&back.levels) {
             assert_eq!(a.width, b.width);
             assert_eq!(a.height, b.height);
             assert_eq!(a.rgba, b.rgba);
         }
+    }
+
+    #[test]
+    fn single_level_pyramid_round_trips() {
+        // A source no larger than TILE_SIZE in either dimension never grows
+        // a second level under Pyramid::build; the terminal rule must
+        // accept the one-level shape.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.pyr");
+        let pyramid = fd_tiles::Pyramid {
+            levels: vec![synth_level(4, 4, 11)],
+        };
+        let s = stamp();
+        write_pyramid(&p, &pyramid, &s).unwrap();
+        let back = read_pyramid(&p, &s, (4, 4)).expect("cache readable");
+        assert_eq!(back.levels.len(), 1);
+        assert_eq!(back.levels[0].rgba, pyramid.levels[0].rgba);
     }
 
     #[test]
@@ -1357,7 +1411,7 @@ mod tests {
             size: s.size + 1,
             mtime_nanos: s.mtime_nanos,
         };
-        assert!(read_pyramid(&p, &mismatched).is_none());
+        assert!(read_pyramid(&p, &mismatched, SYNTH_DIMS).is_none());
         assert!(p.exists(), "stamp mismatch is not corruption; file kept");
     }
 
@@ -1373,7 +1427,7 @@ mod tests {
         bytes[0..8].copy_from_slice(b"UNDPYRA0");
         std::fs::write(&p, &bytes).unwrap();
 
-        assert!(read_pyramid(&p, &s).is_none());
+        assert!(read_pyramid(&p, &s, SYNTH_DIMS).is_none());
         assert!(!p.exists(), "corrupt magic file is deleted on sight");
     }
 
@@ -1391,7 +1445,7 @@ mod tests {
         let truncated = &bytes[..bytes.len() - 4];
         std::fs::write(&p, truncated).unwrap();
 
-        assert!(read_pyramid(&p, &s).is_none());
+        assert!(read_pyramid(&p, &s, SYNTH_DIMS).is_none());
         assert!(!p.exists(), "truncated file is deleted on sight");
     }
 
@@ -1404,7 +1458,9 @@ mod tests {
         // Hand-craft a one-level pyramid whose header claims 4x4 (64 bytes
         // decompressed) but whose zstd payload actually decompresses to
         // 2x2 (16 bytes) worth of data -- width*height*4 disagrees with the
-        // real decompressed length.
+        // real decompressed length. The shape pre-pass passes (a 4x4 single
+        // level is terminal), so this exercises pass 2's bounded
+        // decompression length check.
         let lying_payload = [0u8; 16];
         let compressed = zstd::encode_all(&lying_payload[..], 1).unwrap();
 
@@ -1421,86 +1477,86 @@ mod tests {
 
         std::fs::write(&p, &bytes).unwrap();
 
-        assert!(read_pyramid(&p, &s).is_none());
+        assert!(read_pyramid(&p, &s, (4, 4)).is_none());
         assert!(!p.exists(), "level length lie is treated as corruption");
     }
 
+    // Shape validation lives inside read_pyramid's header pre-pass now
+    // (BEFORE any decompression); these tests exercise it with crafted
+    // files whose payloads are valid zstd matching the claimed dims, so a
+    // removed/weakened shape check would decompress cleanly and return
+    // Some, failing each `is_none()` -- see `craft_pyramid_file`.
+
     #[test]
-    fn coherent_pyramid_shape_passes() {
-        // level0 1000x1000 (> TILE_SIZE=512) halves to level1 500x500 (<=
-        // TILE_SIZE, terminal); halving math must match Pyramid::build's
-        // downsample_2x (div_ceil(2).max(1)) exactly.
-        let pyramid = fd_tiles::Pyramid {
-            levels: vec![synth_level(1000, 1000, 11), synth_level(500, 500, 97)],
-        };
-        assert!(pyramid_shape_is_coherent(&pyramid, 1000, 1000));
+    fn wrong_level0_dims_is_corrupt_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.pyr");
+        let s = stamp();
+        craft_pyramid_file(&p, &s, &[(1000, 1000), (500, 500)]);
+        // Well-formed, internally coherent file -- but for an image of
+        // different dims than the one just decoded, despite a matching
+        // stamp. Corrupt class: delete, fresh build.
+        assert!(read_pyramid(&p, &s, (1001, 1000)).is_none());
+        assert!(!p.exists(), "wrong level0 dims delete the file");
     }
 
     #[test]
-    fn wrong_level0_dims_fails_shape_check() {
-        let pyramid = fd_tiles::Pyramid {
-            levels: vec![synth_level(1000, 1000, 11), synth_level(500, 500, 97)],
-        };
-        assert!(!pyramid_shape_is_coherent(&pyramid, 1001, 1000));
-        assert!(!pyramid_shape_is_coherent(&pyramid, 1000, 1001));
+    fn level1_too_big_is_corrupt_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.pyr");
+        let s = stamp();
+        // level0 1000x1000 must halve to 500x500; claiming 600x600 is
+        // incoherent even though every level is individually well-formed.
+        craft_pyramid_file(&p, &s, &[(1000, 1000), (600, 600)]);
+        assert!(read_pyramid(&p, &s, (1000, 1000)).is_none());
+        assert!(!p.exists(), "non-halving level1 deletes the file");
     }
 
     #[test]
-    fn level1_too_big_fails_shape_check() {
-        // level0 1000x1000 should halve to 500x500; claiming 600x600 is
-        // incoherent even though it's individually well-formed.
-        let pyramid = fd_tiles::Pyramid {
-            levels: vec![synth_level(1000, 1000, 11), synth_level(600, 600, 97)],
-        };
-        assert!(!pyramid_shape_is_coherent(&pyramid, 1000, 1000));
-    }
-
-    #[test]
-    fn halving_off_by_one_fails_shape_check() {
+    fn halving_off_by_one_is_corrupt_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.pyr");
+        let s = stamp();
         // Real rule for an odd dimension is div_ceil(2).max(1): 1001 -> 501,
         // not 500.
-        let pyramid = fd_tiles::Pyramid {
-            levels: vec![synth_level(1001, 1001, 11), synth_level(500, 500, 97)],
-        };
-        assert!(!pyramid_shape_is_coherent(&pyramid, 1001, 1001));
+        craft_pyramid_file(&p, &s, &[(1001, 1001), (500, 500)]);
+        assert!(read_pyramid(&p, &s, (1001, 1001)).is_none());
+        assert!(!p.exists(), "off-by-one halving deletes the file");
     }
 
     #[test]
-    fn missing_final_level_fails_shape_check() {
-        // A pyramid that stops before reaching <= TILE_SIZE is incoherent
-        // (Pyramid::build never stops early). 2000 -> 1000 is a correct
-        // halving, but 1000 > TILE_SIZE so Pyramid::build would keep going;
-        // stopping here is missing the terminal level.
-        let pyramid = fd_tiles::Pyramid {
-            levels: vec![synth_level(4000, 4000, 11), synth_level(2000, 2000, 97)],
-        };
-        assert!(!pyramid_shape_is_coherent(&pyramid, 4000, 4000));
+    fn missing_terminal_level_is_corrupt_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.pyr");
+        let s = stamp();
+        // 2048 -> 1024 is a correct halving, but 1024 > TILE_SIZE so
+        // Pyramid::build would have kept going; stopping here is a chain
+        // missing its terminal level.
+        craft_pyramid_file(&p, &s, &[(2048, 2048), (1024, 1024)]);
+        assert!(read_pyramid(&p, &s, (2048, 2048)).is_none());
+        assert!(!p.exists(), "missing terminal level deletes the file");
     }
 
     #[test]
-    fn empty_pyramid_fails_shape_check() {
-        let pyramid = fd_tiles::Pyramid { levels: vec![] };
-        assert!(!pyramid_shape_is_coherent(&pyramid, 4, 4));
-    }
-
-    #[test]
-    fn single_level_pyramid_at_or_under_tile_size_is_coherent() {
-        // A source image no larger than TILE_SIZE in either dimension never
-        // grows a second level under Pyramid::build.
-        let pyramid = fd_tiles::Pyramid {
-            levels: vec![synth_level(4, 4, 11)],
-        };
-        assert!(pyramid_shape_is_coherent(&pyramid, 4, 4));
-    }
-
-    #[test]
-    fn extra_level_past_terminal_fails_shape_check() {
+    fn extra_level_past_terminal_is_corrupt_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.pyr");
+        let s = stamp();
         // level0 4x4 is already <= TILE_SIZE; Pyramid::build would never
         // have appended a second level at all.
-        let pyramid = fd_tiles::Pyramid {
-            levels: vec![synth_level(4, 4, 11), synth_level(2, 2, 97)],
-        };
-        assert!(!pyramid_shape_is_coherent(&pyramid, 4, 4));
+        craft_pyramid_file(&p, &s, &[(4, 4), (2, 2)]);
+        assert!(read_pyramid(&p, &s, (4, 4)).is_none());
+        assert!(!p.exists(), "extra level past terminal deletes the file");
+    }
+
+    #[test]
+    fn zero_level_pyramid_is_corrupt_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.pyr");
+        let s = stamp();
+        craft_pyramid_file(&p, &s, &[]);
+        assert!(read_pyramid(&p, &s, (4, 4)).is_none());
+        assert!(!p.exists(), "zero-level file deletes on sight");
     }
 
     #[test]
@@ -1574,18 +1630,23 @@ mod tests {
         let p = dir.path().join("a.pyr");
         let s = stamp();
 
-        // A ~100-byte crafted file claiming a 65535x65535 level: expected_len
-        // is ~17GB, which zstd::bulk::decompress would Vec::with_capacity
-        // EAGERLY before decompressing a single byte. The cap check must
-        // reject this as corrupt (delete + None) BEFORE the decompress call,
-        // so this test never drives a giant allocation.
+        // A ~100-byte crafted file claiming a 65535x65535 level 0:
+        // expected_len is ~17GB, which zstd::bulk::decompress would
+        // Vec::with_capacity EAGERLY before decompressing a single byte.
+        // With expected_level0 matching (the attacker controls the claim,
+        // and could pair it with a genuinely huge source), the shape check
+        // passes at level 0 -- the byte cap in the header pre-pass must
+        // reject it as corrupt (delete + None) BEFORE any decompression, so
+        // this test never drives a giant allocation. level_count claims 8
+        // (a coherent chain's length from 65535) but the cap fires while
+        // parsing level 0, before the missing headers even matter.
         let tiny_payload = [0u8; 16];
         let compressed = zstd::encode_all(&tiny_payload[..], 1).unwrap();
 
         let mut bytes = Vec::new();
         bytes.extend_from_slice(PYRAMID_MAGIC);
         bytes.extend_from_slice(&PYRAMID_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&1u32.to_le_bytes()); // level_count
+        bytes.extend_from_slice(&8u32.to_le_bytes()); // level_count
         bytes.extend_from_slice(&s.size.to_le_bytes());
         bytes.extend_from_slice(&s.mtime_nanos.to_le_bytes());
         bytes.extend_from_slice(&65535u32.to_le_bytes()); // width
@@ -1595,7 +1656,7 @@ mod tests {
 
         std::fs::write(&p, &bytes).unwrap();
 
-        assert!(read_pyramid(&p, &s).is_none());
+        assert!(read_pyramid(&p, &s, (65535, 65535)).is_none());
         assert!(!p.exists(), "giant claimed level is treated as corruption");
     }
 }
