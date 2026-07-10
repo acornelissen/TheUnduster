@@ -46,15 +46,18 @@ export interface LeftZoneInput {
   position: { index: number; total: number } | null;
   defectCount: number | null;
   threshold: number;
+  healed: boolean;
   healStale: boolean;
   brushStatus: string | null;
 }
 
 /** Frame-identity string for the left zone: file name, roll position,
  * defect count at the current threshold (or "not yet detected" while none
- * exists), the stale-heal hint (frame state, not activity), and the live
- * brush status (frame-interaction state, e.g. "brush 24px"). The
- * single-export note lives as a toast (see lib/toasts.ts), not here. */
+ * exists), the healed-state indicator, the stale-heal hint (frame state,
+ * not activity -- stale-heal only ever occurs on already-healed frames, so
+ * it follows directly after), and the live brush status (frame-interaction
+ * state, e.g. "brush 24px"). The single-export note lives as a toast (see
+ * lib/toasts.ts), not here. */
 export function composeLeft(input: LeftZoneInput): string {
   if (!input.fileName) return "";
   const parts = [input.fileName];
@@ -66,6 +69,9 @@ export function composeLeft(input: LeftZoneInput): string {
     parts.push(`${input.defectCount} ${noun} at ${input.threshold.toFixed(2)}`);
   } else {
     parts.push("not yet detected");
+  }
+  if (input.healed) {
+    parts.push("healed (space compares)");
   }
   if (input.healStale) {
     parts.push("heal stale (h re-heals)");

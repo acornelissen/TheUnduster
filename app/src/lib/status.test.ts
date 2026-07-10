@@ -87,6 +87,7 @@ describe("composeLeft", () => {
     position: null as { index: number; total: number } | null,
     defectCount: null as number | null,
     threshold: 0.5,
+    healed: false,
     healStale: false,
     brushStatus: null as string | null,
   };
@@ -111,6 +112,12 @@ describe("composeLeft", () => {
     expect(composeLeft({ ...base, defectCount: 1 })).toBe("raw0002.jpg  1 defect at 0.50");
   });
 
+  it("shows the healed-state indicator when the frame is healed", () => {
+    expect(composeLeft({ ...base, defectCount: 3, healed: true })).toBe(
+      "raw0002.jpg  3 defects at 0.50  healed (space compares)",
+    );
+  });
+
   it("appends the stale-heal hint to the left zone when the frame's heal is stale", () => {
     expect(composeLeft({ ...base, defectCount: 3, healStale: true })).toBe(
       "raw0002.jpg  3 defects at 0.50  heal stale (h re-heals)",
@@ -130,11 +137,12 @@ describe("composeLeft", () => {
         position: { index: 2, total: 4 },
         defectCount: 11,
         threshold: 0.5,
+        healed: true,
         healStale: true,
         brushStatus: "erase 12px",
       }),
     ).toBe(
-      "raw0002.jpg  3/4  11 defects at 0.50  heal stale (h re-heals)  erase 12px",
+      "raw0002.jpg  3/4  11 defects at 0.50  healed (space compares)  heal stale (h re-heals)  erase 12px",
     );
   });
 

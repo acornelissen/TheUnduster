@@ -954,6 +954,7 @@
             ? r.frames[currentIndex].defect_count
             : null,
       threshold: overlay.threshold,
+      healed: info?.healed ?? false,
       healStale,
       // Live call, not a snapshot: brushStatus() reads the Viewer's $state
       // (brushMode/brushRadius), so this derived re-evaluates whenever the
