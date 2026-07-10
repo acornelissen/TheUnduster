@@ -312,7 +312,9 @@
           if (e.payload.kind === "detect") {
             detected = true;
             void viewer?.refreshDetections(overlay.threshold);
-          } else if (info) {
+          } else if (e.payload.kind === "heal" && info) {
+            // Export completions land here too now; only a heal makes the
+            // registry's healed tiles real, so only a heal may claim healed.
             info = { ...info, healed: true };
           }
         }
