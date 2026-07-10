@@ -10,6 +10,10 @@ pub enum JobKind {
     Detect,
     Heal,
     Export,
+    /// Warms a neighbor frame into the registry (decode + pyramid) without
+    /// detecting or healing it, so stepping through a roll hits a resident
+    /// entry instead of paying the full decode on arrival.
+    Prefetch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -200,6 +204,20 @@ mod tests {
         assert!(q.enqueue(job(JobKind::Export, 1), false).unwrap()); // distinct kind, kept
         assert!(!q.enqueue(job(JobKind::Export, 1), false).unwrap()); // duplicate coalesced
         assert_eq!(q.len().unwrap(), 2);
+    }
+
+    #[test]
+    fn prefetch_kind_coalesces_separately_from_other_kinds_on_the_same_index() {
+        let q = JobQueue::default();
+        assert!(q.enqueue(job(JobKind::Detect, 1), false).unwrap());
+        assert!(q.enqueue(job(JobKind::Heal, 1), false).unwrap());
+        assert!(q.enqueue(job(JobKind::Export, 1), false).unwrap());
+        // Prefetch on the same index as three other kinds is a distinct job.
+        assert!(q.enqueue(job(JobKind::Prefetch, 1), false).unwrap());
+        // A second prefetch on that index coalesces with the first, not with
+        // any of the other kinds.
+        assert!(!q.enqueue(job(JobKind::Prefetch, 1), false).unwrap());
+        assert_eq!(q.len().unwrap(), 4);
     }
 
     #[test]

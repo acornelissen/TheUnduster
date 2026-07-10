@@ -458,6 +458,18 @@ impl RollState {
         Ok(())
     }
 
+    /// The most recently touched frame index -- i.e. the frame actually on
+    /// screen, as opposed to a job's own `index`, which for a prefetch job is
+    /// a neighbor rather than the displayed frame. `evict_over_budget` must
+    /// be called with this value (not the prefetch job's index) so the
+    /// keep-window it derives protects the real current frame, never a
+    /// neighbor being warmed in the background. None before any frame has
+    /// ever been activated this roll.
+    pub fn current_index(&self) -> Result<Option<usize>, String> {
+        let lru = self.lru.lock().map_err(|e| e.to_string())?;
+        Ok(lru.last().copied())
+    }
+
     pub fn clear_image_id(&self, index: usize) -> Result<(), String> {
         let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
         let roll = guard.as_mut().ok_or("no roll open")?;

@@ -518,6 +518,53 @@ fn evict_over_budget(
     Ok(())
 }
 
+/// Decode + build-pyramid + registry-insert core shared by `activate_frame`'s
+/// fresh-decode path and the `Prefetch` job arm. Neither the reuse path
+/// (already resident) nor activation's UI-contract steps -- the "decoding"
+/// progress emit, the probs-cache restore, `roll.touch`, `evict_over_budget`,
+/// and the terminal "ready" emit -- live here: those differ between
+/// "the operator is waiting on this frame" and "warm this frame quietly in
+/// the background", so callers keep them.
+///
+/// `on_decoded` fires (if given) right after decode, before the
+/// (comparatively fast) pyramid build -- `activate_frame` uses it to emit
+/// the "building-pyramid" progress stage; `Prefetch` passes `None` since it
+/// emits no progress at all.
+async fn decode_and_register(
+    images: &State<'_, Mutex<Images>>,
+    roll: &State<'_, roll::RollState>,
+    index: usize,
+    path: std::path::PathBuf,
+    on_decoded: Option<impl FnOnce() + Send + 'static>,
+) -> Result<ImageInfo, String> {
+    let image = tauri::async_runtime::spawn_blocking(move || Images::decode_stage(&path))
+        .await
+        .map_err(|e| e.to_string())??;
+    if let Some(on_decoded) = on_decoded {
+        on_decoded();
+    }
+    let pyramid = {
+        let image = image.clone();
+        tauri::async_runtime::spawn_blocking(move || Images::pyramid_stage(&image))
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    let prepared = Prepared { image, pyramid };
+    let info = {
+        let mut images = images.lock().map_err(|e| e.to_string())?;
+        images.insert(prepared)
+    };
+    // Concurrent activations/prefetches of the same frame each decode
+    // independently; whichever lands later replaces the frame's id, and the
+    // superseded image must be closed or it is orphaned in the registry
+    // (about a gigabyte of leaked pixels per rapid re-click on a 168MP scan).
+    if let Some(superseded) = roll.set_image_id(index, info.id)? {
+        let mut images = images.lock().map_err(|e| e.to_string())?;
+        images.close(superseded);
+    }
+    Ok(info)
+}
+
 #[tauri::command]
 async fn activate_frame(
     app: tauri::AppHandle,
@@ -572,35 +619,23 @@ async fn activate_frame(
             stage: "decoding",
         },
     );
-    let image = tauri::async_runtime::spawn_blocking(move || Images::decode_stage(&path))
-        .await
-        .map_err(|e| e.to_string())??;
-    let _ = app.emit(
-        "app-progress",
-        Progress {
-            id: 0,
-            stage: "building-pyramid",
-        },
-    );
-    let pyramid = {
-        let image = image.clone();
-        tauri::async_runtime::spawn_blocking(move || Images::pyramid_stage(&image))
-            .await
-            .map_err(|e| e.to_string())?
-    };
-    let prepared = Prepared { image, pyramid };
-    let info = {
-        let mut images = images.lock().map_err(|e| e.to_string())?;
-        images.insert(prepared)
-    };
-    // Concurrent activations of the same frame each decode independently;
-    // whichever lands later replaces the frame's id, and the superseded
-    // image must be closed or it is orphaned in the registry (about a
-    // gigabyte of leaked pixels per rapid re-click on a 168MP scan).
-    if let Some(superseded) = roll.set_image_id(index, info.id)? {
-        let mut images = images.lock().map_err(|e| e.to_string())?;
-        images.close(superseded);
-    }
+    let decode_progress = app.clone();
+    let info = decode_and_register(
+        &images,
+        &roll,
+        index,
+        path,
+        Some(move || {
+            let _ = decode_progress.emit(
+                "app-progress",
+                Progress {
+                    id: 0,
+                    stage: "building-pyramid",
+                },
+            );
+        }),
+    )
+    .await?;
 
     // Decode-path frames start with no probs; restore a cache hit so a
     // scanned frame becomes detection-ready across relaunches without
@@ -1621,6 +1656,48 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                 .state::<roll::RollState>()
                 .set_exported(generation, index);
             let _ = app.emit("export-progress", ExportProgress { index });
+            Ok(())
+        }
+        jobs::JobKind::Prefetch => {
+            let images_state = app.state::<Mutex<Images>>();
+            // Already registry-resident: nothing to do. Mirrors the Detect
+            // arm's resident check (image_id + registry lookup), but a
+            // prefetch has no "already detected" condition to also check --
+            // residency alone is the whole job.
+            if let Some(id) = image_id {
+                let images = images_state.lock().map_err(|e| e.to_string())?;
+                if images.image(id).is_some() {
+                    return Ok(());
+                }
+            }
+            // The pin slot holds an image id, and this frame has none yet (it
+            // is not resident -- that was just ruled out above), so there is
+            // nothing to pin until after decode+insert produces one. A
+            // concurrent activate_frame's evict_over_budget could in
+            // principle run in the gap between this insert and the pin below
+            // and evict the frame just inserted; that is a wasted decode, not
+            // a safety problem -- it can only ever evict a NON-current,
+            // NON-pinned frame (evict_over_budget always skips the pinned id
+            // and the caller's keep-window), so the displayed frame is never
+            // at risk either way.
+            let roll_state = app.state::<roll::RollState>();
+            let queue = app.state::<jobs::JobQueue>();
+            let info =
+                decode_and_register(&images_state, &roll_state, index, path, None::<fn()>).await?;
+            queue.pin(Some(info.id))?;
+            // Unpins on every exit past this point, including an early `?`
+            // from `current_index()` below.
+            let _pin_guard = PinGuard(app.clone());
+            // Protect the frame actually on screen, not this prefetch job's
+            // own index -- `current_index` is the roll's most-recently-touched
+            // frame (set by activate_frame's `roll.touch`), which is exactly
+            // what evict_over_budget must treat as `current` so its
+            // keep-window (current-1..=current+1) shields the displayed frame
+            // and not some other window centered on the neighbor being
+            // warmed here.
+            if let Some(current) = roll_state.current_index()? {
+                evict_over_budget(&images_state, &roll_state, &queue, current)?;
+            }
             Ok(())
         }
     }
