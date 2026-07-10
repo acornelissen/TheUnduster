@@ -1016,7 +1016,8 @@
     const threshold = overlay.threshold;
     thresholdSaveTimer = setTimeout(() => {
       thresholdSaveTimer = undefined;
-      invoke<number | null>("set_frame_threshold", { index, threshold })
+      if (generation === null) return;
+      invoke<number | null>("set_frame_threshold", { index, threshold, generation })
         .then((count) => {
           // Mirror-back guard, same shape as the job-event generation checks
           // above: a stale generation means the roll was swapped while this

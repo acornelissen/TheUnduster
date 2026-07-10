@@ -708,20 +708,22 @@ async fn activate_frame(
 /// or when the write was discarded because the roll changed mid-command --
 /// either way the frontend leaves the chip alone.
 ///
-/// The generation is snapshotted at entry, before any lookup: this command
-/// takes three separate lock acquisitions (image-id read, components
-/// computation, sidecar write) with nothing held across them, so `open_roll`
-/// can swap the roll between any two. The setter re-checks the snapshot
-/// under the write lock and discards a stale write, same discipline as
-/// `record_scan_result`/`set_exported`.
+/// The generation travels with the work, `record_scan_result`-style: the
+/// frontend captures it when the debounced save is SCHEDULED and forwards
+/// it here, so a timer that fires entirely after a roll swap carries the
+/// old roll's generation and is discarded -- a fresh snapshot at command
+/// entry would legitimize it against the new roll. The setter re-checks
+/// under the write lock, closing the mid-command swap window too (this
+/// command takes three separate lock acquisitions -- image-id read,
+/// components computation, sidecar write -- with nothing held across them).
 #[tauri::command]
 fn set_frame_threshold(
     roll: State<'_, roll::RollState>,
     images: State<'_, Mutex<Images>>,
     index: usize,
     threshold: f32,
+    generation: u64,
 ) -> Result<Option<usize>, String> {
-    let generation = roll.generation();
     let (count, bboxes) = match roll.image_id(index)? {
         Some(id) => {
             let images = images.lock().map_err(|e| e.to_string())?;
