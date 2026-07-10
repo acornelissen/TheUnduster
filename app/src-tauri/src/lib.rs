@@ -699,13 +699,32 @@ async fn activate_frame(
     Ok(info)
 }
 
+/// Sets a frame's threshold and, when the frame's image is registry-resident
+/// with probabilities, recomputes and persists its component count and boxes
+/// alongside it -- so the filmstrip's defect-count chip (sourced from the
+/// sidecar) follows the sensitivity slider instead of staying pinned at the
+/// scan's fixed `SCAN_THRESHOLD`. Returns the new count: `None` when the
+/// frame isn't resident or has no probabilities yet (nothing to recompute),
+/// in which case the frontend leaves the chip alone.
 #[tauri::command]
 fn set_frame_threshold(
-    state: State<'_, roll::RollState>,
+    roll: State<'_, roll::RollState>,
+    images: State<'_, Mutex<Images>>,
     index: usize,
     threshold: f32,
-) -> Result<(), String> {
-    state.set_threshold(index, threshold)
+) -> Result<Option<usize>, String> {
+    let (count, bboxes) = match roll.image_id(index)? {
+        Some(id) => {
+            let images = images.lock().map_err(|e| e.to_string())?;
+            match images.components(id, threshold) {
+                Some(bboxes) => (Some(bboxes.len()), Some(bboxes)),
+                None => (None, None),
+            }
+        }
+        None => (None, None),
+    };
+    roll.set_threshold_and_components(index, threshold, count, bboxes)?;
+    Ok(count)
 }
 
 #[tauri::command]
@@ -715,6 +734,16 @@ fn approve_frame(
     approved: bool,
 ) -> Result<(), String> {
     state.set_approved(index, approved)
+}
+
+/// Inverse of `approve_frame`: un-marks a frame as approved without touching
+/// `exported` (an operator un-approving a frame they already exported still
+/// wants "export approved" to skip it next time unless they re-approve it).
+/// `set_approved` already takes the bool both directions, so this is a thin
+/// mirrored command rather than a new roll.rs setter.
+#[tauri::command]
+fn unapprove_frame(state: State<'_, roll::RollState>, index: usize) -> Result<(), String> {
+    state.set_approved(index, false)
 }
 
 #[tauri::command]
@@ -2017,6 +2046,7 @@ pub fn run() {
             activate_frame,
             set_frame_threshold,
             approve_frame,
+            unapprove_frame,
             set_frame_strokes,
             export_frame,
             scan_roll,

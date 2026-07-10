@@ -567,7 +567,27 @@ impl RollState {
         ))
     }
 
-    pub fn set_threshold(&self, index: usize, threshold: f32) -> Result<(), String> {
+    /// Sets a frame's threshold together with the recomputed component count
+    /// and boxes, in one sidecar write. The sole setter for a frame's
+    /// threshold: the operator's sensitivity slider only has fresh
+    /// counts/bboxes to offer when the frame's image is registry-resident
+    /// with probabilities
+    /// (`components` in lib.rs resolves that and passes `None` otherwise) --
+    /// writing threshold there too keeps this a single seam instead of a
+    /// second call racing the first.
+    ///
+    /// No generation check: unlike `record_scan_result`/`set_exported`, this
+    /// runs synchronously off a direct command invoke against whatever roll
+    /// is open right now, not a background task that could still be working
+    /// against a roll the operator has since swapped out. Index-validated
+    /// like its neighbors.
+    pub fn set_threshold_and_components(
+        &self,
+        index: usize,
+        threshold: f32,
+        count: Option<usize>,
+        bboxes: Option<Vec<[u32; 4]>>,
+    ) -> Result<(), String> {
         if !(0.0..=1.0).contains(&threshold) {
             return Err(format!(
                 "threshold must be finite and within [0, 1], got {threshold}"
@@ -580,6 +600,8 @@ impl RollState {
             .get_mut(index)
             .ok_or_else(|| format!("no frame {index}"))?;
         frame.threshold = threshold;
+        frame.defect_count = count;
+        frame.bboxes = bboxes;
         roll.save()
     }
 
@@ -896,7 +918,9 @@ mod state_tests {
     fn set_threshold_and_approved_persist_via_save() {
         let dir = tempfile::tempdir().unwrap();
         let state = opened_state(dir.path(), 2);
-        state.set_threshold(0, 0.33).unwrap();
+        state
+            .set_threshold_and_components(0, 0.33, None, None)
+            .unwrap();
         state.set_approved(1, true).unwrap();
         let reopened = Roll::open(dir.path()).unwrap();
         assert_eq!(reopened.frames[0].threshold, 0.33);
@@ -904,16 +928,58 @@ mod state_tests {
     }
 
     #[test]
-    fn set_threshold_rejects_non_finite_or_out_of_range_values() {
+    fn set_threshold_and_components_rejects_non_finite_or_out_of_range_values() {
         let dir = tempfile::tempdir().unwrap();
         let state = opened_state(dir.path(), 1);
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 1.01] {
-            let err = state.set_threshold(0, bad).unwrap_err();
+            let err = state
+                .set_threshold_and_components(0, bad, None, None)
+                .unwrap_err();
             assert!(err.contains("threshold"), "error was: {err}");
         }
         // Valid boundary values are accepted.
-        state.set_threshold(0, 0.0).unwrap();
-        state.set_threshold(0, 1.0).unwrap();
+        state
+            .set_threshold_and_components(0, 0.0, None, None)
+            .unwrap();
+        state
+            .set_threshold_and_components(0, 1.0, None, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn set_threshold_and_components_persists_all_three_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = opened_state(dir.path(), 1);
+        state
+            .set_threshold_and_components(0, 0.72, Some(2), Some(vec![[1, 2, 3, 4], [5, 6, 7, 8]]))
+            .unwrap();
+        let reopened = Roll::open(dir.path()).unwrap();
+        assert_eq!(reopened.frames[0].threshold, 0.72);
+        assert_eq!(reopened.frames[0].defect_count, Some(2));
+        assert_eq!(
+            reopened.frames[0].bboxes,
+            Some(vec![[1, 2, 3, 4], [5, 6, 7, 8]])
+        );
+    }
+
+    #[test]
+    fn set_threshold_and_components_accepts_none_when_not_resident() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = opened_state(dir.path(), 1);
+        // Seed a prior count/bboxes, then move the threshold with no fresh
+        // components (the not-resident/no-probs case) -- the frame's stale
+        // count and boxes are cleared, not left dangling under the new
+        // threshold they no longer match.
+        state
+            .set_threshold_and_components(0, 0.4, Some(3), Some(vec![[0, 0, 1, 1]]))
+            .unwrap();
+        state
+            .set_threshold_and_components(0, 0.6, None, None)
+            .unwrap();
+        let reopened = Roll::open(dir.path()).unwrap();
+        assert_eq!(reopened.frames[0].threshold, 0.6);
+        assert_eq!(reopened.frames[0].defect_count, None);
+        assert_eq!(reopened.frames[0].bboxes, None);
     }
 
     #[test]
@@ -966,7 +1032,10 @@ mod state_tests {
     #[test]
     fn operations_before_open_error_clearly() {
         let state = RollState::default();
-        assert!(state.set_threshold(0, 0.5).unwrap_err().contains("no roll"));
+        assert!(state
+            .set_threshold_and_components(0, 0.5, None, None)
+            .unwrap_err()
+            .contains("no roll"));
         assert!(state
             .eviction_candidates(0)
             .unwrap_err()
