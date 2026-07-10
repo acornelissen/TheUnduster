@@ -348,10 +348,6 @@ pub struct RollState {
     /// Guards against double-spawning the background scan task if `scan_roll`
     /// is invoked twice (e.g. a second "Open roll" or an eager retry).
     pub scanning: AtomicBool,
-    /// Guards against double-spawning the export queue task if
-    /// `export_approved` is invoked twice (e.g. a second click before the
-    /// first export finished).
-    pub exporting: AtomicBool,
     /// Incremented on every `open` and `close` (i.e. every roll swap/
     /// teardown). `scan_roll` captures this value when it spawns its
     /// background queue task and re-checks it before processing each frame
@@ -361,6 +357,10 @@ pub struct RollState {
     /// Frame view recency (most recent last), driving byte-budget eviction:
     /// least-recently-viewed frames release their pixels first.
     lru: Mutex<Vec<usize>>,
+    /// Destination directory for queued export jobs. Set by `enqueue_exports`
+    /// each time the operator picks a directory; export jobs read it at run
+    /// time, so re-queuing with a new directory redirects still-queued jobs.
+    pub export_dest: Mutex<Option<PathBuf>>,
 }
 
 impl RollState {
@@ -596,6 +596,9 @@ impl RollState {
     /// Approved frame indices, in order. Exported frames are INCLUDED:
     /// pressing "Export approved" again re-exports all approved work,
     /// predictably overwriting whatever landed before.
+    // Exercised by tests; no production caller until Task 2 wires export jobs
+    // through the queue.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn frames_to_export(&self) -> Result<Vec<usize>, String> {
         let guard = self.roll.lock().map_err(|e| e.to_string())?;
         let roll = guard.as_ref().ok_or("no roll open")?;
@@ -638,6 +641,9 @@ impl RollState {
     /// started against is still the live one: mirrors `record_scan_result`'s
     /// generation re-check under the same lock that guards the write, so a
     /// frame exported against roll A never marks roll B's sidecar done.
+    // Exercised by tests; no production caller until Task 2 wires export jobs
+    // through the queue.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_exported(&self, generation: u64, index: usize) -> Result<(), String> {
         let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
         if self.generation.load(Ordering::SeqCst) != generation {
@@ -657,18 +663,25 @@ impl RollState {
         Ok(guard.as_ref().ok_or("no roll open")?.dir.clone())
     }
 
+    pub fn set_export_dest(&self, dest: PathBuf) -> Result<(), String> {
+        let mut guard = self.export_dest.lock().map_err(|e| e.to_string())?;
+        *guard = Some(dest);
+        Ok(())
+    }
+
+    // Exercised by tests; no production caller until Task 2's export jobs
+    // read the queued destination.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn export_dest(&self) -> Result<Option<PathBuf>, String> {
+        let guard = self.export_dest.lock().map_err(|e| e.to_string())?;
+        Ok(guard.clone())
+    }
+
     /// Clears the in-progress scan flag. Pulled out as its own method so the
     /// `scan_roll` task's drop guard has a single, testable reset authority
     /// -- one line, called unconditionally (including on panic unwind).
     pub fn clear_scanning(&self) {
         self.scanning.store(false, Ordering::SeqCst);
-    }
-
-    /// Clears the in-progress export flag. Mirrors `clear_scanning`: a single,
-    /// testable reset authority for the `export_approved` task's drop guard,
-    /// called unconditionally (including on panic unwind).
-    pub fn clear_exporting(&self) {
-        self.exporting.store(false, Ordering::SeqCst);
     }
 
     /// Current roll generation. `scan_roll` snapshots this when its queue
@@ -1007,6 +1020,19 @@ mod state_tests {
         state.set_strokes(0, strokes.clone(), vec![]).unwrap();
         let (_, _, _, meta_strokes) = state.export_frame_meta(0).unwrap();
         assert_eq!(meta_strokes, strokes);
+    }
+
+    #[test]
+    fn export_dest_round_trips_and_defaults_to_none() {
+        let state = RollState::default();
+        assert_eq!(state.export_dest().unwrap(), None);
+        state
+            .set_export_dest(std::path::PathBuf::from("/tmp/out"))
+            .unwrap();
+        assert_eq!(
+            state.export_dest().unwrap(),
+            Some(std::path::PathBuf::from("/tmp/out"))
+        );
     }
 
     #[test]

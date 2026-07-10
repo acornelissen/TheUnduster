@@ -9,6 +9,7 @@ use std::sync::Mutex;
 pub enum JobKind {
     Detect,
     Heal,
+    Export,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -182,6 +183,15 @@ mod tests {
         assert!(!q.try_start()); // already true: loses
         q.clear_running();
         assert!(q.try_start()); // false again: wins
+    }
+
+    #[test]
+    fn export_kind_is_a_distinct_job() {
+        let q = JobQueue::default();
+        assert!(q.enqueue(job(JobKind::Heal, 1), false).unwrap());
+        assert!(q.enqueue(job(JobKind::Export, 1), false).unwrap()); // distinct kind, kept
+        assert!(!q.enqueue(job(JobKind::Export, 1), false).unwrap()); // duplicate coalesced
+        assert_eq!(q.len().unwrap(), 2);
     }
 
     #[test]
