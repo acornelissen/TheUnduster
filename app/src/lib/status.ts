@@ -52,9 +52,10 @@ export interface LeftZoneInput {
 }
 
 /** Frame-identity string for the left zone: file name, roll position,
- * defect count at the current threshold, the stale-heal hint (frame state,
- * not activity), the live brush status (frame-interaction state, e.g.
- * "brush 24px"), and the single-export note. */
+ * defect count at the current threshold (or "not yet detected" while none
+ * exists), the stale-heal hint (frame state, not activity), the live brush
+ * status (frame-interaction state, e.g. "brush 24px"), and the
+ * single-export note. */
 export function composeLeft(input: LeftZoneInput): string {
   if (!input.fileName) return "";
   const parts = [input.fileName];
@@ -64,6 +65,8 @@ export function composeLeft(input: LeftZoneInput): string {
   if (input.defectCount !== null) {
     const noun = input.defectCount === 1 ? "defect" : "defects";
     parts.push(`${input.defectCount} ${noun} at ${input.threshold.toFixed(2)}`);
+  } else {
+    parts.push("not yet detected");
   }
   if (input.healStale) {
     parts.push("heal stale (h re-heals)");

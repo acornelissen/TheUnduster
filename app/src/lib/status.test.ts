@@ -92,13 +92,13 @@ describe("composeLeft", () => {
     singleExportNote: null as string | null,
   };
 
-  it("renders just the file name when nothing else is known", () => {
-    expect(composeLeft(base)).toBe("raw0002.jpg");
+  it("shows not-yet-detected when the frame has no defect count", () => {
+    expect(composeLeft(base)).toBe("raw0002.jpg  not yet detected");
   });
 
   it("includes roll position when present", () => {
     expect(composeLeft({ ...base, position: { index: 2, total: 4 } })).toBe(
-      "raw0002.jpg  3/4",
+      "raw0002.jpg  3/4  not yet detected",
     );
   });
 
@@ -113,23 +113,23 @@ describe("composeLeft", () => {
   });
 
   it("appends the stale-heal hint to the left zone when the frame's heal is stale", () => {
-    expect(composeLeft({ ...base, healStale: true })).toBe(
-      "raw0002.jpg  heal stale (h re-heals)",
+    expect(composeLeft({ ...base, defectCount: 3, healStale: true })).toBe(
+      "raw0002.jpg  3 defects at 0.50  heal stale (h re-heals)",
     );
   });
 
   it("appends the brush status to the left zone while the brush is active", () => {
-    expect(composeLeft({ ...base, brushStatus: "brush 24px" })).toBe(
-      "raw0002.jpg  brush 24px",
+    expect(composeLeft({ ...base, defectCount: 3, brushStatus: "brush 24px" })).toBe(
+      "raw0002.jpg  3 defects at 0.50  brush 24px",
     );
   });
 
   it("appends the single-export note to the left zone", () => {
     // TODO(task 4): singleExportNote moves to a toast; drop this from the
     // left zone once that lands.
-    expect(composeLeft({ ...base, singleExportNote: "exported 42 changed pixels" })).toBe(
-      "raw0002.jpg  exported 42 changed pixels",
-    );
+    expect(
+      composeLeft({ ...base, defectCount: 3, singleExportNote: "exported 42 changed pixels" }),
+    ).toBe("raw0002.jpg  3 defects at 0.50  exported 42 changed pixels");
   });
 
   it("composes every fragment together in order", () => {
