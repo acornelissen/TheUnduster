@@ -608,6 +608,16 @@ const PYRAMID_LEVEL_HEADER_LEN: usize = 4 + 4 + 8;
 /// `TILE_SIZE`, so even a gigapixel scan tops out well under this cap.
 const MAX_PYRAMID_LEVELS: u32 = 32;
 
+/// Upper bound on a single level's decompressed RGBA size (2 GiB).
+/// `zstd::bulk::decompress` allocates its capacity argument EAGERLY
+/// (`Vec::with_capacity`) before decompressing a single byte, so a
+/// ~100-byte crafted file claiming a 65535x65535 level would otherwise
+/// drive a ~17GB allocation attempt straight from untrusted header bytes.
+/// Any level claiming more than this is the corrupt class (delete + None),
+/// checked BEFORE the decompress call. Generously above any real level:
+/// level 0 of a 24000x20000 scan is 1.92GB.
+const MAX_PYRAMID_LEVEL_BYTES: usize = 2 << 30;
+
 /// Writes the display pyramid: header
 /// magic(8) | version(4) | level_count(4) | size(8) | mtime_nanos(8)
 /// then per level: width(4) | height(4) | comp_len(8) | zstd payload.
@@ -763,6 +773,13 @@ pub fn read_pyramid(path: &Path, stamp: &SourceStamp) -> Option<Pyramid> {
             Some(l) => l,
             None => return corrupt(),
         };
+
+        // Cap the claimed size BEFORE handing it to the decompressor: the
+        // capacity below is allocated eagerly (see MAX_PYRAMID_LEVEL_BYTES),
+        // so an unchecked header-claimed size is a memory-DoS lever.
+        if expected_len > MAX_PYRAMID_LEVEL_BYTES {
+            return corrupt();
+        }
 
         // Bounded decompression: a frame that decompresses to more than
         // expected_len errors, catching both decompress-bombs and a
@@ -1306,5 +1323,36 @@ mod tests {
 
         assert!(read_pyramid(&p, &s).is_none());
         assert!(!p.exists(), "level length lie is treated as corruption");
+    }
+
+    #[test]
+    fn pyramid_giant_claimed_level_is_rejected_without_allocating() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.pyr");
+        let s = stamp();
+
+        // A ~100-byte crafted file claiming a 65535x65535 level: expected_len
+        // is ~17GB, which zstd::bulk::decompress would Vec::with_capacity
+        // EAGERLY before decompressing a single byte. The cap check must
+        // reject this as corrupt (delete + None) BEFORE the decompress call,
+        // so this test never drives a giant allocation.
+        let tiny_payload = [0u8; 16];
+        let compressed = zstd::encode_all(&tiny_payload[..], 1).unwrap();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(PYRAMID_MAGIC);
+        bytes.extend_from_slice(&PYRAMID_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // level_count
+        bytes.extend_from_slice(&s.size.to_le_bytes());
+        bytes.extend_from_slice(&s.mtime_nanos.to_le_bytes());
+        bytes.extend_from_slice(&65535u32.to_le_bytes()); // width
+        bytes.extend_from_slice(&65535u32.to_le_bytes()); // height
+        bytes.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&compressed);
+
+        std::fs::write(&p, &bytes).unwrap();
+
+        assert!(read_pyramid(&p, &s).is_none());
+        assert!(!p.exists(), "giant claimed level is treated as corruption");
     }
 }
