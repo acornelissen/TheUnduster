@@ -552,13 +552,6 @@ async fn decode_and_insert(
     Ok(images.insert(prepared))
 }
 
-/// Sentinel returned by `decode_and_register` (and surfaced up through
-/// `activate_frame`) when the freshly-decoded image lost its registration to
-/// a roll swap. Recognized by the frontend's `activate_frame` catch handler
-/// so a benign swap race never surfaces as a scary error toast -- see that
-/// handler's comment.
-const ACTIVATION_LOST_ROLL_SWAP: &str = "roll changed during activation; discarded";
-
 /// `activate_frame`'s fresh-decode path: `decode_and_insert` plus the
 /// activation-only supersede step. Neither the reuse path (already resident)
 /// nor activation's other UI-contract steps -- the "decoding" progress emit,
@@ -571,11 +564,18 @@ const ACTIVATION_LOST_ROLL_SWAP: &str = "roll changed during activation; discard
 /// `set_exported`/`record_scan_result`. That check is airtight because roll
 /// swaps bump the generation inside the same lock (see `RollState::open`) --
 /// there is no window where a new roll coexists with the old generation
-/// value. A decode already running when the
-/// operator opens a new roll must not register its (old-roll) pixels into
-/// the new roll's same-index frame just because that frame starts with
-/// `image_id` `None` -- so a generation loss here closes the fresh image and
-/// returns `ACTIVATION_LOST_ROLL_SWAP` instead of writing anywhere.
+/// value. A decode already running when the operator opens a new roll must
+/// not register its (old-roll) pixels into the new roll's same-index frame
+/// just because that frame starts with `image_id` `None` -- so a generation
+/// loss here closes the fresh image and returns `Ok(None)` instead of
+/// writing anywhere.
+///
+/// The benign loss is data (`Ok(None)`), not an `Err`, for the same reason
+/// `set_threshold_and_components` returns `Ok(false)` on a discard: a lost
+/// race against a roll swap is a no-op the operator should never see an
+/// error toast for, and returning it as data keeps the frontend from
+/// string-matching an error message to tell "benign race" from real
+/// failures.
 async fn decode_and_register(
     images: &State<'_, Mutex<Images>>,
     roll: &State<'_, roll::RollState>,
@@ -583,7 +583,7 @@ async fn decode_and_register(
     index: usize,
     path: std::path::PathBuf,
     on_decoded: Option<impl FnOnce() + Send + 'static>,
-) -> Result<ImageInfo, String> {
+) -> Result<Option<ImageInfo>, String> {
     let info = decode_and_insert(images, path, on_decoded).await?;
     // Concurrent activations of the same frame each decode independently;
     // whichever lands later replaces the frame's id, and the superseded
@@ -598,12 +598,16 @@ async fn decode_and_register(
         roll::SetImageId::GenerationLost => {
             let mut images = images.lock().map_err(|e| e.to_string())?;
             images.close(info.id);
-            return Err(ACTIVATION_LOST_ROLL_SWAP.to_string());
+            return Ok(None);
         }
     }
-    Ok(info)
+    Ok(Some(info))
 }
 
+/// Returns `Ok(None)` when the freshly-decoded image lost its registration
+/// to a roll swap (benign; the backend already closed it -- see
+/// `decode_and_register`). The frontend null-checks this instead of
+/// inspecting error strings; real failures still arrive as `Err`.
 #[tauri::command]
 async fn activate_frame(
     app: tauri::AppHandle,
@@ -612,7 +616,7 @@ async fn activate_frame(
     detector: State<'_, detect::DetectorState>,
     index: usize,
     generation: u64,
-) -> Result<ImageInfo, String> {
+) -> Result<Option<ImageInfo>, String> {
     #[cfg(debug_assertions)]
     eprintln!("[activate] frame {index} requested");
     // Reuse path: already activated and the registry still has it.
@@ -647,7 +651,7 @@ async fn activate_frame(
             #[cfg(debug_assertions)]
             eprintln!("[activate] frame {index} reused id {id}");
             roll.touch(index)?; // recency drives byte-budget eviction
-            return Ok(info);
+            return Ok(Some(info));
         }
     }
 
@@ -660,7 +664,7 @@ async fn activate_frame(
         },
     );
     let decode_progress = app.clone();
-    let info = decode_and_register(
+    let Some(info) = decode_and_register(
         &images,
         &roll,
         generation,
@@ -676,7 +680,18 @@ async fn activate_frame(
             );
         }),
     )
-    .await?;
+    .await?
+    else {
+        // Benign generation loss: the roll this activation was scheduled
+        // against is gone and the decoded image is already closed. Skip the
+        // post-registration steps too -- touch/evict would act on the NEW
+        // roll's frame at this index, and the "ready" emit would clear a
+        // loader that belongs to whatever the swap put on screen. The
+        // frontend clears its own loading state on the null result.
+        #[cfg(debug_assertions)]
+        eprintln!("[activate] frame {index} lost to a roll swap; discarded");
+        return Ok(None);
+    };
 
     // Decode-path frames start with no probs; restore a cache hit so a
     // scanned frame becomes detection-ready across relaunches without
@@ -726,7 +741,7 @@ async fn activate_frame(
     );
     #[cfg(debug_assertions)]
     eprintln!("[activate] frame {index} decoded as id {}", info.id);
-    Ok(info)
+    Ok(Some(info))
 }
 
 /// Sets a frame's threshold and, when the frame's image is registry-resident

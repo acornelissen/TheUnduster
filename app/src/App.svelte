@@ -898,24 +898,28 @@
     // roll's same-index frame.
     const generation = rollGeneration;
     activating = true;
-    let result: ImageInfo;
+    let result: ImageInfo | null;
     try {
-      result = await invoke<ImageInfo>("activate_frame", { index, generation });
+      result = await invoke<ImageInfo | null>("activate_frame", { index, generation });
     } catch (e) {
       if (seq !== activationSeq) return; // stale: a newer activation is in flight
       activating = false;
-      loading = null;
-      // Benign swap race, not a real failure: the backend closed its own
-      // freshly-decoded image and declined to register it. Nothing to show
-      // the operator -- the frame they're actually looking at (post-swap)
-      // is unaffected, and a subsequent activation of the new roll's frame
-      // proceeds normally.
-      if (String(e).includes("roll changed during activation")) return;
       pushError(String(e));
+      loading = null;
       return;
     }
     if (seq !== activationSeq) return; // stale: a newer activation superseded this one
     activating = false;
+    if (result === null) {
+      // Benign swap race, not a real failure (returned as data, not an
+      // error, so nothing here string-matches messages): the backend closed
+      // its own freshly-decoded image and declined to register it. Nothing
+      // to show the operator -- the frame they're actually looking at
+      // (post-swap) is unaffected, and a subsequent activation of the new
+      // roll's frame proceeds normally.
+      loading = null;
+      return;
+    }
     info = result;
     // Only advance once the activation actually landed -- see the
     // `displayedIndex` declaration for why this must not track `currentIndex`
