@@ -4,9 +4,15 @@
 //! Also: heal delta codec, which persists a heal as its mask (bitset) plus
 //! the healed pixel values inside it, provenance-hashed, reconstructed
 //! bit-exactly as original + patch.
+//!
+//! Also: display pyramid codec, which persists each level's RGBA buffer
+//! zstd-compressed behind a stamp-only (no content hash) header -- the
+//! pyramid is a pure function of the source file, so the source stamp alone
+//! is enough provenance.
 
 use std::path::Path;
 
+use fd_tiles::{Level, Pyramid};
 use sha2::{Digest, Sha256};
 
 pub const PROBS_MAGIC: &[u8; 8] = b"UNDPROB1";
@@ -585,6 +591,206 @@ pub fn read_heal(
     Some((result, mask))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+pub const PYRAMID_MAGIC: &[u8; 8] = b"UNDPYRA1";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const PYRAMID_VERSION: u32 = 1;
+
+/// Top-level header length: magic(8) | version(4) | level_count(4) |
+/// size(8) | mtime_nanos(8). Per-level header (width(4) | height(4) |
+/// comp_len(8)) follows separately, once per level.
+const PYRAMID_HEADER_LEN: usize = 8 + 4 + 4 + 8 + 8;
+const PYRAMID_LEVEL_HEADER_LEN: usize = 4 + 4 + 8;
+
+/// A pyramid always has a base level; anything claiming more than this is
+/// almost certainly a corrupted length field rather than a real pyramid --
+/// `fd_tiles::Pyramid::build` halves dimensions each level down to
+/// `TILE_SIZE`, so even a gigapixel scan tops out well under this cap.
+const MAX_PYRAMID_LEVELS: u32 = 32;
+
+/// Writes the display pyramid: header
+/// magic(8) | version(4) | level_count(4) | size(8) | mtime_nanos(8)
+/// then per level: width(4) | height(4) | comp_len(8) | zstd payload.
+/// zstd level 1, not the probs codec's 3: RGBA film grain barely
+/// compresses at any level, and this write runs once per fresh build --
+/// encode speed is worth more than a few percent of disk.
+///
+/// Not yet called from `lib.rs` -- this task lands the codec only, wiring
+/// into the roll pipeline is a later task -- hence the dead-code allow on
+/// the public items below outside of `#[cfg(test)]`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn write_pyramid(path: &Path, pyramid: &Pyramid, stamp: &SourceStamp) -> Result<(), String> {
+    let level_count: u32 = pyramid
+        .levels
+        .len()
+        .try_into()
+        .map_err(|_| "too many levels".to_string())?;
+
+    let mut header = Vec::new();
+    header.extend_from_slice(PYRAMID_MAGIC);
+    header.extend_from_slice(&PYRAMID_VERSION.to_le_bytes());
+    header.extend_from_slice(&level_count.to_le_bytes());
+    header.extend_from_slice(&stamp.size.to_le_bytes());
+    header.extend_from_slice(&stamp.mtime_nanos.to_le_bytes());
+
+    for level in &pyramid.levels {
+        let expected_len = (level.width as usize)
+            .checked_mul(level.height as usize)
+            .and_then(|p| p.checked_mul(4))
+            .ok_or_else(|| "level dimensions overflow".to_string())?;
+        if level.rgba.len() != expected_len {
+            return Err(format!(
+                "level rgba length {} does not match width*height*4 {}",
+                level.rgba.len(),
+                expected_len
+            ));
+        }
+
+        let compressed = zstd::encode_all(&level.rgba[..], 1)
+            .map_err(|e| format!("zstd compression failed: {e}"))?;
+
+        header.extend_from_slice(&level.width.to_le_bytes());
+        header.extend_from_slice(&level.height.to_le_bytes());
+        header.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+        header.extend_from_slice(&compressed);
+    }
+
+    // Write atomically: same temp+rename dance as write_probs/write_heal.
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("bad path: {}", path.display()))?;
+    let tmp_path = path.with_file_name(format!("{}.tmp-unduster", file_name));
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+
+    std::fs::write(&tmp_path, &header).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("write tmp failed: {e}")
+    })?;
+
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("rename failed: {e}")
+    })?;
+
+    Ok(())
+}
+
+/// Reads a cached pyramid. None on: missing file, stamp mismatch
+/// (source changed -- file kept, house mismatch-keep rule), or corrupt
+/// structure (file deleted on sight). Every level's rgba length is
+/// validated as width*height*4 with checked arithmetic, and each
+/// decompression is bounded to that expected size.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn read_pyramid(path: &Path, stamp: &SourceStamp) -> Option<Pyramid> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return None, // absent file is not corruption
+    };
+
+    let corrupt = || {
+        let _ = std::fs::remove_file(path);
+        None
+    };
+
+    if bytes.len() < PYRAMID_HEADER_LEN {
+        return corrupt();
+    }
+
+    let mut offset = 0;
+
+    if &bytes[offset..offset + 8] != PYRAMID_MAGIC {
+        return corrupt();
+    }
+    offset += 8;
+
+    let version = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+    offset += 4;
+    if version != PYRAMID_VERSION {
+        return corrupt();
+    }
+
+    let level_count = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+    offset += 4;
+    // A pyramid always has a base level; zero is corrupt, not a valid
+    // "empty" pyramid. The upper cap guards against a crafted/garbled
+    // count driving an unbounded per-level read loop.
+    if level_count == 0 || level_count > MAX_PYRAMID_LEVELS {
+        return corrupt();
+    }
+
+    // Stamp check FIRST, before any structural per-level parsing: a
+    // well-formed pyramid for a different source file is a miss (file
+    // kept), not corruption, and that verdict must not be preempted by a
+    // later structural check on data we don't even need in the mismatch
+    // case.
+    let stored_size = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+    let stored_mtime_nanos = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+    offset += 8;
+
+    if stored_size != stamp.size || stored_mtime_nanos != stamp.mtime_nanos {
+        return None; // stamp mismatch is not corruption
+    }
+
+    let mut levels = Vec::with_capacity(level_count as usize);
+    for _ in 0..level_count {
+        if bytes.len() < offset + PYRAMID_LEVEL_HEADER_LEN {
+            return corrupt();
+        }
+
+        let width = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+        let height = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+        let comp_len = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+
+        let comp_end = match (offset as u64).checked_add(comp_len) {
+            Some(e) if e <= bytes.len() as u64 => e as usize,
+            _ => return corrupt(), // crafted/oversized length or truncated file
+        };
+        let compressed = &bytes[offset..comp_end];
+        offset = comp_end;
+
+        let expected_len = match (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|p| p.checked_mul(4))
+        {
+            Some(l) => l,
+            None => return corrupt(),
+        };
+
+        // Bounded decompression: a frame that decompresses to more than
+        // expected_len errors, catching both decompress-bombs and a
+        // dimensions/payload disagreement in one shot. Equal-but-short
+        // payloads are caught by the length check right after.
+        let rgba = match zstd::bulk::decompress(compressed, expected_len) {
+            Ok(r) => r,
+            Err(_) => return corrupt(),
+        };
+        if rgba.len() != expected_len {
+            return corrupt();
+        }
+
+        levels.push(Level {
+            width,
+            height,
+            rgba,
+        });
+    }
+
+    // No trailing garbage after the last level.
+    if offset != bytes.len() {
+        return corrupt();
+    }
+
+    Some(Pyramid { levels })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -989,5 +1195,116 @@ mod tests {
             !p.exists(),
             "oversized values decompression is treated as corruption"
         );
+    }
+
+    fn synth_level(width: u32, height: u32, seed: u8) -> fd_tiles::Level {
+        let n = (width * height * 4) as usize;
+        let rgba: Vec<u8> = (0..n).map(|i| seed.wrapping_add((i % 251) as u8)).collect();
+        fd_tiles::Level {
+            width,
+            height,
+            rgba,
+        }
+    }
+
+    fn synth_pyramid() -> fd_tiles::Pyramid {
+        fd_tiles::Pyramid {
+            levels: vec![synth_level(4, 4, 11), synth_level(2, 2, 97)],
+        }
+    }
+
+    #[test]
+    fn pyramid_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.pyr");
+        let pyramid = synth_pyramid();
+        let s = stamp();
+        write_pyramid(&p, &pyramid, &s).unwrap();
+        let back = read_pyramid(&p, &s).expect("cache readable");
+        assert_eq!(back.levels.len(), pyramid.levels.len());
+        for (a, b) in pyramid.levels.iter().zip(&back.levels) {
+            assert_eq!(a.width, b.width);
+            assert_eq!(a.height, b.height);
+            assert_eq!(a.rgba, b.rgba);
+        }
+    }
+
+    #[test]
+    fn pyramid_stamp_mismatch_returns_none_and_keeps_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.pyr");
+        let pyramid = synth_pyramid();
+        let s = stamp();
+        write_pyramid(&p, &pyramid, &s).unwrap();
+        let mismatched = SourceStamp {
+            size: s.size + 1,
+            mtime_nanos: s.mtime_nanos,
+        };
+        assert!(read_pyramid(&p, &mismatched).is_none());
+        assert!(p.exists(), "stamp mismatch is not corruption; file kept");
+    }
+
+    #[test]
+    fn corrupt_pyramid_is_deleted_on_sight() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.pyr");
+        let pyramid = synth_pyramid();
+        let s = stamp();
+        write_pyramid(&p, &pyramid, &s).unwrap();
+
+        let mut bytes = std::fs::read(&p).unwrap();
+        bytes[0..8].copy_from_slice(b"UNDPYRA0");
+        std::fs::write(&p, &bytes).unwrap();
+
+        assert!(read_pyramid(&p, &s).is_none());
+        assert!(!p.exists(), "corrupt magic file is deleted on sight");
+    }
+
+    #[test]
+    fn truncated_pyramid_is_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.pyr");
+        let pyramid = synth_pyramid();
+        let s = stamp();
+        write_pyramid(&p, &pyramid, &s).unwrap();
+
+        let bytes = std::fs::read(&p).unwrap();
+        // Truncate mid-level: keep the top-level header plus the first
+        // level's own header, but cut off partway through its zstd payload.
+        let truncated = &bytes[..bytes.len() - 4];
+        std::fs::write(&p, truncated).unwrap();
+
+        assert!(read_pyramid(&p, &s).is_none());
+        assert!(!p.exists(), "truncated file is deleted on sight");
+    }
+
+    #[test]
+    fn pyramid_level_length_lie_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.pyr");
+        let s = stamp();
+
+        // Hand-craft a one-level pyramid whose header claims 4x4 (64 bytes
+        // decompressed) but whose zstd payload actually decompresses to
+        // 2x2 (16 bytes) worth of data -- width*height*4 disagrees with the
+        // real decompressed length.
+        let lying_payload = [0u8; 16];
+        let compressed = zstd::encode_all(&lying_payload[..], 1).unwrap();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(PYRAMID_MAGIC);
+        bytes.extend_from_slice(&PYRAMID_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // level_count
+        bytes.extend_from_slice(&s.size.to_le_bytes());
+        bytes.extend_from_slice(&s.mtime_nanos.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes()); // width
+        bytes.extend_from_slice(&4u32.to_le_bytes()); // height
+        bytes.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&compressed);
+
+        std::fs::write(&p, &bytes).unwrap();
+
+        assert!(read_pyramid(&p, &s).is_none());
+        assert!(!p.exists(), "level length lie is treated as corruption");
     }
 }

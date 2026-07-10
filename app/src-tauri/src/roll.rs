@@ -142,6 +142,13 @@ pub fn heal_cache_path(dir: &Path, file_name: &str) -> PathBuf {
     cache_dir(dir).join(format!("{file_name}.heal"))
 }
 
+/// Not yet called from `lib.rs` -- wiring the pyramid codec into the roll
+/// pipeline is a later task; see `cache::write_pyramid`'s doc comment.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn pyramid_cache_path(dir: &Path, file_name: &str) -> PathBuf {
+    cache_dir(dir).join(format!("{file_name}.pyr"))
+}
+
 fn list_image_files(dir: &Path) -> Result<Vec<String>, String> {
     let read = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut names: Vec<String> = Vec::new();
@@ -1439,6 +1446,22 @@ mod tests {
         assert_ne!(tiff, png);
         assert_eq!(tiff.file_name().unwrap(), "raw0001.tiff.png");
         assert_eq!(png.file_name().unwrap(), "raw0001.png.png");
+    }
+
+    #[test]
+    fn pyramid_cache_path_is_dot_pyr_beside_its_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let pyr = pyramid_cache_path(dir.path(), "raw0001.tiff");
+        assert_eq!(pyr.file_name().unwrap(), "raw0001.tiff.pyr");
+        assert_eq!(pyr.parent().unwrap(), cache_dir(dir.path()));
+        // Same cache dir as probs/heal, distinct extension -- three codecs,
+        // one directory, no collisions between them for the same frame.
+        assert_eq!(
+            probs_cache_path(dir.path(), "raw0001.tiff").parent(),
+            pyr.parent()
+        );
+        assert_ne!(pyr, probs_cache_path(dir.path(), "raw0001.tiff"));
+        assert_ne!(pyr, heal_cache_path(dir.path(), "raw0001.tiff"));
     }
 
     #[test]
