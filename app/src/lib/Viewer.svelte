@@ -267,15 +267,15 @@
     if (renderer && needsFrame) {
       needsFrame = false;
       renderer.draw(tilePaths(), canvas.width, canvas.height, overlay);
-      // Rings mark defects whenever the red probability tint cannot: always
-      // for queue bboxes (no prob tiles exist before a live detect, at any
-      // zoom), and below 50% zoom for live detections, where the tint is
-      // sub-pixel. Past that, the tint takes over and rings would clutter.
+      // Rings mark defects; they follow the overlay toggle (m) at every zoom
+      // rather than vanishing above 50% zoom -- the operator twice reported
+      // the old zoom cutoff as a bug.
       const source = markerSource();
-      const ringsVisible = !detected || zoom < 0.5;
+      const ringsVisible = overlay.enabled;
       if (ringsVisible && source.length > 0) {
         const rings = ringsFor(source, zoom, centerX, centerY, canvas.width, canvas.height, 12);
-        renderer.drawRings(rings, canvas.width, canvas.height);
+        // --detect teal; app.css token is the CSS-side mirror
+        renderer.drawRings(rings, [0.25, 0.82, 0.77, 1.0], canvas.width, canvas.height);
       }
       // Strokes are edit state, not a detector overlay: they stay visible
       // regardless of the `m` tint toggle. The in-progress stroke (not yet
@@ -297,12 +297,17 @@
           renderer.drawStrokes(paintSegs, [1.0, 0.72, 0.24, 0.35], canvas.width, canvas.height);
         }
         if (eraseSegs.length > 0) {
-          renderer.drawStrokes(eraseSegs, [0.42, 0.69, 1.0, 0.3], canvas.width, canvas.height);
+          renderer.drawStrokes(eraseSegs, [0.91, 0.9, 0.89, 0.35], canvas.width, canvas.height);
         }
         if (brushMode !== "off") {
           const cx = (cursorX - centerX) * zoom + canvas.width / 2;
           const cy = (cursorY - centerY) * zoom + canvas.height / 2;
-          renderer.drawRings([{ x: cx, y: cy, r: brushRadius * zoom }], canvas.width, canvas.height);
+          renderer.drawRings(
+            [{ x: cx, y: cy, r: brushRadius * zoom }],
+            [1.0, 1.0, 1.0, 0.9],
+            canvas.width,
+            canvas.height,
+          );
         }
       }
     }
@@ -527,6 +532,7 @@
     role="application"
     aria-label="Scan viewer: arrows pan, plus and minus zoom, 0 fits, 1 is 100%, d detects, m toggles overlay, z and shift-z cycle defects, h heals, space toggles before and after, b paints, e erases, bracket keys size the brush, arrows nudge it and enter stamps while brushing, cmd-z undoes, escape exits, shift-cmd-z redoes"
     tabindex="0"
+    class:brushing={brushMode !== "off"}
     onwheel={onWheel}
     onpointerdown={(e) => {
       canvas.setPointerCapture(e.pointerId);
@@ -595,6 +601,9 @@
     background: var(--surround);
     touch-action: none;
     cursor: grab;
+  }
+  canvas.brushing {
+    cursor: none;
   }
   .zoom-controls {
     position: absolute;

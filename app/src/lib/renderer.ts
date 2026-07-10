@@ -28,9 +28,9 @@ void main() {
   // ~0.002 (half a u8 step out of 255). That's below the slider's step
   // granularity (0.01), so it never produces a visibly different result.
   float hit = overlayOn * step(threshold, p) * step(0.004, p); // never tint p==0
-  // Saturated red at high opacity: masks must read at a glance on both
+  // Saturated teal at high opacity: masks must read at a glance on both
   // grey film and colour scans; subtlety here costs missed defects.
-  color = mix(base, vec4(1.0, 0.05, 0.05, 1.0), hit * 0.9);
+  color = mix(base, vec4(0.25, 0.82, 0.77, 1.0), hit * 0.9);
 }`;
 
 /** Maps a tile's rgba path to its probability-layer counterpart. */
@@ -59,6 +59,7 @@ precision highp float;
 in vec2 vCorner;
 out vec4 color;
 uniform float radius;
+uniform vec4 uColor;
 void main() {
   float d = length(vCorner) * (radius + 3.0);
   // Soft 2px annulus at the ring radius: smoothstep in from both sides so
@@ -67,7 +68,7 @@ void main() {
   float inner = smoothstep(radius - 3.0, radius - 1.0, d);
   float alpha = outer * inner * 0.9;
   if (alpha <= 0.0) discard;
-  color = vec4(1.0, 0.05, 0.05, alpha);
+  color = vec4(uColor.rgb, uColor.a * alpha);
 }`;
 
 const CAPSULE_VERT = `#version 300 es
@@ -365,13 +366,19 @@ export class TileRenderer {
    * 0.9 alpha set in the fragment shader. Blending is disabled again before
    * returning so the next tile pass (which does not itself touch blend
    * state) renders opaquely as before. */
-  drawRings(rings: { x: number; y: number; r: number }[], canvasW: number, canvasH: number): void {
+  drawRings(
+    rings: { x: number; y: number; r: number }[],
+    color: [number, number, number, number],
+    canvasW: number,
+    canvasH: number,
+  ): void {
     if (rings.length === 0) return;
     const gl = this.gl;
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     gl.useProgram(this.ringProgram);
     gl.uniform2f(gl.getUniformLocation(this.ringProgram, "viewport"), canvasW, canvasH);
+    gl.uniform4fv(gl.getUniformLocation(this.ringProgram, "uColor"), color);
     const centerLoc = gl.getUniformLocation(this.ringProgram, "center");
     const radiusLoc = gl.getUniformLocation(this.ringProgram, "radius");
     const cornerLoc = gl.getAttribLocation(this.ringProgram, "corner");
