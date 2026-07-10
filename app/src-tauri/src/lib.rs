@@ -568,7 +568,10 @@ const ACTIVATION_LOST_ROLL_SWAP: &str = "roll changed during activation; discard
 /// `generation` is the roll generation this activation was scheduled
 /// against (the frontend's `rollGeneration` at invoke time); it travels with
 /// the decode and is re-checked under `set_image_id`'s own lock, mirroring
-/// `set_exported`/`record_scan_result`. A decode already running when the
+/// `set_exported`/`record_scan_result`. That check is airtight because roll
+/// swaps bump the generation inside the same lock (see `RollState::open`) --
+/// there is no window where a new roll coexists with the old generation
+/// value. A decode already running when the
 /// operator opens a new roll must not register its (old-roll) pixels into
 /// the new roll's same-index frame just because that frame starts with
 /// `image_id` `None` -- so a generation loss here closes the fresh image and

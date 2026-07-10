@@ -349,7 +349,9 @@ pub struct RollState {
     /// is invoked twice (e.g. a second "Open roll" or an eager retry).
     pub scanning: AtomicBool,
     /// Incremented on every `open` and `close` (i.e. every roll swap/
-    /// teardown). `scan_roll` captures this value when it spawns its
+    /// teardown), inside the `roll` lock's critical section so generation
+    /// and roll contents always change together (see the comment in
+    /// `open`). `scan_roll` captures this value when it spawns its
     /// background queue task and re-checks it before processing each frame
     /// via `generation()` -- see that function's doc comment for where the
     /// enforcement actually happens.
@@ -401,15 +403,29 @@ impl RollState {
             })
             .unwrap_or_default();
         *guard = Some(roll);
-        drop(guard);
-        if let Ok(mut lru) = self.lru.lock() {
-            lru.clear();
-        }
+        // The generation bump happens INSIDE the roll-lock critical section,
+        // before the guard drops: every generation-checked setter
+        // (set_exported, record_scan_result, set_threshold_and_components,
+        // set_image_id, set_image_id_if_absent) re-checks the generation
+        // while holding this same lock, so bumping after the drop would
+        // leave a window where a stale setter acquires the lock, reads the
+        // OLD (not-yet-bumped) generation, matches, and writes into the
+        // roll just installed above. Bumping under the lock makes
+        // roll-contents and generation a single atomic transition. This
+        // ordering can't be pinned by a unit test (it's a preemption window
+        // between two lock acquisitions); the setter-side stale-generation
+        // tests cover the check itself, and this comment guards the
+        // ordering.
+        //
         // `info.generation` must reflect the generation THIS open produced,
         // not whatever was live before it -- read post-bump so a caller
         // (open_roll, then the frontend) can gate on "does this job event
         // belong to the roll I just opened."
         info.generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        drop(guard);
+        if let Ok(mut lru) = self.lru.lock() {
+            lru.clear();
+        }
         Ok((info, stale_ids))
     }
 
@@ -428,11 +444,18 @@ impl RollState {
                     .collect::<Vec<u64>>()
             })
             .unwrap_or_default();
+        // Bumped inside the roll-lock critical section for the same reason
+        // as in `open`: a stale generation-checked setter acquiring the lock
+        // after the roll is torn down but before a post-drop bump would read
+        // the old generation and pass its check. (Its "no roll open" error
+        // would still stop the write here, but the invariant "generation and
+        // roll contents change together, under the lock" is what all the
+        // setters reason from -- keep it uniform.)
+        self.generation.fetch_add(1, Ordering::SeqCst);
         drop(guard);
         if let Ok(mut lru) = self.lru.lock() {
             lru.clear();
         }
-        self.generation.fetch_add(1, Ordering::SeqCst);
         Ok(stale_ids)
     }
 
@@ -513,7 +536,10 @@ impl RollState {
     /// the write, `set_exported`-style: a decode already in flight when the
     /// operator opens a new roll must not register its (old-roll) pixels
     /// into the new roll's same-index frame just because that frame's
-    /// `image_id` starts out `None`.
+    /// `image_id` starts out `None`. The closure is complete because
+    /// `open`/`close` bump the generation INSIDE this same lock (see the
+    /// comment in `open`), so this check can never observe a new roll paired
+    /// with an old generation.
     ///
     /// On a landed write, returns the id it replaces (if any) so the caller
     /// can close it: concurrent activations of the same frame each decode
