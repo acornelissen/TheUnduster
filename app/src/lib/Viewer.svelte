@@ -68,6 +68,11 @@
   let detections: [number, number, number, number][] = $state([]);
   let current = -1;
   let showHealed = $state(false);
+  // True from the moment a slider-driven refetch is (re)scheduled until
+  // refreshDetections resolves; drives the dimmed defect-ring paint below so
+  // the operator can see the rings are stale rather than trusting circles
+  // that no longer match the current threshold.
+  let refreshPending = $state(false);
 
   let brushMode: "off" | "paint" | "erase" = $state("off");
   let brushRadius = $state(24);
@@ -108,6 +113,9 @@
     // geometry onto frame N+1.
     painting = false;
     livePoints = [];
+    // A pending refresh belonged to the frame we just left; the new frame
+    // hasn't scheduled one yet, so don't leave the rings dimmed for it.
+    refreshPending = false;
     centerX = info.width / 2;
     centerY = info.height / 2;
     if (canvas && canvas.width > 0) {
@@ -130,6 +138,8 @@
     } catch {
       // no detection run yet; leave detections empty until `detect` succeeds
       detections = [];
+    } finally {
+      refreshPending = false;
     }
     current = -1;
     // Explicit redraw trigger: the overlay repaints once the component list
@@ -188,11 +198,22 @@
     requestFrame();
     clearTimeout(refreshTimer);
     if (detected) {
+      refreshPending = true;
       refreshTimer = setTimeout(() => {
         refreshDetections(threshold);
       }, 250);
     }
     return () => clearTimeout(refreshTimer);
+  });
+
+  // The rAF loop only repaints when needsFrame is set, so every site that
+  // flips refreshPending would otherwise need its own requestFrame() call.
+  // A dedicated effect keeps that "pending changed -> repaint" wiring in one
+  // place instead of duplicated across the schedule site, refreshDetections,
+  // and the frame-switch reset.
+  $effect(() => {
+    void refreshPending;
+    requestFrame();
   });
 
   /** Finalizes a stroke: chunks it to the backend's per-stroke point cap
@@ -280,8 +301,15 @@
       const ringsVisible = overlay.enabled;
       if (ringsVisible && source.length > 0) {
         const rings = ringsFor(source, zoom, centerX, centerY, canvas.width, canvas.height, 12);
-        // --detect red; app.css token is the CSS-side mirror
-        renderer.drawRings(rings, [1.0, 0.05, 0.05, 1.0], canvas.width, canvas.height);
+        // --detect red; app.css token is the CSS-side mirror. Dimmed while a
+        // threshold refetch is in flight so the operator can see the drawn
+        // circles are stale rather than trusting them at full strength.
+        renderer.drawRings(
+          rings,
+          refreshPending ? [1.0, 0.05, 0.05, 0.35] : [1.0, 0.05, 0.05, 1.0],
+          canvas.width,
+          canvas.height,
+        );
       }
       // Strokes are edit state, not a detector overlay: they stay visible
       // regardless of the `m` tint toggle. The in-progress stroke (not yet
