@@ -104,9 +104,23 @@
           <span class="badge exported-badge" title="Exported" aria-hidden="true">out</span>
         {/if}
         {#if jobStates[frame.index]?.state === "queued"}
-          <span class="badge job-marker job-queued" title={`${jobStates[frame.index].kind} queued`} aria-hidden="true">&#9675;</span>
+          <span
+            class="badge job-marker job-queued"
+            class:job-detect={jobStates[frame.index].kind === "detect"}
+            class:job-heal={jobStates[frame.index].kind === "heal"}
+            class:job-export={jobStates[frame.index].kind === "export"}
+            title={`${jobStates[frame.index].kind} queued`}
+            aria-hidden="true">&#9675;</span
+          >
         {:else if jobStates[frame.index]?.state === "running"}
-          <span class="badge job-marker job-running" title={`${jobStates[frame.index].kind} running`} aria-hidden="true">&#9679;</span>
+          <span
+            class="badge job-marker job-running"
+            class:job-detect={jobStates[frame.index].kind === "detect"}
+            class:job-heal={jobStates[frame.index].kind === "heal"}
+            class:job-export={jobStates[frame.index].kind === "export"}
+            title={`${jobStates[frame.index].kind} running`}
+            aria-hidden="true">&#9679;</span
+          >
         {/if}
       </div>
       <span class="name">{frame.file_name}</span>
@@ -213,12 +227,19 @@
     padding: 0;
     text-shadow: 0 0 2px rgba(0, 0, 0, 0.9);
   }
-  .job-queued {
+  .job-running {
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  /* Color by job kind -- applies to both the hollow (queued) and filled
+     (running) dot so the kind is legible before hovering for the title. */
+  .job-detect {
+    color: var(--text-2);
+  }
+  .job-heal {
     color: var(--accent);
   }
-  .job-running {
-    color: var(--accent);
-    animation: pulse 1.2s ease-in-out infinite;
+  .job-export {
+    color: var(--info);
   }
   @keyframes pulse {
     0%,
