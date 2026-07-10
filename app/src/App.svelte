@@ -935,6 +935,12 @@
             : null,
       threshold: overlay.threshold,
       healStale,
+      // Live call, not a snapshot: brushStatus() reads the Viewer's $state
+      // (brushMode/brushRadius), so this derived re-evaluates whenever the
+      // brush is toggled or resized -- the same mechanism the old
+      // `{#if viewer?.brushStatus()}` markup relied on. `viewer` itself is
+      // $state too, so binding it after mount also retriggers this.
+      brushStatus: viewer?.brushStatus() ?? null,
       singleExportNote,
     });
   });
