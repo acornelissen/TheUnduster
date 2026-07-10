@@ -110,7 +110,12 @@
   let viewer: Viewer | undefined = $state();
   let overlay = $state({ enabled: true, threshold: 0.5 });
   let detected = $state(false);
-  let componentsAtHalf: number | null = $state(null);
+  // Live defect count at the current slider threshold, fed by the Viewer's
+  // `onDetectionsChange` callback once probabilities exist (either via probe
+  // or a real detect run). Distinct from the roll's persisted
+  // `defect_count`, which stays fixed at whatever threshold last produced a
+  // stored scan/detect result -- this one tracks the slider live.
+  let liveDefectCount: number | null = $state(null);
   // Single-image mode only: set/cleared directly around the awaited
   // detect/heal invokes below. Roll mode never touches these -- its activity
   // is derived from `jobStates` (see `rollDetecting`/`rollHealing`) so that
@@ -682,7 +687,12 @@
       ? (scanFileName.split(".").pop()?.toLowerCase() ?? null)
       : null;
     detected = false;
-    componentsAtHalf = null;
+    liveDefectCount = null;
+    // A freshly opened single image is a brand-new registry entry, so this
+    // will normally miss (no cached probs to find) -- kept for symmetry with
+    // `activateCurrentFrame` and to stay correct if the registry ever learns
+    // to reuse ids for reopened files.
+    probeDetected(info.id);
     if (previousId !== undefined) {
       try {
         await invoke("close_image", { id: previousId });
@@ -791,6 +801,49 @@
     }
   }
 
+  /** Probes whether probabilities already exist for `id` (a roll frame's
+   * scan/detect probs restored into the registry at activation, or a
+   * single-image reopen) without running a fresh detect. `components`
+   * succeeds iff probabilities are cached; failure just means none exist yet
+   * -- benign, the stored-bbox fallback stays in charge. On success this
+   * flips `detected` (re-arming the Viewer's slider-effect and switching
+   * markerSource to live detections) and refreshes the Viewer so rings and
+   * the live count populate immediately.
+   *
+   * The registry's own probs restore is a fire-and-forget background task on
+   * the Rust side, so a probe taken right at activation can race it and miss.
+   * One retry after ~1s covers that; if it still misses, the frame simply has
+   * no cache and stays exactly as before this change. Both attempts are
+   * stale-guarded against `id` (captured before each await) so a fast
+   * frame-to-frame flip can never apply a late probe's result to the wrong
+   * frame. */
+  function probeDetected(id: number) {
+    async function attempt(): Promise<boolean> {
+      try {
+        const components = await invoke<[number, number, number, number][]>("components", {
+          id,
+          threshold: overlay.threshold,
+        });
+        if (info?.id !== id) return true; // stale: a newer frame is active, but not a miss
+        detected = true;
+        liveDefectCount = components.length;
+        void viewer?.refreshDetections(overlay.threshold);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    void (async () => {
+      const ok = await attempt();
+      if (ok || info?.id !== id) return;
+      setTimeout(() => {
+        if (info?.id !== id) return; // stale: frame changed during the wait
+        void attempt();
+      }, 1000);
+    })();
+  }
+
   async function activateCurrentFrame() {
     if (!roll) return;
     // Repeat presses of the same index are already filtered out by the
@@ -845,7 +898,14 @@
     // guarantee is ever violated.
     loading = null;
     detected = false;
-    componentsAtHalf = null;
+    liveDefectCount = null;
+    // The registry may already hold probabilities for this frame -- from the
+    // roll scan, or restored from the probs cache by the backend's
+    // fire-and-forget restore. Probe for them so rings/z-cycling/the status
+    // count switch to live detections without the operator ever pressing
+    // Detect; `probeDetected` no-ops (leaves the stored-bbox fallback) when
+    // none exist.
+    probeDetected(result.id);
   }
 
   async function selectFrame(index: number) {
@@ -918,11 +978,14 @@
     }
     detecting = true;
     try {
-      const report = await invoke<{ id: number; components_at_half: number }>("detect", {
+      // The report's `components_at_half` is a fixed-0.5 count used only for
+      // the backend's own bookkeeping; the immediately following
+      // `refreshDetections` call fetches the live count at the current
+      // slider threshold via `onDetectionsChange`, so it is not read here.
+      await invoke<{ id: number; components_at_half: number }>("detect", {
         id: info.id,
       });
       detected = true;
-      componentsAtHalf = report.components_at_half;
       // The Viewer's `{#key info.id}` only remounts on an image swap, never
       // on a detect (loading no longer gates on "detecting"), so this handle
       // stays stable across the call.
@@ -1085,9 +1148,13 @@
     return composeLeft({
       fileName: r ? r.frames[currentIndex].file_name : scanFileName,
       position: r ? { index: currentIndex, total: r.frames.length } : null,
+      // Live count at the current slider threshold once probabilities exist
+      // (`detected` flips via a real detect or the activation probe);
+      // otherwise fall back to the roll's persisted 0.5-threshold count, or
+      // null (not yet detected) outside a roll.
       defectCount:
-        detected && componentsAtHalf !== null
-          ? componentsAtHalf
+        detected && liveDefectCount !== null
+          ? liveDefectCount
           : r
             ? r.frames[currentIndex].defect_count
             : null,
@@ -1403,6 +1470,7 @@
         redoStrokes={currentRedoStrokes()}
         {onStrokesChange}
         onBrushLimit={(message) => pushError(message)}
+        onDetectionsChange={(count) => (liveDefectCount = count)}
       />
     {:else if !showLoader}
       <div class="empty-state">

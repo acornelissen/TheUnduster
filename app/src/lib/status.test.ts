@@ -112,6 +112,12 @@ describe("composeLeft", () => {
     expect(composeLeft({ ...base, defectCount: 1 })).toBe("raw0002.jpg  1 defect at 0.50");
   });
 
+  it("renders the defect count at the live threshold value, not a fixed 0.50", () => {
+    expect(composeLeft({ ...base, defectCount: 7, threshold: 0.35 })).toBe(
+      "raw0002.jpg  7 defects at 0.35",
+    );
+  });
+
   it("shows the healed-state indicator when the frame is healed", () => {
     expect(composeLeft({ ...base, defectCount: 3, healed: true })).toBe(
       "raw0002.jpg  3 defects at 0.50  healed (space compares)",

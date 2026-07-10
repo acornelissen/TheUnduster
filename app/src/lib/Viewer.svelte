@@ -39,6 +39,7 @@
     redoStrokes = [],
     onStrokesChange,
     onBrushLimit,
+    onDetectionsChange,
   }: {
     info: ImageInfo;
     overlay: Overlay;
@@ -51,6 +52,7 @@
     redoStrokes?: StrokeData[];
     onStrokesChange?: (strokes: StrokeData[], redo: StrokeData[]) => void;
     onBrushLimit?: (message: string) => void;
+    onDetectionsChange?: (count: number) => void;
   } = $props();
 
   let canvas: HTMLCanvasElement;
@@ -122,6 +124,9 @@
   export async function refreshDetections(threshold: number) {
     try {
       detections = await invoke("components", { id: info.id, threshold });
+      // Only on success: a failed fetch (no probabilities yet) must not
+      // report a count, so the status bar's fallback copy stays in charge.
+      onDetectionsChange?.(detections.length);
     } catch {
       // no detection run yet; leave detections empty until `detect` succeeds
       detections = [];
