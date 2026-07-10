@@ -66,7 +66,7 @@
   // to the open roll's generation and index bounds in `queueEntries` below
   // so a stale fetch can never show another roll's jobs.
   interface QueueJob {
-    kind: "detect" | "heal" | "export";
+    kind: "detect" | "heal" | "export" | "prefetch";
     index: number;
     generation: number;
   }
@@ -133,7 +133,7 @@
   // to be current when the job started.
   let jobStates: Record<
     number,
-    { state: "queued" | "running"; kind: "detect" | "heal" | "export" }
+    { state: "queued" | "running"; kind: "detect" | "heal" | "export" | "prefetch" }
   > = $state({});
   // Progress for the currently running queue job, attributed by "currently
   // running" since the worker is single-flight (see lib/queue.ts's
@@ -295,7 +295,11 @@
   });
 
   $effect(() => {
-    const un = listen<{ index: number; kind: "detect" | "heal" | "export"; generation: number }>(
+    const un = listen<{
+      index: number;
+      kind: "detect" | "heal" | "export" | "prefetch";
+      generation: number;
+    }>(
       "job-queued",
       (e) => {
         // Generation is the primary guard: a job event belongs to this
@@ -314,7 +318,11 @@
   });
 
   $effect(() => {
-    const un = listen<{ index: number; kind: "detect" | "heal" | "export"; generation: number }>(
+    const un = listen<{
+      index: number;
+      kind: "detect" | "heal" | "export" | "prefetch";
+      generation: number;
+    }>(
       "job-started",
       (e) => {
         if (e.payload.generation !== rollGeneration) return;
@@ -347,7 +355,11 @@
   });
 
   $effect(() => {
-    const un = listen<{ index: number; kind: "detect" | "heal" | "export"; generation: number }>(
+    const un = listen<{
+      index: number;
+      kind: "detect" | "heal" | "export" | "prefetch";
+      generation: number;
+    }>(
       "job-done",
       (e) => {
         if (e.payload.generation !== rollGeneration) return;
@@ -381,7 +393,7 @@
   $effect(() => {
     const un = listen<{
       index: number;
-      kind: "detect" | "heal" | "export";
+      kind: "detect" | "heal" | "export" | "prefetch";
       message: string;
       generation: number;
     }>("job-error", (e) => {
@@ -912,6 +924,24 @@
     // Detect; `probeDetected` no-ops (leaves the stored-bbox fallback) when
     // none exist.
     probeDetected(result.id);
+    prefetchNeighbors(index);
+  }
+
+  // Warms the immediate next/previous frames into the registry so stepping
+  // through a roll hits a resident entry instead of paying the full decode.
+  // Back of queue (front: false) -- neighbors must never jump ahead of a
+  // heal/export/detect the operator actually asked for. Fire-and-forget:
+  // rapid stepping is handled by the backend's coalescing (a duplicate
+  // enqueue for the same index just returns false) and the job worker's
+  // resident fast-path, so no debounce is needed here.
+  function prefetchNeighbors(index: number) {
+    if (!roll) return; // roll mode only
+    for (const neighbor of [index + 1, index - 1]) {
+      if (neighbor < 0 || neighbor >= roll.frames.length) continue;
+      invoke("enqueue_job", { kind: "prefetch", index: neighbor, front: false }).catch((e) =>
+        pushError(String(e)),
+      );
+    }
   }
 
   async function selectFrame(index: number) {

@@ -21,7 +21,7 @@
     thumbVersions?: Record<number, number>;
     jobStates?: Record<
       number,
-      { state: "queued" | "running"; kind: "detect" | "heal" | "export" }
+      { state: "queued" | "running"; kind: "detect" | "heal" | "export" | "prefetch" }
     >;
     onSelect: (index: number) => void;
   } = $props();
@@ -109,6 +109,7 @@
             class:job-detect={jobStates[frame.index].kind === "detect"}
             class:job-heal={jobStates[frame.index].kind === "heal"}
             class:job-export={jobStates[frame.index].kind === "export"}
+            class:job-prefetch={jobStates[frame.index].kind === "prefetch"}
             title={`${jobStates[frame.index].kind} queued`}
             aria-hidden="true">&#9675;</span
           >
@@ -118,6 +119,7 @@
             class:job-detect={jobStates[frame.index].kind === "detect"}
             class:job-heal={jobStates[frame.index].kind === "heal"}
             class:job-export={jobStates[frame.index].kind === "export"}
+            class:job-prefetch={jobStates[frame.index].kind === "prefetch"}
             title={`${jobStates[frame.index].kind} running`}
             aria-hidden="true">&#9679;</span
           >
@@ -240,6 +242,12 @@
   }
   .job-export {
     color: var(--info);
+  }
+  /* Prefetch shares detect's grey: it's a quiet background warm-up, not an
+     operator-requested action, so it doesn't need a color of its own -- the
+     title text disambiguates on hover. */
+  .job-prefetch {
+    color: var(--text-2);
   }
   @keyframes pulse {
     0%,

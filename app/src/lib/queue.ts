@@ -20,12 +20,12 @@ export interface QueueEntry {
 
 export interface RunningJob {
   index: number;
-  kind: "detect" | "heal" | "export";
+  kind: "detect" | "heal" | "export" | "prefetch";
 }
 
 export interface SnapshotJob {
   index: number;
-  kind: "detect" | "heal" | "export";
+  kind: "detect" | "heal" | "export" | "prefetch";
 }
 
 /** Composes the queue panel's rows: running jobs first (from `jobStates`),
