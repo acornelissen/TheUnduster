@@ -591,9 +591,8 @@
     onkeydown={onKey}
   ></canvas>
   {#if !glError}
-    <div class="tool-palette">
-      <div class="palette-group">
-        <button
+    <div class="palette tool-palette">
+      <button
           class="btn"
           class:btn-toggle-on={brushMode === "paint"}
           title="Paint mask (b)"
@@ -629,14 +628,13 @@
         {#if brushMode !== "off"}
           <span class="radius-readout">{brushRadius}px</span>
         {/if}
-      </div>
-      <div class="palette-group">
-        <button class="btn" title="Zoom out (-)" aria-label="Zoom out" onclick={zoomOut}>&minus;</button>
-        <span class="zoom-readout">{Math.round(zoom * 100)}%</span>
-        <button class="btn" title="Zoom in (+)" aria-label="Zoom in" onclick={zoomIn}>+</button>
-        <button class="btn" title="Fit (0)" aria-label="Fit to window" onclick={zoomFit}>Fit</button>
-        <button class="btn" title="100% (1)" aria-label="Actual size" onclick={zoomActual}>1:1</button>
-      </div>
+    </div>
+    <div class="palette zoom-palette">
+      <button class="btn" title="Zoom out (-)" aria-label="Zoom out" onclick={zoomOut}>&minus;</button>
+      <span class="zoom-readout">{Math.round(zoom * 100)}%</span>
+      <button class="btn" title="Zoom in (+)" aria-label="Zoom in" onclick={zoomIn}>+</button>
+      <button class="btn" title="Fit (0)" aria-label="Fit to window" onclick={zoomFit}>Fit</button>
+      <button class="btn" title="100% (1)" aria-label="Actual size" onclick={zoomActual}>1:1</button>
     </div>
   {/if}
 </div>
@@ -658,9 +656,8 @@
   canvas.brushing {
     cursor: none;
   }
-  .tool-palette {
+  .palette {
     position: absolute;
-    left: var(--space-3);
     bottom: var(--space-3);
     display: flex;
     align-items: center;
@@ -670,15 +667,11 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-1);
   }
-  .palette-group {
-    display: flex;
-    align-items: center;
-    gap: var(--space-1);
+  .tool-palette {
+    left: var(--space-3);
   }
-  .palette-group + .palette-group {
-    border-left: 1px solid var(--border);
-    margin-left: var(--space-2);
-    padding-left: var(--space-2);
+  .zoom-palette {
+    right: var(--space-3);
   }
   .zoom-readout {
     min-width: 4ch;
