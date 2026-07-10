@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fitZoom, pickLevel, ringsFor, visibleTiles, type Level } from "./viewport";
+import { fitZoom, pickLevel, ringsFor, visibleTiles, wheelZoomFactor, type Level } from "./viewport";
 
 const LEVELS: Level[] = [
   { width: 2000, height: 1200 },
@@ -120,5 +120,27 @@ describe("ringsFor", () => {
     // screen x = (1410 - 1000) * 1 + 400 = 810, r = max(20, 12) = 20;
     // circle spans 790..830, canvas right edge is 800 -> still overlaps
     expect(rings).toHaveLength(1);
+  });
+});
+
+describe("wheelZoomFactor", () => {
+  it("is 1 for zero delta", () => {
+    expect(wheelZoomFactor(0, false)).toBe(1);
+  });
+
+  it("zooms in on negative delta, out on positive, proportionally", () => {
+    expect(wheelZoomFactor(-40, false)).toBeGreaterThan(1);
+    expect(wheelZoomFactor(40, false)).toBeLessThan(1);
+    // small trackpad delta moves less than a large one
+    expect(wheelZoomFactor(-4, false)).toBeLessThan(wheelZoomFactor(-40, false));
+  });
+
+  it("clamps a detented mouse-wheel notch", () => {
+    expect(wheelZoomFactor(-120, false)).toBe(1.35);
+    expect(wheelZoomFactor(120, false)).toBe(1 / 1.35);
+  });
+
+  it("responds more strongly to pinch (ctrlKey) at the same delta", () => {
+    expect(wheelZoomFactor(-10, true)).toBeGreaterThan(wheelZoomFactor(-10, false));
   });
 });

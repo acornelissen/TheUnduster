@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
-  import { fitZoom, visibleTiles, ringsFor, TILE, type Level } from "./viewport";
+  import { fitZoom, visibleTiles, ringsFor, wheelZoomFactor, TILE, type Level } from "./viewport";
   import { TileRenderer, probPathFor, type StrokeSegment } from "./renderer";
   import {
     screenToImage,
@@ -54,7 +54,7 @@
 
   let canvas: HTMLCanvasElement;
   let renderer: TileRenderer | undefined;
-  let zoom = 1;
+  let zoom = $state(1);
   let centerX = info.width / 2;
   let centerY = info.height / 2;
   let dragging = false;
@@ -326,10 +326,32 @@
     requestFrame();
   }
 
+  function zoomFit() {
+    zoom = fitZoom(info.levels[0], canvas.width, canvas.height);
+    centerX = info.width / 2;
+    centerY = info.height / 2;
+    clampCenter();
+    requestFrame();
+  }
+
+  function zoomActual() {
+    zoom = 1;
+    clampCenter();
+    requestFrame();
+  }
+
+  function zoomIn() {
+    zoomAt(1.25, canvas.width / 2, canvas.height / 2);
+  }
+
+  function zoomOut() {
+    zoomAt(1 / 1.25, canvas.width / 2, canvas.height / 2);
+  }
+
   function onWheel(e: WheelEvent) {
     e.preventDefault();
     const dpr = window.devicePixelRatio || 1;
-    zoomAt(e.deltaY < 0 ? 1.15 : 1 / 1.15, e.offsetX * dpr, e.offsetY * dpr);
+    zoomAt(wheelZoomFactor(e.deltaY, e.ctrlKey), e.offsetX * dpr, e.offsetY * dpr);
   }
 
   function onPointerMove(e: PointerEvent) {
@@ -442,10 +464,8 @@
     else if (e.key === "+" || e.key === "=") zoomAt(1.25, canvas.width / 2, canvas.height / 2);
     else if (e.key === "-") zoomAt(1 / 1.25, canvas.width / 2, canvas.height / 2);
     else if (e.key === "0") {
-      zoom = fitZoom(info.levels[0], canvas.width, canvas.height);
-      centerX = info.width / 2;
-      centerY = info.height / 2;
-    } else if (e.key === "1") zoom = 1;
+      zoomFit();
+    } else if (e.key === "1") zoomActual();
     else return;
     e.preventDefault();
     clampCenter();
@@ -494,57 +514,73 @@
 {#if glError}
   <p role="alert" class="gl-error">Viewer failed to start: {glError}</p>
 {/if}
-<canvas
-  bind:this={canvas}
-  role="application"
-  aria-label="Scan viewer: arrows pan, plus and minus zoom, 0 fits, 1 is 100%, d detects, m toggles overlay, z and shift-z cycle defects, h heals, space toggles before and after, b paints, e erases, bracket keys size the brush, arrows nudge it and enter stamps while brushing, cmd-z undoes, escape exits, shift-cmd-z redoes"
-  tabindex="0"
-  onwheel={onWheel}
-  onpointerdown={(e) => {
-    canvas.setPointerCapture(e.pointerId);
-    if (brushMode !== "off") {
-      // Compute from the event directly rather than trusting cursorX/Y: a
-      // pointerdown with no preceding pointermove over the canvas (the very
-      // first click) would otherwise start the stroke at their stale (0,0)
-      // init value instead of the actual click position.
-      const dpr = window.devicePixelRatio || 1;
-      const [ix, iy] = screenToImage(
-        e.offsetX * dpr,
-        e.offsetY * dpr,
-        zoom,
-        centerX,
-        centerY,
-        canvas.width,
-        canvas.height,
-      );
-      cursorX = ix;
-      cursorY = iy;
-      painting = true;
-      livePoints = [[ix, iy]];
-      requestFrame();
-      return;
-    }
-    dragging = true;
-  }}
-  onpointerup={() => {
-    dragging = false;
-    if (painting) {
+<div class="viewer-canvas-wrap">
+  <canvas
+    bind:this={canvas}
+    role="application"
+    aria-label="Scan viewer: arrows pan, plus and minus zoom, 0 fits, 1 is 100%, d detects, m toggles overlay, z and shift-z cycle defects, h heals, space toggles before and after, b paints, e erases, bracket keys size the brush, arrows nudge it and enter stamps while brushing, cmd-z undoes, escape exits, shift-cmd-z redoes"
+    tabindex="0"
+    onwheel={onWheel}
+    onpointerdown={(e) => {
+      canvas.setPointerCapture(e.pointerId);
+      if (brushMode !== "off") {
+        // Compute from the event directly rather than trusting cursorX/Y: a
+        // pointerdown with no preceding pointermove over the canvas (the very
+        // first click) would otherwise start the stroke at their stale (0,0)
+        // init value instead of the actual click position.
+        const dpr = window.devicePixelRatio || 1;
+        const [ix, iy] = screenToImage(
+          e.offsetX * dpr,
+          e.offsetY * dpr,
+          zoom,
+          centerX,
+          centerY,
+          canvas.width,
+          canvas.height,
+        );
+        cursorX = ix;
+        cursorY = iy;
+        painting = true;
+        livePoints = [[ix, iy]];
+        requestFrame();
+        return;
+      }
+      dragging = true;
+    }}
+    onpointerup={() => {
+      dragging = false;
+      if (painting) {
+        painting = false;
+        commitStroke(livePoints);
+        livePoints = [];
+        requestFrame();
+      }
+    }}
+    onpointercancel={() => {
+      dragging = false;
       painting = false;
-      commitStroke(livePoints);
       livePoints = [];
-      requestFrame();
-    }
-  }}
-  onpointercancel={() => {
-    dragging = false;
-    painting = false;
-    livePoints = [];
-  }}
-  onpointermove={onPointerMove}
-  onkeydown={onKey}
-></canvas>
+    }}
+    onpointermove={onPointerMove}
+    onkeydown={onKey}
+  ></canvas>
+  {#if !glError}
+    <div class="zoom-controls">
+      <button class="btn" title="Zoom out (-)" aria-label="Zoom out" onclick={zoomOut}>&minus;</button>
+      <span class="zoom-readout">{Math.round(zoom * 100)}%</span>
+      <button class="btn" title="Zoom in (+)" aria-label="Zoom in" onclick={zoomIn}>+</button>
+      <button class="btn" title="Fit (0)" aria-label="Fit to window" onclick={zoomFit}>Fit</button>
+      <button class="btn" title="100% (1)" aria-label="Actual size" onclick={zoomActual}>1:1</button>
+    </div>
+  {/if}
+</div>
 
 <style>
+  .viewer-canvas-wrap {
+    position: relative;
+    width: 100%;
+    height: 100%;
+  }
   canvas {
     width: 100%;
     height: 100%;
@@ -552,6 +588,25 @@
     background: var(--surround);
     touch-action: none;
     cursor: grab;
+  }
+  .zoom-controls {
+    position: absolute;
+    right: var(--space-3);
+    bottom: var(--space-3);
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+    padding: var(--space-1);
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-1);
+  }
+  .zoom-readout {
+    min-width: 4ch;
+    text-align: center;
+    font-size: var(--text-sm);
+    color: var(--text-2);
+    font-variant-numeric: tabular-nums;
   }
   .gl-error {
     color: var(--err);

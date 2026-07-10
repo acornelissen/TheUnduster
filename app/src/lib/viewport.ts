@@ -25,6 +25,26 @@ export function fitZoom(level0: Level, canvasW: number, canvasH: number): number
   return Math.min(canvasW / level0.width, canvasH / level0.height);
 }
 
+const WHEEL_ZOOM_CLAMP = 1.35;
+// A detented mouse wheel notch reports deltaY = +/-120; size k so that
+// exactly hits the clamp, i.e. exp(120 * k) == WHEEL_ZOOM_CLAMP.
+const WHEEL_ZOOM_K = Math.log(WHEEL_ZOOM_CLAMP) / 120;
+const WHEEL_ZOOM_K_CTRL = WHEEL_ZOOM_K * 5;
+
+/**
+ * Multiplicative zoom factor for one wheel event. Trackpads emit streams
+ * of small-delta events, so a fixed per-event factor (the old 1.15) races
+ * away; scaling with delta magnitude keeps trackpads gentle while a
+ * detented mouse wheel still moves a full clamped step per notch. Pinch
+ * arrives as wheel-with-ctrlKey in WKWebView and needs a stronger
+ * response to feel 1:1 with the gesture.
+ */
+export function wheelZoomFactor(deltaY: number, ctrlKey: boolean): number {
+  const k = ctrlKey ? WHEEL_ZOOM_K_CTRL : WHEEL_ZOOM_K;
+  const factor = Math.exp(-deltaY * k);
+  return Math.min(Math.max(factor, 1 / WHEEL_ZOOM_CLAMP), WHEEL_ZOOM_CLAMP);
+}
+
 function tilesForLevel(
   levels: Level[],
   level: number,
