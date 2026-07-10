@@ -178,18 +178,13 @@
   const isHealing = $derived(healing || rollHealing);
   // Count of queued jobs (all states, all frames) for the status line.
   const queuedJobCount = $derived(Object.keys(jobStates).length);
-  // Exporting is queue state now, not a hand-managed flag: any export job
-  // queued or running means the roll is exporting. Used to gate re-clicks
-  // (the button disabled state and exportApproved()'s guard) so those stay
-  // blocked for the whole time exports are in the queue, not just while one
-  // is actively running.
-  const rollExporting = $derived(
-    Object.values(jobStates).some((j) => j.kind === "export"),
-  );
-  // Narrower than rollExporting: only true while an export job is actually
-  // running (not merely queued). Feeds the status-activity slot so a live
-  // heal narrates itself during a mixed batch instead of the slot showing
-  // bare "exporting" for an export that hasn't started yet.
+  // True only while an export job is actually running (not merely queued).
+  // Feeds the status-activity slot so a live heal narrates itself during a
+  // mixed batch instead of the slot showing bare "exporting" for an export
+  // that hasn't started yet. Deliberately NOT used to disable the Export
+  // button: re-clicking while exports are queued is allowed -- the backend
+  // coalesces per-frame, so already-queued frames are skipped and only
+  // newly approved work is added.
   const exportRunning = $derived(
     Object.values(jobStates).some((j) => j.kind === "export" && j.state === "running"),
   );
@@ -658,7 +653,7 @@
   }
 
   async function exportApproved() {
-    if (!roll || rollExporting) return;
+    if (!roll) return;
     const dir = await open({ directory: true });
     if (typeof dir !== "string") return;
     try {
@@ -1224,9 +1219,9 @@
           class="btn"
           title="Export approved"
           onclick={exportApproved}
-          disabled={rollExporting || roll.frames.every((f) => !f.approved)}
+          disabled={roll.frames.every((f) => !f.approved)}
         >
-          {rollExporting ? "Exporting..." : "Export approved"}
+          Export approved
         </button>
       </div>
     {/if}
