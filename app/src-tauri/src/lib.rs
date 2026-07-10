@@ -1211,17 +1211,23 @@ struct QueueIdlePayload {
 /// A coarse stage marker for one frame's export, emitted from inside the
 /// export job's `spawn_blocking` closure so a slow transient heal (cache
 /// miss) shows the operator something more specific than "running".
+/// `generation` matches the job-* events' field so the frontend listener
+/// can drop stale narration from a roll that was swapped mid-export.
 #[derive(serde::Serialize, Clone)]
 struct ExportFrameStage {
     index: usize,
     stage: &'static str,
+    generation: u64,
 }
 
+/// Per-defect heal progress during a transient export -- see
+/// `ExportFrameStage` for why `generation` rides along.
 #[derive(serde::Serialize, Clone)]
 struct ExportHealProgress {
     index: usize,
     done: usize,
     total: usize,
+    generation: u64,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -1675,8 +1681,14 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                 let file_name_for_log = file_name.clone();
                 tauri::async_runtime::spawn_blocking(move || {
                     let stage = |s: &'static str| {
-                        let _ = app_for_stages
-                            .emit("export-frame-stage", ExportFrameStage { index, stage: s });
+                        let _ = app_for_stages.emit(
+                            "export-frame-stage",
+                            ExportFrameStage {
+                                index,
+                                stage: s,
+                                generation,
+                            },
+                        );
                     };
                     // Stamp BEFORE decoding -- see run_heal's identical comment.
                     // A stat failure skips the heal-cache interaction (read AND
@@ -1724,7 +1736,12 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                         fd_heal::heal_with_progress(&mut copy, &mask, inp, &mut |done, total| {
                             let _ = app_for_stages.emit(
                                 "export-heal-progress",
-                                ExportHealProgress { index, done, total },
+                                ExportHealProgress {
+                                    index,
+                                    done,
+                                    total,
+                                    generation,
+                                },
                             );
                         })
                         .map_err(|e| e.to_string())?;
@@ -1760,11 +1777,20 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
             // shorter. `generation` in the payload lets the listener apply the
             // same guard the job-* events already use, belt-and-braces with
             // this gate.
-            if app
+            //
+            // The gate also suppresses the badge when set_exported fails on
+            // the sidecar SAVE itself (disk I/O), not just on a stale
+            // generation. That direction is deliberate: the badge mirrors
+            // persisted state, and a badge for an exported-but-not-recorded
+            // frame would vanish on relaunch. The exported file itself is
+            // fine either way.
+            if let Err(_e) = app
                 .state::<roll::RollState>()
                 .set_exported(generation, index)
-                .is_ok()
             {
+                #[cfg(debug_assertions)]
+                eprintln!("[export] exported flag not recorded for frame {index}: {_e}");
+            } else {
                 let _ = app.emit("export-progress", ExportProgress { index, generation });
             }
             Ok(())

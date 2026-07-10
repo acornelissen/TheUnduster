@@ -483,21 +483,32 @@
   let exportDetail: string | null = $state(null);
 
   $effect(() => {
-    const un = listen<{ index: number; stage: string }>("export-frame-stage", (e) => {
-      if (!roll) return;
-      exportDetail = `${roll.frames[e.payload.index].file_name}: ${e.payload.stage}`;
-      queueProgress = { stage: e.payload.stage };
-    });
+    const un = listen<{ index: number; stage: string; generation: number }>(
+      "export-frame-stage",
+      (e) => {
+        if (!roll) return;
+        // Same guard shape as the export-progress listener: a stale event
+        // from a roll swapped mid-export must not narrate against (or index
+        // past the end of) the new roll's frames.
+        if (e.payload.generation !== rollGeneration) return;
+        if (e.payload.index < 0 || e.payload.index >= roll.frames.length) return;
+        exportDetail = `${roll.frames[e.payload.index].file_name}: ${e.payload.stage}`;
+        queueProgress = { stage: e.payload.stage };
+      },
+    );
     return () => {
       un.then((f) => f());
     };
   });
 
   $effect(() => {
-    const un = listen<{ index: number; done: number; total: number }>(
+    const un = listen<{ index: number; done: number; total: number; generation: number }>(
       "export-heal-progress",
       (e) => {
         if (!roll) return;
+        // Same guard shape as export-frame-stage above.
+        if (e.payload.generation !== rollGeneration) return;
+        if (e.payload.index < 0 || e.payload.index >= roll.frames.length) return;
         exportDetail = `${roll.frames[e.payload.index].file_name}: healing ${e.payload.done}/${e.payload.total}`;
         queueProgress = { done: e.payload.done, total: e.payload.total };
       },
@@ -692,6 +703,9 @@
       // same index) could be mistaken for a live job by the guards in the
       // job-started/job-done/job-error listeners below.
       jobStates = {};
+      // Same reason for the export narration: it described the closed
+      // roll's export, and nothing in single-image mode will clear it.
+      exportDetail = null;
     }
     try {
       info = await invoke<ImageInfo>("open_image", { path });
@@ -760,6 +774,9 @@
     // frames that no longer exist in this roll's index space, and must not
     // be mistaken for this roll's own in-flight work by the job listeners.
     jobStates = {};
+    // Likewise the export narration: a stale line from the previous roll's
+    // export would otherwise linger until this roll's first export event.
+    exportDetail = null;
     currentIndex = 0;
     if (roll.frames.length > 0) {
       await activateCurrentFrame();
