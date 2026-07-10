@@ -869,7 +869,7 @@
   }
 
   async function activateCurrentFrame() {
-    if (!roll) return;
+    if (!roll || rollGeneration === null) return;
     // Repeat presses of the same index are already filtered out by the
     // `index === currentIndex` guards in `selectFrame`/`stepFrame` below, so
     // `activating` need not gate re-entry itself -- it just tracks in-flight
@@ -885,15 +885,27 @@
     // instead of the persisted values the cached heal actually matched.
     const persistedThreshold = roll.frames[index].threshold;
     const persistedStrokeCount = roll.frames[index].strokes.length;
+    // Captured now, schedule-time, same shape as the threshold-save debounce:
+    // the backend re-checks this against the live roll under the same lock
+    // that registers the decoded image, so a decode that finishes after a
+    // roll swap loses instead of registering old-roll pixels into the new
+    // roll's same-index frame.
+    const generation = rollGeneration;
     activating = true;
     let result: ImageInfo;
     try {
-      result = await invoke<ImageInfo>("activate_frame", { index });
+      result = await invoke<ImageInfo>("activate_frame", { index, generation });
     } catch (e) {
       if (seq !== activationSeq) return; // stale: a newer activation is in flight
       activating = false;
-      pushError(String(e));
       loading = null;
+      // Benign swap race, not a real failure: the backend closed its own
+      // freshly-decoded image and declined to register it. Nothing to show
+      // the operator -- the frame they're actually looking at (post-swap)
+      // is unaffected, and a subsequent activation of the new roll's frame
+      // proceeds normally.
+      if (String(e).includes("roll changed during activation")) return;
+      pushError(String(e));
       return;
     }
     if (seq !== activationSeq) return; // stale: a newer activation superseded this one

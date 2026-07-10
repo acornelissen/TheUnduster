@@ -363,6 +363,23 @@ pub struct RollState {
     pub export_dest: Mutex<Option<PathBuf>>,
 }
 
+/// Outcome of `RollState::set_image_id`: either the write landed (carrying
+/// whatever id it superseded, if any), or it was discarded because
+/// `generation` no longer matched the live roll. Distinct from a plain
+/// `Option<Option<u64>>` so call sites read as "written vs lost" rather than
+/// a doubly-nested `None`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SetImageId {
+    /// The id was recorded. Carries the id it replaced, if any -- the
+    /// caller must close that superseded image or it leaks.
+    Written(Option<u64>),
+    /// `generation` no longer matched the live roll; nothing was written.
+    /// The caller must close its own freshly-produced image (there is
+    /// nothing else to close -- the frame this generation pointed at may
+    /// not even exist anymore).
+    GenerationLost,
+}
+
 impl RollState {
     /// Opens `dir` as the new roll, replacing whatever roll was previously
     /// held. Returns the fresh roll's info alongside any `image_id`s that
@@ -491,13 +508,28 @@ impl RollState {
             .image_id)
     }
 
-    /// Records the frame's live registry id, returning the id it replaces
-    /// (if any) so the caller can close it: concurrent activations of the
-    /// same frame each decode independently, and the superseded image would
-    /// otherwise be orphaned in the registry -- roughly a gigabyte of leaked
-    /// pixels per rapid re-click on a large scan.
-    pub fn set_image_id(&self, index: usize, id: u64) -> Result<Option<u64>, String> {
+    /// Records the frame's live registry id, but only if `generation` still
+    /// matches the live roll -- re-checked under the same lock that guards
+    /// the write, `set_exported`-style: a decode already in flight when the
+    /// operator opens a new roll must not register its (old-roll) pixels
+    /// into the new roll's same-index frame just because that frame's
+    /// `image_id` starts out `None`.
+    ///
+    /// On a landed write, returns the id it replaces (if any) so the caller
+    /// can close it: concurrent activations of the same frame each decode
+    /// independently, and the superseded image would otherwise be orphaned
+    /// in the registry -- roughly a gigabyte of leaked pixels per rapid
+    /// re-click on a large scan.
+    pub fn set_image_id(
+        &self,
+        generation: u64,
+        index: usize,
+        id: u64,
+    ) -> Result<SetImageId, String> {
         let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return Ok(SetImageId::GenerationLost);
+        }
         let roll = guard.as_mut().ok_or("no roll open")?;
         let frame = roll
             .frames
@@ -505,22 +537,33 @@ impl RollState {
             .ok_or_else(|| format!("no frame {index}"))?;
         let previous = frame.image_id.filter(|&old| old != id);
         frame.image_id = Some(id);
-        Ok(previous)
+        Ok(SetImageId::Written(previous))
     }
 
-    /// Records the frame's live registry id only if the frame has none.
-    /// Returns true when the id was recorded, false when the frame already
-    /// had one -- the caller lost the race and must close its own image.
-    /// Check and set are one operation under the roll lock, so two racers
-    /// can never both believe they won.
+    /// Records the frame's live registry id only if the frame has none AND
+    /// `generation` still matches the live roll. Returns true when the id
+    /// was recorded, false otherwise -- the caller lost the race (to
+    /// another racer OR to a roll swap) and must close its own image either
+    /// way, so both loss modes collapse to the same `false`. Check and set
+    /// are one operation under the roll lock, so two racers can never both
+    /// believe they won, and a stale generation can never claim an empty
+    /// slot that belongs to a different roll.
     ///
     /// Prefetch-only counterpart to `set_image_id`: a background warm-up
     /// racing an activation of the same frame must LOSE the tie, never
     /// supersede -- superseding would close the image the activation just
     /// put on screen. Activation keeps `set_image_id`'s supersede semantics
     /// (latest activation wins, superseded image closed) unchanged.
-    pub fn set_image_id_if_absent(&self, index: usize, id: u64) -> Result<bool, String> {
+    pub fn set_image_id_if_absent(
+        &self,
+        generation: u64,
+        index: usize,
+        id: u64,
+    ) -> Result<bool, String> {
         let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return Ok(false);
+        }
         let roll = guard.as_mut().ok_or("no roll open")?;
         let frame = roll
             .frames
@@ -802,8 +845,9 @@ mod state_tests {
         let dir_b = tempfile::tempdir().unwrap();
         touch(dir_b.path(), "g00.tif");
         let state = opened_state(dir_a.path(), 3);
-        state.set_image_id(0, 100).unwrap();
-        state.set_image_id(1, 101).unwrap();
+        let gen = state.generation();
+        state.set_image_id(gen, 0, 100).unwrap();
+        state.set_image_id(gen, 1, 101).unwrap();
         // frame 2 never activated -- must not appear in the stale ids.
 
         let (info, mut stale_ids) = state.open(dir_b.path()).unwrap();
@@ -828,7 +872,7 @@ mod state_tests {
     fn close_returns_live_ids_and_clears_the_roll() {
         let dir = tempfile::tempdir().unwrap();
         let state = opened_state(dir.path(), 2);
-        state.set_image_id(0, 5).unwrap();
+        state.set_image_id(state.generation(), 0, 5).unwrap();
 
         let stale_ids = state.close().unwrap();
         assert_eq!(stale_ids, vec![5]);
@@ -888,8 +932,9 @@ mod state_tests {
         }
         let state = RollState::default();
         state.open(dir.path()).unwrap();
+        let gen = state.generation();
         for (i, id) in [(0, 10), (1, 11), (3, 13), (4, 14)] {
-            state.set_image_id(i, id).unwrap();
+            state.set_image_id(gen, i, id).unwrap();
         }
         // view order: 0, 4, 3, 1 -> among candidates outside window(1)={0,1,2},
         // frame 4 was viewed before 3, but 0 is oldest... 0 is inside window.
@@ -909,7 +954,7 @@ mod state_tests {
         state.open(dir.path()).unwrap();
         state.touch(0).unwrap();
         state.open(dir.path()).unwrap(); // swap clears recency
-        state.set_image_id(0, 5).unwrap();
+        state.set_image_id(state.generation(), 0, 5).unwrap();
         // frame 0 activated but inside every window; no candidates, no panic
         assert!(state.eviction_candidates(0).unwrap().is_empty());
     }
@@ -918,10 +963,11 @@ mod state_tests {
     fn ids_to_evict_only_returns_activated_frames_outside_the_window() {
         let dir = tempfile::tempdir().unwrap();
         let state = opened_state(dir.path(), 5);
-        state.set_image_id(0, 10).unwrap();
-        state.set_image_id(1, 11).unwrap();
-        state.set_image_id(2, 12).unwrap();
-        state.set_image_id(4, 14).unwrap();
+        let gen = state.generation();
+        state.set_image_id(gen, 0, 10).unwrap();
+        state.set_image_id(gen, 1, 11).unwrap();
+        state.set_image_id(gen, 2, 12).unwrap();
+        state.set_image_id(gen, 4, 14).unwrap();
         // window around 2 is {1,2,3}: frame 0 and frame 4 are activated but
         // outside it, frame 3 is inside the window but was never activated.
         let mut evict = state.eviction_candidates(2).unwrap();
@@ -1102,10 +1148,39 @@ mod state_tests {
         std::fs::write(dir.path().join("a.png"), b"x").unwrap();
         let state = RollState::default();
         state.open(dir.path()).unwrap();
-        assert_eq!(state.set_image_id(0, 7).unwrap(), None);
-        assert_eq!(state.set_image_id(0, 9).unwrap(), Some(7)); // superseded
-        assert_eq!(state.set_image_id(0, 9).unwrap(), None); // same id: nothing to close
+        let gen = state.generation();
+        assert_eq!(
+            state.set_image_id(gen, 0, 7).unwrap(),
+            SetImageId::Written(None)
+        );
+        assert_eq!(
+            state.set_image_id(gen, 0, 9).unwrap(),
+            SetImageId::Written(Some(7))
+        ); // superseded
+        assert_eq!(
+            state.set_image_id(gen, 0, 9).unwrap(),
+            SetImageId::Written(None)
+        ); // same id: nothing to close
         assert_eq!(state.image_id(0).unwrap(), Some(9));
+    }
+
+    #[test]
+    fn set_image_id_loses_a_stale_generation_and_leaves_image_id_untouched() {
+        // Pins the bead-619 gap: a decode already running when the operator
+        // swaps rolls must not register its pixels into the new roll's
+        // same-index frame just because that frame's image_id started None.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"x").unwrap();
+        let state = RollState::default();
+        state.open(dir.path()).unwrap();
+        let stale = state.generation();
+        state.open(dir.path()).unwrap(); // swap bumps generation, clears image_id
+        assert_eq!(
+            state.set_image_id(stale, 0, 999).unwrap(),
+            SetImageId::GenerationLost
+        );
+        // The stale write left the fresh roll's frame untouched.
+        assert_eq!(state.image_id(0).unwrap(), None);
     }
 
     #[test]
@@ -1114,19 +1189,35 @@ mod state_tests {
         std::fs::write(dir.path().join("a.png"), b"x").unwrap();
         let state = RollState::default();
         state.open(dir.path()).unwrap();
+        let gen = state.generation();
         // Empty slot: the if-absent set wins and records the id.
-        assert!(state.set_image_id_if_absent(0, 7).unwrap());
+        assert!(state.set_image_id_if_absent(gen, 0, 7).unwrap());
         assert_eq!(state.image_id(0).unwrap(), Some(7));
         // Occupied slot: the if-absent set loses -- the existing id stays,
         // never superseded. This is the prefetch tie-loss contract: an
         // activation that landed first keeps its (displayed) image.
-        assert!(!state.set_image_id_if_absent(0, 9).unwrap());
+        assert!(!state.set_image_id_if_absent(gen, 0, 9).unwrap());
         assert_eq!(state.image_id(0).unwrap(), Some(7));
         // Bad index still errors rather than reading as a lost tie.
         assert!(state
-            .set_image_id_if_absent(5, 1)
+            .set_image_id_if_absent(gen, 5, 1)
             .unwrap_err()
             .contains("no frame"));
+    }
+
+    #[test]
+    fn set_image_id_if_absent_loses_a_stale_generation_and_leaves_image_id_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"x").unwrap();
+        let state = RollState::default();
+        state.open(dir.path()).unwrap();
+        let stale = state.generation();
+        state.open(dir.path()).unwrap(); // swap bumps generation, clears image_id
+                                         // Even though the fresh roll's frame 0 has no image_id (an empty
+                                         // slot the if-absent check would otherwise happily claim), the
+                                         // stale generation must lose -- false, same as a tied race.
+        assert!(!state.set_image_id_if_absent(stale, 0, 999).unwrap());
+        assert_eq!(state.image_id(0).unwrap(), None);
     }
 
     #[test]
@@ -1215,7 +1306,7 @@ mod state_tests {
         }
         let state = RollState::default();
         state.open(dir.path()).unwrap();
-        state.set_image_id(1, 42).unwrap();
+        state.set_image_id(state.generation(), 1, 42).unwrap();
         let (d, name) = state.frame_for_image(42).unwrap().expect("mapped");
         assert_eq!(d, dir.path());
         assert_eq!(name, "b.png");

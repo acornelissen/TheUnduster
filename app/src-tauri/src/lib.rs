@@ -552,14 +552,31 @@ async fn decode_and_insert(
     Ok(images.insert(prepared))
 }
 
+/// Sentinel returned by `decode_and_register` (and surfaced up through
+/// `activate_frame`) when the freshly-decoded image lost its registration to
+/// a roll swap. Recognized by the frontend's `activate_frame` catch handler
+/// so a benign swap race never surfaces as a scary error toast -- see that
+/// handler's comment.
+const ACTIVATION_LOST_ROLL_SWAP: &str = "roll changed during activation; discarded";
+
 /// `activate_frame`'s fresh-decode path: `decode_and_insert` plus the
 /// activation-only supersede step. Neither the reuse path (already resident)
 /// nor activation's other UI-contract steps -- the "decoding" progress emit,
 /// the probs-cache restore, `roll.touch`, `evict_over_budget`, and the
 /// terminal "ready" emit -- live here; `activate_frame` keeps them.
+///
+/// `generation` is the roll generation this activation was scheduled
+/// against (the frontend's `rollGeneration` at invoke time); it travels with
+/// the decode and is re-checked under `set_image_id`'s own lock, mirroring
+/// `set_exported`/`record_scan_result`. A decode already running when the
+/// operator opens a new roll must not register its (old-roll) pixels into
+/// the new roll's same-index frame just because that frame starts with
+/// `image_id` `None` -- so a generation loss here closes the fresh image and
+/// returns `ACTIVATION_LOST_ROLL_SWAP` instead of writing anywhere.
 async fn decode_and_register(
     images: &State<'_, Mutex<Images>>,
     roll: &State<'_, roll::RollState>,
+    generation: u64,
     index: usize,
     path: std::path::PathBuf,
     on_decoded: Option<impl FnOnce() + Send + 'static>,
@@ -569,9 +586,17 @@ async fn decode_and_register(
     // whichever lands later replaces the frame's id, and the superseded
     // image must be closed or it is orphaned in the registry (about a
     // gigabyte of leaked pixels per rapid re-click on a 168MP scan).
-    if let Some(superseded) = roll.set_image_id(index, info.id)? {
-        let mut images = images.lock().map_err(|e| e.to_string())?;
-        images.close(superseded);
+    match roll.set_image_id(generation, index, info.id)? {
+        roll::SetImageId::Written(Some(superseded)) => {
+            let mut images = images.lock().map_err(|e| e.to_string())?;
+            images.close(superseded);
+        }
+        roll::SetImageId::Written(None) => {}
+        roll::SetImageId::GenerationLost => {
+            let mut images = images.lock().map_err(|e| e.to_string())?;
+            images.close(info.id);
+            return Err(ACTIVATION_LOST_ROLL_SWAP.to_string());
+        }
     }
     Ok(info)
 }
@@ -583,6 +608,7 @@ async fn activate_frame(
     roll: State<'_, roll::RollState>,
     detector: State<'_, detect::DetectorState>,
     index: usize,
+    generation: u64,
 ) -> Result<ImageInfo, String> {
     #[cfg(debug_assertions)]
     eprintln!("[activate] frame {index} requested");
@@ -634,6 +660,7 @@ async fn activate_frame(
     let info = decode_and_register(
         &images,
         &roll,
+        generation,
         index,
         path,
         Some(move || {
@@ -1741,11 +1768,18 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
             // spans two tasks and real decodes, so it is not unit-testable;
             // the tie-loss primitive itself is covered by
             // roll::state_tests::set_image_id_if_absent_loses_to_an_existing_id.
-            if !roll_state.set_image_id_if_absent(index, info.id)? {
+            //
+            // `generation` here is this job's own generation (`run_job`'s
+            // parameter, equal to `job.generation`) -- a roll swap mid-decode
+            // makes this a loss too, same as losing to another racer, so the
+            // frame this job started against never gets an id written into
+            // whatever roll now occupies that slot.
+            if !roll_state.set_image_id_if_absent(generation, index, info.id)? {
                 // Lost: an activation (or an earlier racer) owns this frame
-                // now. Close our own freshly-inserted image -- nothing
-                // references it, and leaving it would orphan a full frame of
-                // pixels in the registry.
+                // now, or the roll was swapped mid-decode. Close our own
+                // freshly-inserted image -- nothing references it, and
+                // leaving it would orphan a full frame of pixels in the
+                // registry.
                 let mut images = images_state.lock().map_err(|e| e.to_string())?;
                 images.close(info.id);
                 return Ok(());
