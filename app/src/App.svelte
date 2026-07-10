@@ -512,6 +512,9 @@
       }
       // "drop"
       dropActive = false;
+      // Same gate as the picker buttons' disabled state: a drop while an
+      // open is already in flight would race info/loading reassignment.
+      if (loading !== null) return;
       const paths = payload.paths;
       let kinds: PathKind[];
       try {
@@ -1221,7 +1224,10 @@
   }
 </script>
 
-<svelte:window onkeydown={onWindowKey} />
+<!-- blur failsafe: some webview drag cancels (Escape, leaving the window
+     abruptly) never send a "leave" event, which would wedge the drop
+     highlight on until the next drag. -->
+<svelte:window onkeydown={onWindowKey} onblur={() => (dropActive = false)} />
 
 <div class="shell">
   <header class="toolbar">
