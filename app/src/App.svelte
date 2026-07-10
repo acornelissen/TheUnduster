@@ -4,9 +4,11 @@
   import { open, save } from "@tauri-apps/plugin-dialog";
   import Viewer from "./lib/Viewer.svelte";
   import Filmstrip from "./lib/Filmstrip.svelte";
+  import StatusBar from "./lib/StatusBar.svelte";
   import { nextUnapprovedIndex } from "./lib/roll-nav";
   import type { Level } from "./lib/viewport";
   import { undoStroke, redoStroke, type StrokeData } from "./lib/brush";
+  import { composeActivity, composeLeft, composeRight } from "./lib/status";
 
   interface ImageInfo {
     id: number;
@@ -915,6 +917,53 @@
     );
   });
 
+  // Three-zone status bar strings. Pure composition lives in lib/status.ts
+  // (tested there); these derived calls just wire in the live state. Each
+  // snapshots `roll` into a local const first: TS's narrowing of the
+  // `$state`-declared `roll` does not survive into the `.filter` closures
+  // below without it.
+  const statusLeft = $derived.by(() => {
+    const r = roll;
+    return composeLeft({
+      fileName: r ? r.frames[currentIndex].file_name : scanFileName,
+      position: r ? { index: currentIndex, total: r.frames.length } : null,
+      defectCount:
+        detected && componentsAtHalf !== null
+          ? componentsAtHalf
+          : r
+            ? r.frames[currentIndex].defect_count
+            : null,
+      threshold: overlay.threshold,
+      healStale,
+      singleExportNote,
+    });
+  });
+  const statusActivity = $derived.by(() => {
+    const r = roll;
+    return composeActivity({
+      modelStatus,
+      modelProgressText: modelProgressText(),
+      exporting,
+      exportDetail,
+      isHealing,
+      healProgress,
+      isDetecting,
+      roll: r !== null,
+      scanDone,
+      scannedCount: r ? r.frames.filter((f) => f.defect_count !== null).length : 0,
+      totalCount: r ? r.frames.length : 0,
+    });
+  });
+  const statusRight = $derived.by(() => {
+    const r = roll;
+    return composeRight({
+      roll: r !== null,
+      approvedCount: r ? r.frames.filter((f) => f.approved).length : 0,
+      totalCount: r ? r.frames.length : 0,
+      queuedJobCount,
+    });
+  });
+
   function onStrokesChange(strokes: StrokeData[], redo: StrokeData[]) {
     const key = strokeKey();
     if (!key) return;
@@ -1084,61 +1133,6 @@
       </div>
     {/if}
 
-    <!-- Status messages and error -->
-    {#if info}
-      <p class="status" role="status">
-        {#if detected && componentsAtHalf !== null}
-          {componentsAtHalf} defect{componentsAtHalf === 1 ? "" : "s"} at 50%
-        {:else if roll && roll.frames[currentIndex].defect_count !== null}
-          {roll.frames[currentIndex].defect_count} defect{roll.frames[currentIndex]
-            .defect_count === 1
-            ? ""
-            : "s"} at 50% (scanned)
-        {:else}
-          Not yet detected
-        {/if}
-        {#if isDetecting}
-          &mdash; Detecting...
-        {/if}
-        {#if isHealing}
-          &mdash; Healing...{#if healProgress}
-            ({healProgress.done}/{healProgress.total} defects){/if}
-        {/if}
-        {#if queuedJobCount > 0}
-          &mdash; {queuedJobCount} job{queuedJobCount === 1 ? "" : "s"} queued
-        {/if}
-        {#if info?.healed}
-          &mdash; space toggles before/after
-          {#if healStale}
-            &mdash; heal is stale (h re-heals)
-          {/if}
-        {/if}
-        {#if viewer?.brushStatus()}
-          &mdash; {viewer.brushStatus()}
-        {/if}
-        {#if singleExportNote}
-          &mdash; {singleExportNote}
-        {/if}
-        {#if roll}
-          &mdash; {roll.frames.filter((f) => f.approved).length}/{roll.frames.length} approved
-          {#if !scanDone}
-            &mdash; scanning ({roll.frames.filter((f) => f.defect_count !== null).length}/{roll
-              .frames.length})
-          {/if}
-          {#if exporting}
-            &mdash; exporting ({roll.frames.filter((f) => f.exported).length}/{roll.frames.filter(
-              (f) => f.approved,
-            ).length}){#if exportDetail}
-              &mdash; {exportDetail}{/if}
-          {/if}
-        {/if}
-      </p>
-    {/if}
-    {#if modelStatus === "downloading"}
-      <p class="status" role="status">downloading healing model {modelProgressText()}</p>
-    {:else if modelStatus === "missing" || modelStatus === "available"}
-      <p class="status" role="status">healing: classical fill only</p>
-    {/if}
     {#if error}<p role="alert">{error}</p>{/if}
   </header>
   <section class="stage">
@@ -1182,6 +1176,9 @@
   {#if roll}
     <Filmstrip frames={roll.frames} {currentIndex} {thumbVersions} {jobStates} onSelect={selectFrame} />
   {/if}
+  {#if info}
+    <StatusBar left={statusLeft} activity={statusActivity} right={statusRight} />
+  {/if}
 </div>
 
 <style>
@@ -1201,12 +1198,6 @@
     align-items: center;
     gap: var(--space-1);
     font-size: var(--text-sm);
-  }
-  .status {
-    margin: 0;
-    color: var(--text-2);
-    font-size: var(--text-sm);
-    font-variant-numeric: tabular-nums;
   }
   .stage {
     flex: 1;
