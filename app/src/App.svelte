@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
+  import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { open, save } from "@tauri-apps/plugin-dialog";
   import Viewer from "./lib/Viewer.svelte";
   import Filmstrip from "./lib/Filmstrip.svelte";
@@ -9,6 +10,7 @@
   import LogPanel from "./lib/LogPanel.svelte";
   import QueuePanel from "./lib/QueuePanel.svelte";
   import { composeQueueEntries, type QueueProgress } from "./lib/queue";
+  import { routeDrop, type PathKind } from "./lib/drop";
   import { nextUnapprovedIndex } from "./lib/roll-nav";
   import type { Level } from "./lib/viewport";
   import { undoStroke, redoStroke, type StrokeData } from "./lib/brush";
@@ -493,6 +495,47 @@
     return () => clearTimeout(loaderTimer);
   });
 
+  // True while a drag carrying files/folders hovers the window; drives the
+  // drop-highlight overlay only, never blocks the drop itself.
+  let dropActive = $state(false);
+
+  $effect(() => {
+    const un = getCurrentWebview().onDragDropEvent(async (event) => {
+      const { payload } = event;
+      if (payload.type === "enter" || payload.type === "over") {
+        dropActive = true;
+        return;
+      }
+      if (payload.type === "leave") {
+        dropActive = false;
+        return;
+      }
+      // "drop"
+      dropActive = false;
+      const paths = payload.paths;
+      let kinds: PathKind[];
+      try {
+        kinds = await Promise.all(paths.map((path) => invoke<PathKind>("path_kind", { path })));
+      } catch (e) {
+        pushError(String(e));
+        return;
+      }
+      const route = routeDrop(paths, kinds);
+      if ("error" in route) {
+        pushError(route.error);
+        return;
+      }
+      if (route.action === "scan") {
+        await openScanPath(route.path);
+      } else {
+        await openRollPath(route.path);
+      }
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
   $effect(() => {
     const un = listen<{ index: number }>("roll-thumb", (e) => {
       thumbVersions[e.payload.index] = (thumbVersions[e.payload.index] ?? 0) + 1;
@@ -561,8 +604,15 @@
       filters: [{ name: "Scans", extensions: ["tif", "tiff", "png", "jpg", "jpeg"] }],
     });
     if (typeof path !== "string") return;
+    await openScanPath(path);
+  }
+
+  /** Every post-pick step for opening a single scan, shared by the file
+   * picker (`openScan`) and a dropped file (`onDragDropEvent`'s "drop"
+   * handling): the picker only adds the dialog in front of this. */
+  async function openScanPath(path: string) {
     const previousId = info?.id;
-    // Null-first, like openRoll: every successful open must be a real
+    // Null-first, like openRollPath: every successful open must be a real
     // Viewer unmount/remount, because the Viewer's mount is what focuses
     // the canvas so keys work immediately. Swapping `info` old->new
     // directly (scan open while a scan is already open) would keep the
@@ -594,8 +644,8 @@
       return;
     }
     // Only after a SUCCESSFUL open: a failed open falls back to the empty
-    // stage (info was nulled above, matching openRoll's failure path), and
-    // a later single-frame export must keep defaulting to the last
+    // stage (info was nulled above, matching openRollPath's failure path),
+    // and a later single-frame export must keep defaulting to the last
     // successfully opened file's name and format, not the failed pick's.
     scanFileName = path.split(/[\\/]/).pop() ?? null;
     // A name without a dot has no extension: leave null (filters omitted)
@@ -617,6 +667,13 @@
   async function openRoll() {
     const dir = await open({ multiple: false, directory: true });
     if (typeof dir !== "string") return;
+    await openRollPath(dir);
+  }
+
+  /** Every post-pick step for opening a roll, shared by the folder picker
+   * (`openRoll`) and a dropped directory (`onDragDropEvent`'s "drop"
+   * handling): the picker only adds the dialog in front of this. */
+  async function openRollPath(dir: string) {
     info = null;
     scanDone = false;
     try {
@@ -1279,7 +1336,22 @@
         onBrushLimit={(message) => pushError(message)}
       />
     {:else if !showLoader}
-      <p class="hint">Open a scan or a roll to begin.</p>
+      <div class="empty-state">
+        <svg class="empty-art" viewBox="0 0 96 64" aria-hidden="true">
+          <rect x="2" y="2" width="92" height="60" rx="4" fill="none" stroke="var(--border)" stroke-width="2" />
+          <rect x="14" y="12" width="68" height="40" rx="2" fill="var(--surround)" />
+          <circle cx="30" cy="26" r="3" fill="var(--detect)" />
+          <circle cx="58" cy="38" r="2" fill="var(--detect)" />
+          <rect x="4" y="6" width="4" height="4" fill="var(--bg-3)" /><rect x="4" y="14" width="4" height="4" fill="var(--bg-3)" /><rect x="4" y="22" width="4" height="4" fill="var(--bg-3)" /><rect x="4" y="30" width="4" height="4" fill="var(--bg-3)" /><rect x="4" y="38" width="4" height="4" fill="var(--bg-3)" /><rect x="4" y="46" width="4" height="4" fill="var(--bg-3)" /><rect x="4" y="54" width="4" height="4" fill="var(--bg-3)" />
+          <rect x="88" y="6" width="4" height="4" fill="var(--bg-3)" /><rect x="88" y="14" width="4" height="4" fill="var(--bg-3)" /><rect x="88" y="22" width="4" height="4" fill="var(--bg-3)" /><rect x="88" y="30" width="4" height="4" fill="var(--bg-3)" /><rect x="88" y="38" width="4" height="4" fill="var(--bg-3)" /><rect x="88" y="46" width="4" height="4" fill="var(--bg-3)" /><rect x="88" y="54" width="4" height="4" fill="var(--bg-3)" />
+        </svg>
+        <p class="empty-title">no scan open</p>
+        <div class="empty-actions">
+          <button class="btn" onclick={openScan}>Open scan</button>
+          <button class="btn" onclick={openRoll}>Open roll</button>
+        </div>
+        <p class="hint">or drop a scan or a roll folder anywhere in this window</p>
+      </div>
     {/if}
     {#if showLoader}
       <!-- Delayed overlay (not a stage swap): quick switches never flash it,
@@ -1295,6 +1367,9 @@
         {/if}
         <p class="hint">{loading}...</p>
       </div>
+    {/if}
+    {#if dropActive}
+      <div class="drop-overlay" aria-hidden="true"></div>
     {/if}
   </section>
   {#if roll}
@@ -1369,5 +1444,38 @@
     text-align: center;
     color: var(--text-2);
     margin-top: var(--space-6);
+  }
+
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-3);
+    margin-top: var(--space-6);
+  }
+  .empty-art {
+    width: 160px;
+    height: auto;
+    opacity: 0.8;
+  }
+  .empty-title {
+    color: var(--text-2);
+    font-size: var(--text-lg);
+    margin: 0;
+  }
+  .empty-actions {
+    display: flex;
+    gap: var(--space-2);
+  }
+  .empty-state .hint {
+    margin-top: 0;
+  }
+
+  .drop-overlay {
+    position: absolute;
+    inset: 0;
+    border: 2px solid var(--accent);
+    background: var(--accent-soft);
+    pointer-events: none;
   }
 </style>
