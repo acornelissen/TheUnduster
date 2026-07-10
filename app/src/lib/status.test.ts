@@ -89,7 +89,6 @@ describe("composeLeft", () => {
     threshold: 0.5,
     healStale: false,
     brushStatus: null as string | null,
-    singleExportNote: null as string | null,
   };
 
   it("shows not-yet-detected when the frame has no defect count", () => {
@@ -124,14 +123,6 @@ describe("composeLeft", () => {
     );
   });
 
-  it("appends the single-export note to the left zone", () => {
-    // TODO(task 4): singleExportNote moves to a toast; drop this from the
-    // left zone once that lands.
-    expect(
-      composeLeft({ ...base, defectCount: 3, singleExportNote: "exported 42 changed pixels" }),
-    ).toBe("raw0002.jpg  3 defects at 0.50  exported 42 changed pixels");
-  });
-
   it("composes every fragment together in order", () => {
     expect(
       composeLeft({
@@ -141,10 +132,9 @@ describe("composeLeft", () => {
         threshold: 0.5,
         healStale: true,
         brushStatus: "erase 12px",
-        singleExportNote: "exported 3 changed pixels",
       }),
     ).toBe(
-      "raw0002.jpg  3/4  11 defects at 0.50  heal stale (h re-heals)  erase 12px  exported 3 changed pixels",
+      "raw0002.jpg  3/4  11 defects at 0.50  heal stale (h re-heals)  erase 12px",
     );
   });
 

@@ -3,7 +3,15 @@
     left,
     activity,
     right,
-  }: { left: string; activity: string | null; right: string } = $props();
+    logOpen = false,
+    onToggleLog = null,
+  }: {
+    left: string;
+    activity: string | null;
+    right: string;
+    logOpen?: boolean;
+    onToggleLog?: (() => void) | null;
+  } = $props();
 </script>
 
 <div class="status-bar">
@@ -13,7 +21,19 @@
       <span class="dot" aria-hidden="true"></span>{activity}
     {/if}
   </span>
-  <span class="zone zone-right">{right}</span>
+  <span class="zone zone-right">
+    <span class="zone-right-text">{right}</span>
+    {#if onToggleLog}
+      <button
+        class="btn btn-log"
+        onclick={onToggleLog}
+        aria-expanded={logOpen}
+        aria-controls="activity-log-panel"
+      >
+        Log
+      </button>
+    {/if}
+  </span>
 </div>
 
 <style>
@@ -47,6 +67,14 @@
   .zone-right {
     color: var(--text-2);
     justify-self: end;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .zone-right-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .dot {
     width: 6px;
@@ -54,5 +82,11 @@
     border-radius: 50%;
     background: var(--accent);
     flex: 0 0 auto;
+  }
+  .btn-log {
+    flex: 0 0 auto;
+    font-size: var(--text-xs);
+    min-height: 20px;
+    padding: 1px var(--space-2);
   }
 </style>

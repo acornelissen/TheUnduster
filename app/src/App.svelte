@@ -5,10 +5,17 @@
   import Viewer from "./lib/Viewer.svelte";
   import Filmstrip from "./lib/Filmstrip.svelte";
   import StatusBar from "./lib/StatusBar.svelte";
+  import Toasts from "./lib/Toasts.svelte";
+  import LogPanel from "./lib/LogPanel.svelte";
   import { nextUnapprovedIndex } from "./lib/roll-nav";
   import type { Level } from "./lib/viewport";
   import { undoStroke, redoStroke, type StrokeData } from "./lib/brush";
   import { composeActivity, composeLeft, composeRight } from "./lib/status";
+  import { pushToast, dismissToast, pushLog, type Toast } from "./lib/toasts";
+
+  // Monotonic id source for toasts; module-scoped so ids stay unique across
+  // the whole component instance regardless of dismiss/collapse churn.
+  let nextToastId = 0;
 
   interface ImageInfo {
     id: number;
@@ -37,7 +44,36 @@
   }
 
   let info: ImageInfo | null = $state(null);
-  let error: string | null = $state(null);
+  let toastList: Toast[] = $state([]);
+  let activityLog: { time: string; level: string; message: string }[] = $state([]);
+  let logOpen = $state(false);
+
+  // Every error site funnels through here: pushes an error toast and logs
+  // it to the activity log (capped at 100, oldest dropped first). Message
+  // copy is passed through verbatim from the call site.
+  function pushError(message: string) {
+    toastList = pushToast(toastList, "error", message, nextToastId++);
+    activityLog = pushLog(
+      activityLog,
+      { time: new Date().toLocaleTimeString(), level: "error", message },
+      100,
+    );
+  }
+
+  // Info notes (e.g. the single-export summary) funnel through here.
+  function pushInfo(message: string) {
+    toastList = pushToast(toastList, "info", message, nextToastId++);
+    activityLog = pushLog(
+      activityLog,
+      { time: new Date().toLocaleTimeString(), level: "info", message },
+      100,
+    );
+  }
+
+  function dismissToastById(id: number) {
+    toastList = dismissToast(toastList, id);
+  }
+
   let loading: string | null = $state(null);
   let viewer: Viewer | undefined = $state();
   let overlay = $state({ enabled: true, threshold: 0.5 });
@@ -116,7 +152,6 @@
   let exportingSingle = $state(false);
   let scanFileName: string | null = $state(null);
   let scanFileExt: string | null = $state(null);
-  let singleExportNote: string | null = $state(null);
   let thresholdSaveTimer: ReturnType<typeof setTimeout> | undefined;
 
   // Per-frame brush stroke undo/redo stacks, keyed by roll index
@@ -184,7 +219,7 @@
     const un = listen<{ index: number; message: string }>("roll-frame-error", (e) => {
       if (!roll) return;
       roll.frames[e.payload.index].defect_count = null;
-      error = `Frame ${roll.frames[e.payload.index].file_name}: ${e.payload.message}`;
+      pushError(`Frame ${roll.frames[e.payload.index].file_name}: ${e.payload.message}`);
     });
     return () => {
       un.then((f) => f());
@@ -290,7 +325,7 @@
       if (!(e.payload.index in jobStates)) return;
       delete jobStates[e.payload.index];
       const fileName = roll?.frames[e.payload.index]?.file_name ?? `frame ${e.payload.index}`;
-      error = `Frame ${fileName}: ${e.payload.message}`;
+      pushError(`Frame ${fileName}: ${e.payload.message}`);
     });
     return () => {
       un.then((f) => f());
@@ -376,7 +411,7 @@
   $effect(() => {
     const un = listen<{ index: number; message: string }>("export-frame-error", (e) => {
       if (!roll) return;
-      error = `Frame ${roll.frames[e.payload.index].file_name}: ${e.payload.message}`;
+      pushError(`Frame ${roll.frames[e.payload.index].file_name}: ${e.payload.message}`);
     });
     return () => {
       un.then((f) => f());
@@ -427,7 +462,7 @@
       try {
         modelStatus = await invoke<"loaded" | "available" | "missing">("inpainter_status");
       } catch (e) {
-        error = String(e);
+        pushError(String(e));
         modelStatus = "missing";
       }
     })();
@@ -456,7 +491,7 @@
 
   $effect(() => {
     const un = listen<{ message: string }>("model-error", (e) => {
-      error = e.payload.message;
+      pushError(e.payload.message);
       modelReceived = 0;
       modelTotal = null;
       (async () => {
@@ -466,7 +501,7 @@
           // was in flight; never clobber the live downloading state.
           if (modelStatus !== "downloading") modelStatus = s;
         } catch (e2) {
-          error = String(e2);
+          pushError(String(e2));
         }
       })();
     });
@@ -476,7 +511,6 @@
   });
 
   async function openScan() {
-    error = null;
     const path = await open({
       multiple: false,
       filters: [{ name: "Scans", extensions: ["tif", "tiff", "png", "jpg", "jpeg"] }],
@@ -503,7 +537,7 @@
     try {
       info = await invoke<ImageInfo>("open_image", { path });
     } catch (e) {
-      error = String(e);
+      pushError(String(e));
       loading = null;
       return;
     }
@@ -518,7 +552,6 @@
       : null;
     detected = false;
     componentsAtHalf = null;
-    singleExportNote = null;
     if (previousId !== undefined) {
       try {
         await invoke("close_image", { id: previousId });
@@ -529,16 +562,14 @@
   }
 
   async function openRoll() {
-    error = null;
     const dir = await open({ multiple: false, directory: true });
     if (typeof dir !== "string") return;
     info = null;
     scanDone = false;
-    singleExportNote = null;
     try {
       roll = await invoke<RollInfo>("open_roll", { dir });
     } catch (e) {
-      error = String(e);
+      pushError(String(e));
       return;
     }
     // Captured from the SAME response as `roll` itself, so the two are
@@ -564,27 +595,25 @@
     try {
       await invoke("scan_roll");
     } catch (e) {
-      error = String(e);
+      pushError(String(e));
     }
   }
 
   async function exportApproved() {
     if (!roll || exporting) return;
-    error = null;
     const dir = await open({ directory: true });
     if (typeof dir !== "string") return;
     exporting = true;
     try {
       await invoke("export_approved", { destDir: dir });
     } catch (e) {
-      error = String(e);
+      pushError(String(e));
       exporting = false;
     }
   }
 
   async function healApproved() {
     if (!roll) return;
-    error = null;
     // Back of queue (front: false) for every approved frame, in frame order,
     // so this never jumps ahead of a job the operator already queued
     // in-viewer via d/h.
@@ -593,7 +622,7 @@
       try {
         await invoke("enqueue_job", { kind: "heal", index: frame.index, front: false });
       } catch (e) {
-        error = String(e);
+        pushError(String(e));
       }
     }
   }
@@ -604,8 +633,6 @@
     // a second activation while the picker is open must not start a
     // parallel dialog/export pair.
     exportingSingle = true;
-    error = null;
-    singleExportNote = null;
     try {
       const saveOptions: {
         defaultPath?: string;
@@ -620,9 +647,9 @@
       const dest = await save(saveOptions);
       if (!dest) return;
       const result = await invoke<number>("export_frame", { id: info.id, dest });
-      singleExportNote = `exported ${result} changed pixel${result === 1 ? "" : "s"}`;
+      pushInfo(`exported ${result} changed pixel${result === 1 ? "" : "s"}`);
     } catch (e) {
-      error = String(e);
+      pushError(String(e));
     } finally {
       exportingSingle = false;
     }
@@ -652,7 +679,7 @@
     } catch (e) {
       if (seq !== activationSeq) return; // stale: a newer activation is in flight
       activating = false;
-      error = String(e);
+      pushError(String(e));
       loading = null;
       return;
     }
@@ -706,7 +733,7 @@
     try {
       await invoke("approve_frame", { index: currentIndex, approved: true });
     } catch (e) {
-      error = String(e);
+      pushError(String(e));
       return;
     }
     // Wrapping search: an operator may approve out of order, and A should
@@ -731,7 +758,7 @@
         index: currentIndex,
         threshold: overlay.threshold,
       }).catch((e) => {
-        error = String(e);
+        pushError(String(e));
       });
     }, 300);
   }
@@ -744,16 +771,13 @@
     // roll frame's persisted sidecar), so single-image mode always takes the
     // direct-invoke path below.
     if (roll) {
-      error = null;
       try {
         await invoke("enqueue_job", { kind: "detect", index: currentIndex, front: true });
       } catch (e) {
-        error = String(e);
+        pushError(String(e));
       }
       return;
     }
-    error = null;
-    singleExportNote = null;
     detecting = true;
     try {
       const report = await invoke<{ id: number; components_at_half: number }>("detect", {
@@ -766,7 +790,7 @@
       // stays stable across the call.
       await viewer?.refreshDetections(overlay.threshold);
     } catch (e) {
-      error = String(e);
+      pushError(String(e));
       // Belt and braces: the backend now guarantees a terminal "ready" emit
       // on every detect exit path, which already clears `loading`. This
       // catch clears it too in case that guarantee is ever violated, so a
@@ -806,26 +830,23 @@
             threshold: overlay.threshold,
           });
         } catch (e) {
-          error = String(e);
+          pushError(String(e));
           return;
         }
       }
-      error = null;
       try {
         await invoke("enqueue_job", { kind: "heal", index: currentIndex, front: true });
       } catch (e) {
-        error = String(e);
+        pushError(String(e));
       }
       return;
     }
     // Single-image mode only from here on (the roll branch above always
     // returns): healing needs live probabilities computed for this session.
     if (!detected) {
-      error = "Run detection before healing";
+      pushError("Run detection before healing");
       return;
     }
-    error = null;
-    singleExportNote = null;
     healing = true;
     healProgress = null;
     // Snapshot BEFORE the await: the slider and brush stay live during a
@@ -845,7 +866,7 @@
       }
       info = { ...info, healed: true };
     } catch (e) {
-      error = String(e);
+      pushError(String(e));
     } finally {
       healing = false;
     }
@@ -853,7 +874,6 @@
 
   async function downloadModel() {
     if (modelStatus === "downloading" || modelStatus === "loaded") return;
-    error = null;
     modelStatus = "downloading";
     modelReceived = 0;
     modelTotal = null;
@@ -863,12 +883,12 @@
       // model-error also fires and re-fetches inpainter_status; this catch
       // just guards against a rejected invoke that never reaches the backend
       // event path at all.
-      error = String(e);
+      pushError(String(e));
       try {
         const s = await invoke<"loaded" | "available" | "missing">("inpainter_status");
         if (modelStatus !== "downloading") modelStatus = s;
       } catch (e2) {
-        error = String(e2);
+        pushError(String(e2));
       }
     }
   }
@@ -941,7 +961,6 @@
       // `{#if viewer?.brushStatus()}` markup relied on. `viewer` itself is
       // $state too, so binding it after mount also retriggers this.
       brushStatus: viewer?.brushStatus() ?? null,
-      singleExportNote,
     });
   });
   const statusActivity = $derived.by(() => {
@@ -985,7 +1004,7 @@
       // navigation may already be mid-switch towards.
       invoke("set_frame_strokes", { index: displayedIndex, strokes, redoStrokes: redo }).catch(
         (e) => {
-          error = String(e);
+          pushError(String(e));
         },
       );
     }
@@ -1021,6 +1040,16 @@
       // nothing to undo/redo; skip the no-op persist/store update in that case.
       if (result.strokes === before.strokes && result.redo === before.redo) return;
       onStrokesChange(result.strokes, result.redo);
+      return;
+    }
+    // Escape closes the activity log panel -- but only when it's open, and
+    // never when the brush already consumed the keypress (the Viewer's
+    // canvas-scoped handler runs before this window handler bubbles and
+    // calls preventDefault to turn the brush off; one Escape should do one
+    // thing).
+    if (e.key === "Escape" && logOpen && !e.defaultPrevented) {
+      e.preventDefault();
+      logOpen = false;
       return;
     }
     if (!roll) return;
@@ -1138,8 +1167,6 @@
         </button>
       </div>
     {/if}
-
-    {#if error}<p role="alert">{error}</p>{/if}
   </header>
   <section class="stage">
     {#if info}
@@ -1158,7 +1185,7 @@
         strokes={currentStrokes()}
         redoStrokes={currentRedoStrokes()}
         {onStrokesChange}
-        onBrushLimit={(message) => (error = message)}
+        onBrushLimit={(message) => pushError(message)}
       />
     {:else if !showLoader}
       <p class="hint">Open a scan or a roll to begin.</p>
@@ -1183,9 +1210,20 @@
     <Filmstrip frames={roll.frames} {currentIndex} {thumbVersions} {jobStates} onSelect={selectFrame} />
   {/if}
   {#if info}
-    <StatusBar left={statusLeft} activity={statusActivity} right={statusRight} />
+    <StatusBar
+      left={statusLeft}
+      activity={statusActivity}
+      right={statusRight}
+      {logOpen}
+      onToggleLog={() => (logOpen = !logOpen)}
+    />
   {/if}
 </div>
+
+<Toasts toasts={toastList} onDismiss={dismissToastById} />
+{#if logOpen}
+  <LogPanel entries={activityLog} id="activity-log-panel" />
+{/if}
 
 <style>
   .shell {
@@ -1235,9 +1273,5 @@
     text-align: center;
     color: var(--text-2);
     margin-top: var(--space-6);
-  }
-  [role="alert"] {
-    color: var(--err);
-    margin: 0;
   }
 </style>
