@@ -1039,16 +1039,6 @@ fn scan_roll(
     Ok(())
 }
 
-// `export_approved` is being rewritten to enqueue `jobs::JobKind::Export`
-// jobs on the background queue instead of running its own ad hoc task (see
-// export-queue-and-zoom Task 2). This stub keeps the crate compiling and the
-// command registered in the interim; Task 2 replaces the body.
-#[tauri::command]
-fn export_approved(roll: State<'_, roll::RollState>, dest_dir: String) -> Result<(), String> {
-    roll.set_export_dest(std::path::PathBuf::from(dest_dir))?;
-    Err("export_approved: queue-based export not yet implemented".to_string())
-}
-
 /// One background job's identity; the payload for the `job-queued`,
 /// `job-started`, and `job-done` events. `generation` is the roll generation
 /// the job was enqueued against (`job.generation`), so a listener can drop
@@ -1073,6 +1063,27 @@ struct JobError {
 #[derive(serde::Serialize, Clone)]
 struct QueueIdlePayload {
     generation: u64,
+}
+
+/// A coarse stage marker for one frame's export, emitted from inside the
+/// export job's `spawn_blocking` closure so a slow transient heal (cache
+/// miss) shows the operator something more specific than "running".
+#[derive(serde::Serialize, Clone)]
+struct ExportFrameStage {
+    index: usize,
+    stage: &'static str,
+}
+
+#[derive(serde::Serialize, Clone)]
+struct ExportHealProgress {
+    index: usize,
+    done: usize,
+    total: usize,
+}
+
+#[derive(serde::Serialize, Clone)]
+struct ExportProgress {
+    index: usize,
 }
 
 /// Clears the job-worker running flag when dropped, including on unwind, so
@@ -1114,7 +1125,7 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
         },
     );
     // Cache paths are keyed by the frame's own roll directory, mirroring
-    // export_approved's transient path.
+    // run_heal's transient path.
     let roll_dir = path
         .parent()
         .unwrap_or_else(|| std::path::Path::new(""))
@@ -1476,9 +1487,133 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
             }
             Ok(())
         }
-        // Queue-based export lands in export-queue-and-zoom Task 2; this
-        // stub keeps `JobKind`'s match exhaustive in the meantime.
-        jobs::JobKind::Export => Err("export job kind not yet implemented".to_string()),
+        jobs::JobKind::Export => {
+            let dest_dir = app
+                .state::<roll::RollState>()
+                .export_dest()?
+                .ok_or("no export destination set")?;
+            let dest = dest_dir.join(&file_name);
+
+            // Prefer already-healed registry data (the operator reviewed it).
+            // Pin before reading the Arcs so eviction cannot pull the entry
+            // out from under the export; the guard unpins on every exit.
+            let mut _pin_guard = None;
+            let registry_export = match image_id {
+                Some(id) => {
+                    app.state::<jobs::JobQueue>().pin(Some(id))?;
+                    _pin_guard = Some(PinGuard(app.clone()));
+                    let images_state = app.state::<Mutex<Images>>();
+                    let images = images_state.lock().map_err(|e| e.to_string())?;
+                    images.healed_parts(id)
+                }
+                None => None,
+            };
+
+            if let Some((original, healed, mask)) = registry_export {
+                let dest_for_write = dest.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    export::export_healed(&original, &healed, &mask, &dest_for_write).map(|_| ())
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r)?;
+            } else {
+                // No registry entry: heal cache, then the transient detect/heal
+                // pipeline. Identical to run_heal's discipline: detector hash
+                // resolved before the closure (read path, benign miss on race);
+                // everything provenance-dependent inside one with_inpainter_hashed.
+                let detector = app.state::<detect::DetectorState>().inner().clone();
+                let inpainter = app.state::<detect::InpainterState>().inner().clone();
+                let detector_hash = detector.hash().unwrap_or([0u8; 32]);
+                let cache_path = roll::heal_cache_path(&roll_dir, &file_name);
+                let app_for_stages = app.clone();
+                let path_for_task = path.clone();
+                let file_name_for_log = file_name.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let stage = |s: &'static str| {
+                        let _ = app_for_stages
+                            .emit("export-frame-stage", ExportFrameStage { index, stage: s });
+                    };
+                    // Stamp BEFORE decoding -- see run_heal's identical comment.
+                    // A stat failure skips the heal-cache interaction (read AND
+                    // write); it must never fail the export.
+                    let stamp = stamp_or_skip(&path_for_task);
+                    let image = images::Images::decode_stage(&path_for_task)?;
+                    masks::validate_strokes(&strokes)?;
+
+                    inpainter.with_inpainter_hashed(|pair| {
+                        let inpainter_hash = pair.as_ref().map(|(_, h)| *h).unwrap_or([0u8; 32]);
+                        let provenance = stamp.as_ref().map(|stamp| {
+                            cache::heal_provenance(
+                                threshold,
+                                HEAL_DILATE_RADIUS,
+                                &strokes,
+                                &detector_hash,
+                                &inpainter_hash,
+                                stamp,
+                            )
+                        });
+
+                        if let Some(provenance) = &provenance {
+                            if let Some((healed, mask)) =
+                                cache::read_heal(&cache_path, &image, provenance)
+                            {
+                                stage("writing");
+                                return export::export_healed(&image, &healed, &mask, &dest)
+                                    .map(|_| ());
+                            }
+                        }
+
+                        stage("detecting");
+                        let probs = detector.detect(&image)?;
+                        let raw: Vec<bool> = probs.iter().map(|&p| p > threshold).collect();
+                        let mask = masks::compose_heal_mask(
+                            raw,
+                            image.width,
+                            image.height,
+                            HEAL_DILATE_RADIUS,
+                            &strokes,
+                        );
+                        stage("healing");
+                        let mut copy = (*image).clone();
+                        let inp = pair.map(|(inp, _)| inp);
+                        fd_heal::heal_with_progress(&mut copy, &mask, inp, &mut |done, total| {
+                            let _ = app_for_stages.emit(
+                                "export-heal-progress",
+                                ExportHealProgress { index, done, total },
+                            );
+                        })
+                        .map_err(|e| e.to_string())?;
+                        // Cache the fresh heal so the next export or heal of this
+                        // frame is instant.
+                        if let Some(provenance) = &provenance {
+                            if let Err(_e) =
+                                cache::write_heal(&cache_path, &image, &copy, &mask, provenance)
+                            {
+                                #[cfg(debug_assertions)]
+                                eprintln!(
+                                    "[cache] heal write failed for frame {index} ({file_name_for_log}): {_e}"
+                                );
+                            }
+                        }
+                        stage("writing");
+                        export::export_healed(&image, &copy, &mask, &dest).map(|_| ())
+                    })?
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r)?;
+            }
+
+            // set_exported re-checks the generation under its own lock; the
+            // worker's top-of-loop check plus this makes a roll-swap-mid-export
+            // land nowhere.
+            let _ = app
+                .state::<roll::RollState>()
+                .set_exported(generation, index);
+            let _ = app.emit("export-progress", ExportProgress { index });
+            Ok(())
+        }
     }
 }
 
@@ -1511,18 +1646,59 @@ fn enqueue_job(
             generation,
         },
     );
+    spawn_worker_if_idle(&app, generation);
+    Ok(())
+}
+
+#[tauri::command]
+fn enqueue_exports(
+    app: tauri::AppHandle,
+    roll: State<'_, roll::RollState>,
+    queue: State<'_, jobs::JobQueue>,
+    dest_dir: String,
+) -> Result<(), String> {
+    // Validation before anything lands in the queue: errors when no roll
+    // is open. frames_to_export already includes previously exported
+    // frames -- re-export is deliberate, predictable overwrite.
+    let indices = roll.frames_to_export()?;
+    roll.set_export_dest(std::path::PathBuf::from(dest_dir))?;
+    let generation = roll.generation();
+    for index in indices {
+        let newly_queued = queue.enqueue(
+            jobs::Job {
+                kind: jobs::JobKind::Export,
+                index,
+                generation,
+            },
+            false, // back of queue: never jumps ahead of queued heals
+        )?;
+        if newly_queued {
+            let _ = app.emit(
+                "job-queued",
+                JobEvent {
+                    index,
+                    kind: jobs::JobKind::Export,
+                    generation,
+                },
+            );
+        }
+    }
+    spawn_worker_if_idle(&app, generation);
+    Ok(())
+}
+
+/// Claims the worker flag and spawns the drain loop if no worker is
+/// running. `spawn_generation` is the roll generation at the caller's
+/// enqueue time; see the comment inside for why the terminal queue-idle
+/// must carry it rather than a generation read at emit time.
+fn spawn_worker_if_idle(app: &tauri::AppHandle, spawn_generation: u64) {
+    let queue = app.state::<jobs::JobQueue>();
     if !queue.try_start() {
-        return Ok(()); // a worker is already draining; it will reach this job
+        return; // a worker is already draining; it will reach the new jobs
     }
     // The flag is set; any fallible setup from here must clear it before
     // returning (the scan_roll discipline).
     let app_for_task = app.clone();
-    // The worker's identity for its terminal queue-idle emit: the generation
-    // at SPAWN. Reading the current generation at emit time instead would
-    // let an old worker's final idle race a roll swap, read the NEW
-    // generation, pass the frontend's filter, and wipe the new roll's live
-    // job entries -- the exact hole the generation guard exists to close.
-    let spawn_generation = generation;
     tauri::async_runtime::spawn(async move {
         let _job_flag_guard = JobFlagGuard(app_for_task.clone());
         // Labeled so the exit handshake below can `continue 'drain` to adopt
@@ -1625,7 +1801,6 @@ fn enqueue_job(
             break 'drain;
         }
     });
-    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1655,8 +1830,8 @@ pub fn run() {
             set_frame_strokes,
             export_frame,
             scan_roll,
-            export_approved,
             enqueue_job,
+            enqueue_exports,
             models::inpainter_status,
             models::download_inpaint_model
         ])

@@ -596,9 +596,6 @@ impl RollState {
     /// Approved frame indices, in order. Exported frames are INCLUDED:
     /// pressing "Export approved" again re-exports all approved work,
     /// predictably overwriting whatever landed before.
-    // Exercised by tests; no production caller until Task 2 wires export jobs
-    // through the queue.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn frames_to_export(&self) -> Result<Vec<usize>, String> {
         let guard = self.roll.lock().map_err(|e| e.to_string())?;
         let roll = guard.as_ref().ok_or("no roll open")?;
@@ -641,9 +638,6 @@ impl RollState {
     /// started against is still the live one: mirrors `record_scan_result`'s
     /// generation re-check under the same lock that guards the write, so a
     /// frame exported against roll A never marks roll B's sidecar done.
-    // Exercised by tests; no production caller until Task 2 wires export jobs
-    // through the queue.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_exported(&self, generation: u64, index: usize) -> Result<(), String> {
         let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
         if self.generation.load(Ordering::SeqCst) != generation {
@@ -669,9 +663,6 @@ impl RollState {
         Ok(())
     }
 
-    // Exercised by tests; no production caller until Task 2's export jobs
-    // read the queued destination.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn export_dest(&self) -> Result<Option<PathBuf>, String> {
         let guard = self.export_dest.lock().map_err(|e| e.to_string())?;
         Ok(guard.clone())

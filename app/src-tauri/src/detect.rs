@@ -43,8 +43,6 @@ impl DetectorState {
         Ok(())
     }
 
-    // No production caller until Task 2 wires export jobs through the queue.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn detect(&self, img: &ImageBuf) -> Result<Vec<f32>, String> {
         let mut guard = self.0.lock().map_err(|e| e.to_string())?;
         match guard.as_mut() {
