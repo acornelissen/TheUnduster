@@ -1,5 +1,6 @@
 <script lang="ts">
   interface LogEntry {
+    id: number;
     time: string;
     level: string;
     message: string;
@@ -11,12 +12,17 @@
   const reversed = $derived([...entries].reverse());
 </script>
 
-<div class="log-panel" {id} role="log" aria-label="Activity log">
+<!-- svelte-ignore a11y_no_noninteractive_tabindex -- role="log" is
+     non-interactive by ARIA's book, but this is a scrollable region with no
+     other focusable descendant; WKWebView won't let keyboard users scroll
+     it without an explicit tabindex, which is the standard accessible
+     pattern for scrollable regions (ARIA APG, MDN). -->
+<div class="log-panel" {id} role="log" aria-label="Activity log" tabindex="0">
   {#if reversed.length === 0}
     <p class="log-empty">No activity yet.</p>
   {:else}
     <ul>
-      {#each reversed as entry, i (entries.length - 1 - i)}
+      {#each reversed as entry (entry.id)}
         <li class="log-entry" class:log-error={entry.level === "error"}>
           <span class="log-time">{entry.time}</span>
           <span class="log-message">{entry.message}</span>
@@ -38,6 +44,10 @@
     border-left: 1px solid var(--border);
     overflow-y: auto;
     padding: var(--space-3);
+  }
+  .log-panel:focus-visible {
+    outline: 3px solid var(--focus);
+    outline-offset: 1px;
   }
   .log-empty {
     color: var(--text-2);

@@ -61,7 +61,7 @@
 <style>
   .toast-stack {
     position: fixed;
-    top: calc(var(--space-6) + var(--space-2));
+    top: calc(var(--space-6) + var(--space-4)); /* clears the ~42px toolbar */
     right: var(--space-3);
     z-index: 100;
     display: flex;
@@ -108,13 +108,18 @@
   }
   .toast-dismiss {
     flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 24px;
+    min-height: 24px;
     background: transparent;
     border: none;
     color: var(--text-2);
     font-size: var(--text-lg);
     line-height: 1;
     cursor: pointer;
-    padding: 0 var(--space-1);
+    padding: 0;
   }
   .toast-dismiss:hover {
     color: var(--text-1);

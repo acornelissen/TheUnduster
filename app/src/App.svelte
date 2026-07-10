@@ -17,6 +17,11 @@
   // the whole component instance regardless of dismiss/collapse churn.
   let nextToastId = 0;
 
+  // Monotonic id source for activity log entries, mirroring nextToastId --
+  // lets LogPanel key its {#each} on a stable id instead of the computed
+  // reversed-array index, so entries keep their identity across pushes.
+  let nextLogId = 0;
+
   interface ImageInfo {
     id: number;
     width: number;
@@ -45,7 +50,7 @@
 
   let info: ImageInfo | null = $state(null);
   let toastList: Toast[] = $state([]);
-  let activityLog: { time: string; level: string; message: string }[] = $state([]);
+  let activityLog: { id: number; time: string; level: string; message: string }[] = $state([]);
   let logOpen = $state(false);
 
   // Every error site funnels through here: pushes an error toast and logs
@@ -55,7 +60,7 @@
     toastList = pushToast(toastList, "error", message, nextToastId++);
     activityLog = pushLog(
       activityLog,
-      { time: new Date().toLocaleTimeString(), level: "error", message },
+      { id: nextLogId++, time: new Date().toLocaleTimeString(), level: "error", message },
       100,
     );
   }
@@ -65,7 +70,7 @@
     toastList = pushToast(toastList, "info", message, nextToastId++);
     activityLog = pushLog(
       activityLog,
-      { time: new Date().toLocaleTimeString(), level: "info", message },
+      { id: nextLogId++, time: new Date().toLocaleTimeString(), level: "info", message },
       100,
     );
   }

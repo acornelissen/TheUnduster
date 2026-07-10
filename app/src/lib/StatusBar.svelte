@@ -86,7 +86,7 @@
   .btn-log {
     flex: 0 0 auto;
     font-size: var(--text-xs);
-    min-height: 20px;
-    padding: 1px var(--space-2);
+    min-height: 24px;
+    padding: 0 var(--space-2);
   }
 </style>
