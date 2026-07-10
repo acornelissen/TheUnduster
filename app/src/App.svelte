@@ -523,6 +523,13 @@
     });
     if (typeof path !== "string") return;
     const previousId = info?.id;
+    // Null-first, like openRoll: every successful open must be a real
+    // Viewer unmount/remount, because the Viewer's mount is what focuses
+    // the canvas so keys work immediately. Swapping `info` old->new
+    // directly (scan open while a scan is already open) would keep the
+    // same Viewer instance alive and skip that focus. Placed after the
+    // picker check so a cancelled dialog changes nothing.
+    info = null;
     const hadRoll = roll !== null;
     roll = null;
     rollGeneration = null;
@@ -547,9 +554,10 @@
       loading = null;
       return;
     }
-    // Only after a SUCCESSFUL open: a failed open leaves the previous image
-    // on screen, and its export must keep defaulting to the previous file's
-    // name and format, not the failed pick's.
+    // Only after a SUCCESSFUL open: a failed open falls back to the empty
+    // stage (info was nulled above, matching openRoll's failure path), and
+    // a later single-frame export must keep defaulting to the last
+    // successfully opened file's name and format, not the failed pick's.
     scanFileName = path.split(/[\\/]/).pop() ?? null;
     // A name without a dot has no extension: leave null (filters omitted)
     // rather than treating the whole name as one.
