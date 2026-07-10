@@ -710,19 +710,48 @@ impl RollState {
             .collect())
     }
 
-    /// Approved frame indices, in order. Exported frames are INCLUDED:
+    /// Approved frame indices (in order, exported frames INCLUDED --
     /// pressing "Export approved" again re-exports all approved work,
-    /// predictably overwriting whatever landed before.
-    pub fn frames_to_export(&self) -> Result<Vec<usize>, String> {
+    /// predictably overwriting whatever landed before) AND the roll
+    /// generation, read under one lock acquisition. `enqueue_exports` used
+    /// to call a `frames_to_export()`-shaped indices-only accessor then
+    /// `generation()` as two separate locks; a roll swap landing between
+    /// them would tag the OLD roll's indices with the NEW generation, and
+    /// the worker's per-job generation check -- which trusts the tag, not
+    /// the indices' actual origin -- would then wave those jobs through
+    /// against the wrong roll. Snapshotting both together closes that
+    /// window: the generation returned here is provably the one that
+    /// produced these exact indices.
+    pub fn approved_snapshot(&self) -> Result<(Vec<usize>, u64), String> {
         let guard = self.roll.lock().map_err(|e| e.to_string())?;
         let roll = guard.as_ref().ok_or("no roll open")?;
-        Ok(roll
+        let indices = roll
             .frames
             .iter()
             .enumerate()
             .filter(|(_, f)| f.approved)
             .map(|(i, _)| i)
-            .collect())
+            .collect();
+        Ok((indices, self.generation.load(Ordering::SeqCst)))
+    }
+
+    /// A single frame's `image_id` presence AND the roll generation, read
+    /// under one lock acquisition. `enqueue_job`'s validation shape used to
+    /// be `roll.image_id(index)?` (bounds/roll-open check, discarding the
+    /// id) followed by a separate `roll.generation()` call; the same
+    /// two-lock race as `approved_snapshot` applies -- a swap between the
+    /// two calls could tag a validated-against-the-OLD-roll index with the
+    /// NEW generation. Validation semantics are unchanged: errors when no
+    /// roll is open or `index` is out of range.
+    pub fn frame_snapshot(&self, index: usize) -> Result<(Option<u64>, u64), String> {
+        let guard = self.roll.lock().map_err(|e| e.to_string())?;
+        let roll = guard.as_ref().ok_or("no roll open")?;
+        let image_id = roll
+            .frames
+            .get(index)
+            .ok_or_else(|| format!("no frame {index}"))?
+            .image_id;
+        Ok((image_id, self.generation.load(Ordering::SeqCst)))
     }
 
     /// Records a queue result, but only if the roll the scan started against
@@ -1098,17 +1127,55 @@ mod state_tests {
     }
 
     #[test]
-    fn frames_to_export_lists_approved_in_order_including_exported() {
+    fn approved_snapshot_returns_the_same_generation_the_state_reports_and_only_approved_indices() {
+        // Pins the bead-caw contract: indices and generation must come from
+        // ONE lock acquisition, so a roll swap between reading them (the
+        // old two-call shape) can never tag old-roll indices with the new
+        // generation.
         let dir = tempfile::tempdir().unwrap();
-        for n in ["a.png", "b.png", "c.png"] {
+        for n in ["a.png", "b.png", "c.png", "d.png"] {
             std::fs::write(dir.path().join(n), b"x").unwrap();
         }
         let state = RollState::default();
         state.open(dir.path()).unwrap();
-        state.set_approved(0, true).unwrap();
-        state.set_approved(2, true).unwrap();
-        state.set_exported(state.generation(), 0).unwrap();
-        assert_eq!(state.frames_to_export().unwrap(), vec![0, 2]);
+        state.set_approved(1, true).unwrap();
+        state.set_approved(3, true).unwrap();
+        state.set_exported(state.generation(), 1).unwrap(); // exported frames stay included
+        let (indices, generation) = state.approved_snapshot().unwrap();
+        assert_eq!(indices, vec![1, 3]);
+        assert_eq!(generation, state.generation());
+    }
+
+    #[test]
+    fn approved_snapshot_errors_when_no_roll_open() {
+        let state = RollState::default();
+        assert!(state.approved_snapshot().unwrap_err().contains("no roll"));
+    }
+
+    #[test]
+    fn frame_snapshot_returns_image_id_presence_and_generation_together() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"x").unwrap();
+        let state = RollState::default();
+        state.open(dir.path()).unwrap();
+        let gen = state.generation();
+        let (image_id, generation) = state.frame_snapshot(0).unwrap();
+        assert_eq!(image_id, None);
+        assert_eq!(generation, gen);
+        state.set_image_id(gen, 0, 7).unwrap();
+        let (image_id, generation) = state.frame_snapshot(0).unwrap();
+        assert_eq!(image_id, Some(7));
+        assert_eq!(generation, gen);
+    }
+
+    #[test]
+    fn frame_snapshot_errors_on_bad_index_and_no_roll() {
+        let state = RollState::default();
+        assert!(state.frame_snapshot(0).unwrap_err().contains("no roll"));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"x").unwrap();
+        state.open(dir.path()).unwrap();
+        assert!(state.frame_snapshot(5).unwrap_err().contains("no frame"));
     }
 
     #[test]

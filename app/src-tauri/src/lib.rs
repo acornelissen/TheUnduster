@@ -1833,9 +1833,12 @@ fn enqueue_job(
     front: bool,
 ) -> Result<(), String> {
     // Bounds/roll validation before anything lands in the queue: errors when
-    // no roll is open or the index is out of range.
-    roll.image_id(index)?;
-    let generation = roll.generation();
+    // no roll is open or the index is out of range. Indices and generation
+    // come from one lock acquisition (`frame_snapshot`) rather than two
+    // separate calls, so a roll swap landing between them can never tag an
+    // index validated against the OLD roll with the NEW generation -- see
+    // that method's doc comment.
+    let (_, generation) = roll.frame_snapshot(index)?;
     queue.enqueue(
         jobs::Job {
             kind,
@@ -1871,11 +1874,14 @@ fn enqueue_exports(
     dest_dir: String,
 ) -> Result<(), String> {
     // Validation before anything lands in the queue: errors when no roll
-    // is open. frames_to_export already includes previously exported
-    // frames -- re-export is deliberate, predictable overwrite.
-    let indices = roll.frames_to_export()?;
+    // is open. approved_snapshot already includes previously exported
+    // frames -- re-export is deliberate, predictable overwrite. Indices and
+    // generation come from one lock acquisition rather than two separate
+    // calls, so a roll swap landing between them can never tag the OLD
+    // roll's indices with the NEW generation -- see that method's doc
+    // comment.
+    let (indices, generation) = roll.approved_snapshot()?;
     roll.set_export_dest(std::path::PathBuf::from(dest_dir))?;
-    let generation = roll.generation();
     for index in indices {
         let newly_queued = queue.enqueue(
             jobs::Job {
