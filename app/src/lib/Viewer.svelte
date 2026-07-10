@@ -545,7 +545,7 @@
     role="application"
     aria-label="Scan viewer: arrows pan, plus and minus zoom, 0 fits, 1 is 100%, d detects, m toggles overlay, z and shift-z cycle defects, h heals, space toggles before and after, b paints, e erases, bracket keys size the brush, arrows nudge it and enter stamps while brushing, cmd-z undoes, escape exits, shift-cmd-z redoes"
     tabindex="0"
-    class:brushing={brushMode !== "off"}
+    class:brushing={brushMode !== "off" && !showHealed}
     onwheel={onWheel}
     onpointerdown={(e) => {
       canvas.setPointerCapture(e.pointerId);
