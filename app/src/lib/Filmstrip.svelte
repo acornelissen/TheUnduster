@@ -26,6 +26,10 @@
   let listEl: HTMLDivElement | undefined = $state();
   let focusIndex = $state(currentIndex);
 
+  // Read once at component init, not per keypress/scroll.
+  const prefersReducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const scrollBehavior: ScrollBehavior = prefersReducedMotion ? "auto" : "smooth";
+
   $effect(() => {
     focusIndex = currentIndex;
   });
@@ -35,7 +39,7 @@
     // navigation via ,/. at the App level, or a filmstrip click).
     void currentIndex;
     const el = listEl?.querySelector(`[data-index="${currentIndex}"]`);
-    el?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    el?.scrollIntoView({ block: "nearest", inline: "nearest", behavior: scrollBehavior });
   });
 
   function moveFocus(delta: number) {
@@ -88,18 +92,18 @@
         {#if frame.defect_count === null}
           <span class="spinner" aria-hidden="true"></span>
         {:else}
-          <span class="badge">{frame.defect_count}</span>
+          <span class="badge defect-chip" title="Defect count">{frame.defect_count}</span>
         {/if}
         {#if frame.approved}
-          <span class="check" aria-hidden="true">&#10003;</span>
+          <span class="badge approved-badge" title="Approved" aria-hidden="true">&#10003;</span>
         {/if}
         {#if frame.exported}
-          <span class="exported" aria-hidden="true">out</span>
+          <span class="badge exported-badge" title="Exported" aria-hidden="true">out</span>
         {/if}
         {#if jobStates[frame.index]?.state === "queued"}
-          <span class="job-marker job-queued" title={`${jobStates[frame.index].kind} queued`} aria-hidden="true">&#9675;</span>
+          <span class="badge job-marker job-queued" title={`${jobStates[frame.index].kind} queued`} aria-hidden="true">&#9675;</span>
         {:else if jobStates[frame.index]?.state === "running"}
-          <span class="job-marker job-running" title={`${jobStates[frame.index].kind} running`} aria-hidden="true">&#9679;</span>
+          <span class="badge job-marker job-running" title={`${jobStates[frame.index].kind} running`} aria-hidden="true">&#9679;</span>
         {/if}
       </div>
       <span class="name">{frame.file_name}</span>
@@ -121,40 +125,40 @@
     flex-direction: column;
     align-items: center;
     gap: var(--space-1);
-    width: 96px;
+    width: 140px;
     flex: 0 0 auto;
     cursor: pointer;
     border-radius: var(--radius-1);
     padding: var(--space-1);
   }
-  .frame.current {
-    background: var(--accent-soft);
+  .frame:hover .thumb-wrap {
+    background: var(--bg-3);
+  }
+  .frame.current .thumb-wrap {
+    border-color: var(--accent);
   }
   .frame:focus-visible {
     outline: 3px solid var(--focus);
-    outline-offset: 2px;
+    outline-offset: 1px;
   }
   .thumb-wrap {
     position: relative;
-    width: 88px;
-    height: 88px;
-    background: var(--bg-3);
+    width: 100%;
+    max-width: 140px;
+    height: 96px;
+    background: var(--bg-0);
+    border: 2px solid transparent;
+    border-radius: var(--radius-1);
     display: flex;
     align-items: center;
     justify-content: center;
+    overflow: hidden;
   }
   .thumb {
-    max-width: 100%;
-    max-height: 100%;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
     display: block;
-  }
-  .badge {
-    position: absolute;
-    bottom: 2px;
-    right: 2px;
-    background: rgba(0, 0, 0, 0.75);
-    color: var(--text-1);
-    border-radius: var(--radius-2);
   }
   .spinner {
     position: absolute;
@@ -172,46 +176,64 @@
       transform: rotate(360deg);
     }
   }
-  .check {
+  .approved-badge {
     position: absolute;
     top: 2px;
     left: 2px;
+    background: rgba(0, 0, 0, 0.75);
     color: var(--ok);
-    font-size: var(--text-sm);
+    line-height: 1;
   }
-  .exported {
+  .exported-badge {
     position: absolute;
     top: 2px;
     right: 2px;
     background: rgba(0, 0, 0, 0.75);
     color: var(--info);
-    font-size: var(--text-xs);
     font-weight: 600;
     letter-spacing: 0.02em;
-    padding: 1px var(--space-1);
-    border-radius: var(--radius-1);
     text-transform: uppercase;
+  }
+  .defect-chip {
+    position: absolute;
+    bottom: 2px;
+    right: 2px;
+    background: rgba(39, 39, 39, 0.85); /* --bg-2 @ 85% */
+    color: var(--text-1);
   }
   .job-marker {
     position: absolute;
     bottom: 2px;
     left: 2px;
-    font-size: var(--text-sm);
     line-height: 1;
+    background: transparent;
+    padding: 0;
     text-shadow: 0 0 2px rgba(0, 0, 0, 0.9);
   }
   .job-queued {
-    color: var(--focus);
+    color: var(--accent);
   }
   .job-running {
     color: var(--accent);
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.4;
+    }
   }
   .name {
     font-size: var(--text-xs);
     color: var(--text-2);
-    max-width: 88px;
+    max-width: 140px;
+    width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    text-align: center;
   }
 </style>
