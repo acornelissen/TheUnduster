@@ -20,7 +20,7 @@
   --err: #e08379; /* muted red: 6.2:1 on --bg-1 */
   --info: #8fb8e8; /* 8.2:1 on --bg-1 */
   --focus: #ffc46b; /* focus ring, 3px, offset 1px */
-  --detect: #40d1c4; /* defect ring/tint teal: 9.8:1 on --bg-0, 5.8:1 on --surround; renderer.ts uColor/tile shader is the GL-side mirror */
+  --detect: #ff0d0d; /* defect ring/tint red (operator preference): 4.7:1 on --bg-0, 2.8:1 on --surround -- non-text markers over image content; renderer.ts uColor/tile shader is the GL-side mirror */
 
   --space-1: 4px;
   --space-2: 8px;

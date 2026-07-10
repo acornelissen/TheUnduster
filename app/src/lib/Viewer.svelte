@@ -275,8 +275,8 @@
       const ringsVisible = overlay.enabled;
       if (ringsVisible && source.length > 0) {
         const rings = ringsFor(source, zoom, centerX, centerY, canvas.width, canvas.height, 12);
-        // --detect teal; app.css token is the CSS-side mirror
-        renderer.drawRings(rings, [0.25, 0.82, 0.77, 1.0], canvas.width, canvas.height);
+        // --detect red; app.css token is the CSS-side mirror
+        renderer.drawRings(rings, [1.0, 0.05, 0.05, 1.0], canvas.width, canvas.height);
       }
       // Strokes are edit state, not a detector overlay: they stay visible
       // regardless of the `m` tint toggle. The in-progress stroke (not yet
@@ -660,7 +660,7 @@
   }
   .tool-palette {
     position: absolute;
-    right: var(--space-3);
+    left: var(--space-3);
     bottom: var(--space-3);
     display: flex;
     align-items: center;
