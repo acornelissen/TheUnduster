@@ -146,9 +146,19 @@
   // Count of queued jobs (all states, all frames) for the status line.
   const queuedJobCount = $derived(Object.keys(jobStates).length);
   // Exporting is queue state now, not a hand-managed flag: any export job
-  // queued or running means the roll is exporting.
+  // queued or running means the roll is exporting. Used to gate re-clicks
+  // (the button disabled state and exportApproved()'s guard) so those stay
+  // blocked for the whole time exports are in the queue, not just while one
+  // is actively running.
   const rollExporting = $derived(
     Object.values(jobStates).some((j) => j.kind === "export"),
+  );
+  // Narrower than rollExporting: only true while an export job is actually
+  // running (not merely queued). Feeds the status-activity slot so a live
+  // heal narrates itself during a mixed batch instead of the slot showing
+  // bare "exporting" for an export that hasn't started yet.
+  const exportRunning = $derived(
+    Object.values(jobStates).some((j) => j.kind === "export" && j.state === "running"),
   );
   // The index of the frame actually on screen. `currentIndex` is set
   // synchronously on navigation (stepFrame/selectFrame/approveAndAdvance)
@@ -963,7 +973,7 @@
     return composeActivity({
       modelStatus,
       modelProgressText: modelProgressText(),
-      exporting: rollExporting,
+      exporting: exportRunning,
       exportDetail,
       isHealing,
       healProgress,
