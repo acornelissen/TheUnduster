@@ -1229,8 +1229,9 @@
     // so this matches the produced character rather than also requiring
     // e.shiftKey (which would miss layouts where `?` isn't shift-2/-slash).
     // isTypingTarget still guards: typing a literal `?` in a text field must
-    // not pop the panel open.
-    if (e.key === "?" && !isTypingTarget(e.target)) {
+    // not pop the panel open. defaultPrevented mirrors the Escape branch: a
+    // keypress an earlier handler already consumed should do one thing.
+    if (e.key === "?" && !isTypingTarget(e.target) && !e.defaultPrevented) {
       e.preventDefault();
       toggleShortcuts();
       return;

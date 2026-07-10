@@ -1,5 +1,19 @@
 <script lang="ts">
   let { onClose }: { onClose: () => void } = $props();
+
+  let body: HTMLDivElement | undefined = $state();
+
+  // Focus moves into the dialog on open (aria-modal without moving focus is
+  // a WCAG dialog failure) and back to whatever had it when the panel
+  // closes. The component only exists while the panel is open, so mount is
+  // open and effect cleanup is close.
+  $effect(() => {
+    const previous = document.activeElement;
+    body?.focus();
+    return () => {
+      if (previous instanceof HTMLElement) previous.focus();
+    };
+  });
 </script>
 
 <!-- Borderless button, not a div+role="presentation": a real <button> gets
@@ -8,16 +22,17 @@
      synthetic click handler. -->
 <button class="backdrop" aria-label="Close shortcuts" onclick={onClose}></button>
 
-<!-- svelte-ignore a11y_no_noninteractive_tabindex -- same rationale as
-     LogPanel/QueuePanel: a scrollable dialog body with no other focusable
-     descendant needs an explicit tabindex for keyboard users to scroll it
-     in WKWebView. -->
-<div class="shortcuts-panel" role="dialog" aria-modal="true" aria-label="keyboard shortcuts" tabindex="0">
+<div class="shortcuts-panel" role="dialog" aria-modal="true" aria-label="keyboard shortcuts">
   <div class="shortcuts-header">
     <h2>Keyboard shortcuts</h2>
     <button class="close-btn" aria-label="Close" onclick={onClose}>&#215;</button>
   </div>
-  <div class="shortcuts-body">
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex -- same rationale as
+       LogPanel/QueuePanel: this is the scrollable region (overflow-y: auto)
+       and it has no focusable descendant, so keyboard users in WKWebView
+       need an explicit tabindex on it to scroll. It also serves as the
+       dialog's initial focus target (see the $effect above). -->
+  <div class="shortcuts-body" bind:this={body} tabindex="0">
     <section>
       <h3>Viewer</h3>
       <ul>
