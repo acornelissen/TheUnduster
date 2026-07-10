@@ -2,6 +2,7 @@ use fd_io::{ImageBuf, PixelData};
 
 pub const TILE_SIZE: u32 = 512;
 
+#[derive(Clone)]
 pub struct Level {
     pub width: u32,
     pub height: u32,
@@ -14,6 +15,12 @@ pub struct Tile {
     pub rgba: Vec<u8>,
 }
 
+/// Cloning this is a real memcpy of every level's RGBA buffer (~336MB for a
+/// full pyramid) -- only done for the display-pyramid disk cache's
+/// fire-and-forget background write, where the alternative (encoding on the
+/// activation path, or blocking activation on the write) is worse. See
+/// `decode_and_insert` in the app crate.
+#[derive(Clone)]
 pub struct Pyramid {
     pub levels: Vec<Level>,
 }

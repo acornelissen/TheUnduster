@@ -142,9 +142,9 @@ pub fn heal_cache_path(dir: &Path, file_name: &str) -> PathBuf {
     cache_dir(dir).join(format!("{file_name}.heal"))
 }
 
-/// Not yet called from `lib.rs` -- wiring the pyramid codec into the roll
-/// pipeline is a later task; see `cache::write_pyramid`'s doc comment.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Display-pyramid disk cache path, next to `probs_cache_path`/
+/// `heal_cache_path`: `.unduster/cache/<file_name>.pyr`. Consumed by
+/// `decode_and_insert` in `lib.rs`.
 pub fn pyramid_cache_path(dir: &Path, file_name: &str) -> PathBuf {
     cache_dir(dir).join(format!("{file_name}.pyr"))
 }

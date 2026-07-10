@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use fd_tiles::{Level, Pyramid};
+use fd_tiles::{downsample_2x, Level, Pyramid, TILE_SIZE};
 use sha2::{Digest, Sha256};
 
 pub const PROBS_MAGIC: &[u8; 8] = b"UNDPROB1";
@@ -591,9 +591,7 @@ pub fn read_heal(
     Some((result, mask))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub const PYRAMID_MAGIC: &[u8; 8] = b"UNDPYRA1";
-#[cfg_attr(not(test), allow(dead_code))]
 pub const PYRAMID_VERSION: u32 = 1;
 
 /// Top-level header length: magic(8) | version(4) | level_count(4) |
@@ -624,11 +622,6 @@ const MAX_PYRAMID_LEVEL_BYTES: usize = 2 << 30;
 /// zstd level 1, not the probs codec's 3: RGBA film grain barely
 /// compresses at any level, and this write runs once per fresh build --
 /// encode speed is worth more than a few percent of disk.
-///
-/// Not yet called from `lib.rs` -- this task lands the codec only, wiring
-/// into the roll pipeline is a later task -- hence the dead-code allow on
-/// the public items below outside of `#[cfg(test)]`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn write_pyramid(path: &Path, pyramid: &Pyramid, stamp: &SourceStamp) -> Result<(), String> {
     let level_count: u32 = pyramid
         .levels
@@ -694,7 +687,6 @@ pub fn write_pyramid(path: &Path, pyramid: &Pyramid, stamp: &SourceStamp) -> Res
 /// structure (file deleted on sight). Every level's rgba length is
 /// validated as width*height*4 with checked arithmetic, and each
 /// decompression is bounded to that expected size.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn read_pyramid(path: &Path, stamp: &SourceStamp) -> Option<Pyramid> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
@@ -806,6 +798,114 @@ pub fn read_pyramid(path: &Path, stamp: &SourceStamp) -> Option<Pyramid> {
     }
 
     Some(Pyramid { levels })
+}
+
+/// True when `pyramid` is a well-formed, fully coherent display pyramid for
+/// an image of `image_width`x`image_height`: level 0's dims match the
+/// decoded image exactly, and every subsequent level is exactly the
+/// halving of the previous under `Pyramid::build`'s own rule (reusing
+/// `fd_tiles::downsample_2x`'s dims so this can never drift from the real
+/// rounding), terminating exactly where `Pyramid::build` would stop (the
+/// last level's longest side <= `TILE_SIZE`, and no level after that).
+///
+/// This is a stricter check than `read_pyramid`'s per-level structural
+/// validation: a file can pass every per-level check (magic, version,
+/// length-matches-payload) while still being shape-incoherent -- e.g. a
+/// level 1 that doesn't halve level 0, or a level0 that doesn't match the
+/// image that was actually decoded. Two concrete costs of skipping this:
+/// `Pyramid::tile`'s `l.width - x0` subtraction assumes a self-consistent
+/// grid derived from a coherent pyramid and can underflow/panic against an
+/// engineered level; and an incoherent file can claim up to
+/// `MAX_PYRAMID_LEVELS` (32) levels each near `MAX_PYRAMID_LEVEL_BYTES` (2
+/// GiB), an aggregate zstd-bomb far beyond any real pyramid -- full halving
+/// coherence bounds the aggregate to ~4/3 of level 0 by construction (a
+/// geometric series in quarters: 1 + 1/4 + 1/16 + ... < 4/3).
+///
+/// A cache-read pyramid MUST pass this before it ever reaches `tile()`;
+/// failure is the corrupt class (delete + fall through to a fresh build),
+/// not the mismatch-keep class -- unlike a stamp mismatch, a well-formed
+/// per-level-but-incoherent-shape file can never become valid by retrying
+/// the same read later.
+pub fn pyramid_shape_is_coherent(pyramid: &Pyramid, image_width: u32, image_height: u32) -> bool {
+    let Some(level0) = pyramid.levels.first() else {
+        return false;
+    };
+    if level0.width != image_width || level0.height != image_height {
+        return false;
+    }
+
+    let mut prev = level0;
+    for level in &pyramid.levels[1..] {
+        // Pyramid::build only ever appends another level while the
+        // previous one's longest side still exceeds TILE_SIZE; a level
+        // beyond that point is one Pyramid::build would never have built.
+        if prev.width.max(prev.height) <= TILE_SIZE {
+            return false;
+        }
+        let (_, expected_w, expected_h) = downsample_2x(&prev.rgba, prev.width, prev.height);
+        if level.width != expected_w || level.height != expected_h {
+            return false;
+        }
+        prev = level;
+    }
+
+    // The last level must actually be terminal -- Pyramid::build stops
+    // exactly when the longest side drops to TILE_SIZE or below, never
+    // earlier and never later.
+    prev.width.max(prev.height) <= TILE_SIZE
+}
+
+/// Deletes the oldest-mtime `*.pyr` files under `dir` until the total size
+/// of the remaining ones is at or under `budget_bytes`. `keep` (the file
+/// just written by this same background task) is never deleted, even if
+/// its mtime makes it look oldest -- pruning the entry that motivated the
+/// prune in the first place would defeat the point of caching it. Every
+/// step (dir listing, stat, delete) is best-effort: an IO error on any one
+/// file is skipped rather than aborting the whole prune, mirroring the
+/// write-failure discipline (debug-eprintln, never surfaced) one layer up
+/// in the caller.
+pub fn prune_pyramid_cache(dir: &Path, budget_bytes: u64, keep: &Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let mut files: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    let mut total: u64 = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("pyr") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        total += meta.len();
+        files.push((path, meta.len(), mtime));
+    }
+
+    if total <= budget_bytes {
+        return;
+    }
+
+    // Oldest mtime first; touch-on-read keeps recently-hit entries fresh so
+    // this degrades to true LRU rather than FIFO (see read path caller).
+    files.sort_by_key(|(_, _, mtime)| *mtime);
+
+    for (path, size, _) in files {
+        if total <= budget_bytes {
+            break;
+        }
+        if path == keep {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1323,6 +1423,149 @@ mod tests {
 
         assert!(read_pyramid(&p, &s).is_none());
         assert!(!p.exists(), "level length lie is treated as corruption");
+    }
+
+    #[test]
+    fn coherent_pyramid_shape_passes() {
+        // level0 1000x1000 (> TILE_SIZE=512) halves to level1 500x500 (<=
+        // TILE_SIZE, terminal); halving math must match Pyramid::build's
+        // downsample_2x (div_ceil(2).max(1)) exactly.
+        let pyramid = fd_tiles::Pyramid {
+            levels: vec![synth_level(1000, 1000, 11), synth_level(500, 500, 97)],
+        };
+        assert!(pyramid_shape_is_coherent(&pyramid, 1000, 1000));
+    }
+
+    #[test]
+    fn wrong_level0_dims_fails_shape_check() {
+        let pyramid = fd_tiles::Pyramid {
+            levels: vec![synth_level(1000, 1000, 11), synth_level(500, 500, 97)],
+        };
+        assert!(!pyramid_shape_is_coherent(&pyramid, 1001, 1000));
+        assert!(!pyramid_shape_is_coherent(&pyramid, 1000, 1001));
+    }
+
+    #[test]
+    fn level1_too_big_fails_shape_check() {
+        // level0 1000x1000 should halve to 500x500; claiming 600x600 is
+        // incoherent even though it's individually well-formed.
+        let pyramid = fd_tiles::Pyramid {
+            levels: vec![synth_level(1000, 1000, 11), synth_level(600, 600, 97)],
+        };
+        assert!(!pyramid_shape_is_coherent(&pyramid, 1000, 1000));
+    }
+
+    #[test]
+    fn halving_off_by_one_fails_shape_check() {
+        // Real rule for an odd dimension is div_ceil(2).max(1): 1001 -> 501,
+        // not 500.
+        let pyramid = fd_tiles::Pyramid {
+            levels: vec![synth_level(1001, 1001, 11), synth_level(500, 500, 97)],
+        };
+        assert!(!pyramid_shape_is_coherent(&pyramid, 1001, 1001));
+    }
+
+    #[test]
+    fn missing_final_level_fails_shape_check() {
+        // A pyramid that stops before reaching <= TILE_SIZE is incoherent
+        // (Pyramid::build never stops early). 2000 -> 1000 is a correct
+        // halving, but 1000 > TILE_SIZE so Pyramid::build would keep going;
+        // stopping here is missing the terminal level.
+        let pyramid = fd_tiles::Pyramid {
+            levels: vec![synth_level(4000, 4000, 11), synth_level(2000, 2000, 97)],
+        };
+        assert!(!pyramid_shape_is_coherent(&pyramid, 4000, 4000));
+    }
+
+    #[test]
+    fn empty_pyramid_fails_shape_check() {
+        let pyramid = fd_tiles::Pyramid { levels: vec![] };
+        assert!(!pyramid_shape_is_coherent(&pyramid, 4, 4));
+    }
+
+    #[test]
+    fn single_level_pyramid_at_or_under_tile_size_is_coherent() {
+        // A source image no larger than TILE_SIZE in either dimension never
+        // grows a second level under Pyramid::build.
+        let pyramid = fd_tiles::Pyramid {
+            levels: vec![synth_level(4, 4, 11)],
+        };
+        assert!(pyramid_shape_is_coherent(&pyramid, 4, 4));
+    }
+
+    #[test]
+    fn extra_level_past_terminal_fails_shape_check() {
+        // level0 4x4 is already <= TILE_SIZE; Pyramid::build would never
+        // have appended a second level at all.
+        let pyramid = fd_tiles::Pyramid {
+            levels: vec![synth_level(4, 4, 11), synth_level(2, 2, 97)],
+        };
+        assert!(!pyramid_shape_is_coherent(&pyramid, 4, 4));
+    }
+
+    #[test]
+    fn prune_pyramid_cache_forces_out_oldest_when_over_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pyr");
+        let b = dir.path().join("b.pyr");
+        let c = dir.path().join("c.pyr");
+        std::fs::write(&a, vec![0u8; 100]).unwrap();
+        std::fs::write(&b, vec![0u8; 100]).unwrap();
+        std::fs::write(&c, vec![0u8; 100]).unwrap();
+        let now = std::time::SystemTime::now();
+        std::fs::File::open(&a)
+            .unwrap()
+            .set_modified(now - std::time::Duration::from_secs(30))
+            .unwrap();
+        std::fs::File::open(&b)
+            .unwrap()
+            .set_modified(now - std::time::Duration::from_secs(20))
+            .unwrap();
+        std::fs::File::open(&c)
+            .unwrap()
+            .set_modified(now - std::time::Duration::from_secs(10))
+            .unwrap();
+
+        // 300 bytes total, budget 250: exactly one file (the oldest, a) must go.
+        prune_pyramid_cache(dir.path(), 250, &c);
+
+        assert!(!a.exists(), "oldest file is pruned first");
+        assert!(b.exists());
+        assert!(c.exists());
+    }
+
+    #[test]
+    fn prune_pyramid_cache_never_deletes_the_just_written_file_even_if_oldest() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pyr");
+        let b = dir.path().join("b.pyr");
+        std::fs::write(&a, vec![0u8; 100]).unwrap();
+        std::fs::write(&b, vec![0u8; 100]).unwrap();
+        let now = std::time::SystemTime::now();
+        // `a` is the just-written file but has an (artificially) older mtime
+        // than `b` -- it must still survive.
+        std::fs::File::open(&a)
+            .unwrap()
+            .set_modified(now - std::time::Duration::from_secs(30))
+            .unwrap();
+        std::fs::File::open(&b)
+            .unwrap()
+            .set_modified(now - std::time::Duration::from_secs(20))
+            .unwrap();
+
+        prune_pyramid_cache(dir.path(), 50, &a);
+
+        assert!(a.exists(), "the just-written file is never pruned");
+        assert!(!b.exists(), "the only other file is pruned instead");
+    }
+
+    #[test]
+    fn prune_pyramid_cache_is_a_noop_under_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pyr");
+        std::fs::write(&a, vec![0u8; 100]).unwrap();
+        prune_pyramid_cache(dir.path(), 1_000_000, &a);
+        assert!(a.exists());
     }
 
     #[test]

@@ -518,35 +518,141 @@ fn evict_over_budget(
     Ok(())
 }
 
-/// Decode + build-pyramid + registry-insert core shared by `activate_frame`'s
-/// fresh-decode path and the `Prefetch` job arm. Registry insert only, no
-/// roll bookkeeping: the two callers resolve a same-frame decode race in
-/// opposite directions (activation supersedes and closes the loser via
-/// `set_image_id`; prefetch loses ties via `set_image_id_if_absent` and
-/// closes its own image), so which id the frame ends up pointing at is the
-/// caller's decision, not this core's.
+/// Default per-roll display-pyramid disk cache budget: `UNDUSTER_PYRAMID_BUDGET_GB`,
+/// parsed with the same shape as [`pixel_budget_bytes`] (invalid/zero/absent
+/// falls back to the default; both are per-process one-shot reads, not
+/// cached, since env changes mid-run are a debug/tuning affordance, not a
+/// hot path).
+fn pyramid_budget_bytes() -> u64 {
+    const DEFAULT_GB: u64 = 20;
+    std::env::var("UNDUSTER_PYRAMID_BUDGET_GB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&gb| gb > 0)
+        .unwrap_or(DEFAULT_GB)
+        * 1024
+        * 1024
+        * 1024
+}
+
+/// Best-effort mtime bump on a cache-hit `.pyr` file so the LRU prune
+/// (`cache::prune_pyramid_cache`) treats recently-revisited frames as fresh,
+/// not just recently-built ones -- without this, prune degrades from LRU to
+/// FIFO-by-write-time. `File::set_modified` has been stable since Rust
+/// 1.75; the pinned toolchain here is 1.96, so the std-only path landed
+/// (no `filetime` dependency needed). Opened without `O_TRUNC`/`O_CREAT`
+/// (`File::open`, not `File::create`) so this never disturbs the cached
+/// bytes themselves. Failures are silent: a missed touch just costs this
+/// entry a little eviction priority next prune, never correctness.
+fn touch_pyramid_cache_file(path: &std::path::Path) {
+    if let Ok(file) = std::fs::File::open(path) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
+}
+
+/// Decode + pyramid (cache-hit or build) + registry-insert core shared by
+/// `activate_frame`'s fresh-decode path and the `Prefetch` job arm. Registry
+/// insert only, no roll bookkeeping: the two callers resolve a same-frame
+/// decode race in opposite directions (activation supersedes and closes the
+/// loser via `set_image_id`; prefetch loses ties via
+/// `set_image_id_if_absent` and closes its own image), so which id the
+/// frame ends up pointing at is the caller's decision, not this core's.
 ///
-/// `on_decoded` fires (if given) right after decode, before the
-/// (comparatively fast) pyramid build -- `activate_frame` uses it to emit
-/// the "building-pyramid" progress stage; `Prefetch` passes `None` since it
-/// emits no progress at all.
+/// `on_decoded` fires (if given) right after decode, before the pyramid
+/// step -- `activate_frame` uses it to emit the "building-pyramid" progress
+/// stage; `Prefetch` passes `None` since it emits no progress at all. On a
+/// cache hit the step is near-instant, but the same event fires regardless
+/// -- no new event is added for the hit/miss distinction.
+///
+/// The pyramid cache path mirrors the heal cache's exactly: keyed by the
+/// frame's own directory (`path.parent()`) plus its file name, so
+/// single-image mode (no roll) gets the cache for free the same way the
+/// heal/probs caches already do -- any directory holding the source file
+/// can carry a `.unduster/cache/` sibling.
 async fn decode_and_insert(
     images: &State<'_, Mutex<Images>>,
     path: std::path::PathBuf,
     on_decoded: Option<impl FnOnce() + Send + 'static>,
 ) -> Result<ImageInfo, String> {
-    let image = tauri::async_runtime::spawn_blocking(move || Images::decode_stage(&path))
+    // Stat + path derivation happen inside the blocking closure (stat is a
+    // syscall) alongside the decode; the closure hands back a fresh-build
+    // flag plus everything the fire-and-forget write needs, so the caller
+    // never re-derives the cache path or re-stats the source.
+    type FreshWrite = Option<(std::path::PathBuf, cache::SourceStamp)>;
+    let (image, pyramid, fresh_write): (_, _, FreshWrite) =
+        tauri::async_runtime::spawn_blocking(move || {
+            let cache_path = path.parent().map(|dir| {
+                let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+                roll::pyramid_cache_path(dir, &file_name)
+            });
+            // Stamp BEFORE decoding (fail-safe direction, mirroring every other
+            // cache site): a source changed after the stat mismatches on the
+            // next read instead of pairing a fresh stamp with stale pixels. A
+            // stat failure skips the cache interaction entirely -- read AND
+            // write -- and never fails activation; only a build is attempted.
+            let stamp = stamp_or_skip(&path);
+            let image = Images::decode_stage(&path)?;
+
+            if let (Some(cache_path), Some(stamp)) = (cache_path.as_ref(), stamp.as_ref()) {
+                if let Some(pyramid) = cache::read_pyramid(cache_path, stamp) {
+                    // A cache hit is only trustworthy once its shape is
+                    // validated against the image that was actually just
+                    // decoded: a well-formed-per-level file whose shape
+                    // doesn't cohere with a true Pyramid::build output is the
+                    // corrupt class (delete + fall through to a fresh build),
+                    // not the stamp-mismatch-keep class -- see
+                    // `pyramid_shape_is_coherent`'s doc comment for why an
+                    // incoherent shape is unsafe to hand to `tile()`.
+                    if cache::pyramid_shape_is_coherent(&pyramid, image.width, image.height) {
+                        // Touch-on-read here, inside the blocking stage: it's a
+                        // single cheap syscall on a file we just proved we can
+                        // read, not worth a second background hop.
+                        touch_pyramid_cache_file(cache_path);
+                        return Ok((image, pyramid, None));
+                    }
+                    let _ = std::fs::remove_file(cache_path);
+                }
+            }
+
+            let pyramid = Images::pyramid_stage(&image);
+            let fresh_write = match (cache_path, stamp) {
+                (Some(cache_path), Some(stamp)) => Some((cache_path, stamp)),
+                _ => None,
+            };
+            Ok::<_, String>((image, pyramid, fresh_write))
+        })
         .await
         .map_err(|e| e.to_string())??;
+
     if let Some(on_decoded) = on_decoded {
         on_decoded();
     }
-    let pyramid = {
-        let image = image.clone();
-        tauri::async_runtime::spawn_blocking(move || Images::pyramid_stage(&image))
-            .await
-            .map_err(|e| e.to_string())?
-    };
+
+    // Fire-and-forget write + prune: only on a fresh build (a cache hit has
+    // nothing new to persist) with a usable stamp+cache_path pair. Never
+    // awaited -- activation must return at decode+insert speed, not
+    // decode+insert+encode+fsync speed. Clones the pyramid (~336MB memcpy,
+    // tens of ms) for the background task rather than the alternatives:
+    // writing before insert would hold the zstd encode on the activation
+    // path (slower, not faster); encoding to bytes here on the blocking
+    // stage just relocates the same expensive work instead of backgrounding
+    // it. This mirrors the probs-cache fire-and-forget restore in
+    // `activate_frame` (`spawn` wrapping `spawn_blocking`), just a write
+    // instead of a read.
+    if let Some((cache_path, stamp)) = fresh_write {
+        let pyramid_for_write = pyramid.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            if let Err(_e) = cache::write_pyramid(&cache_path, &pyramid_for_write, &stamp) {
+                #[cfg(debug_assertions)]
+                eprintln!("[cache] pyramid write failed: {_e}");
+                return;
+            }
+            if let Some(dir) = cache_path.parent() {
+                cache::prune_pyramid_cache(dir, pyramid_budget_bytes(), &cache_path);
+            }
+        });
+    }
+
     let prepared = Prepared { image, pyramid };
     let mut images = images.lock().map_err(|e| e.to_string())?;
     Ok(images.insert(prepared))
