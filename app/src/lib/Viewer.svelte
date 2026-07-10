@@ -496,6 +496,13 @@
     renderer.onTileLoaded = requestFrame;
     zoom = fitZoom(info.levels[0], canvas.width, canvas.height);
     requestFrame();
+    // The Viewer only exists in the DOM while `info` is set (App gates it
+    // behind `{#if info}`), so mount time is exactly the null->set
+    // transition of a fresh open or roll swap -- never a frame-to-frame
+    // navigation within an already-open roll, since those reuse this same
+    // persistent instance. Focus here, once, so d/h/space/arrows/+/-/0/1
+    // work immediately without an initial click.
+    canvas.focus();
     rafId = requestAnimationFrame(frame);
     return () => {
       // The Viewer unmounts on mode switches (roll opened, everything
