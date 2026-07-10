@@ -1650,6 +1650,13 @@ fn enqueue_job(
     Ok(())
 }
 
+/// Returns the pending queue in order (front first), without draining it.
+/// Backs the queue panel's poll-on-open-and-events refresh.
+#[tauri::command]
+fn queue_snapshot(queue: State<'_, jobs::JobQueue>) -> Result<Vec<jobs::Job>, String> {
+    queue.snapshot()
+}
+
 #[tauri::command]
 fn enqueue_exports(
     app: tauri::AppHandle,
@@ -1838,6 +1845,7 @@ pub fn run() {
             scan_roll,
             enqueue_job,
             enqueue_exports,
+            queue_snapshot,
             models::inpainter_status,
             models::download_inpaint_model
         ])

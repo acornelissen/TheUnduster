@@ -85,6 +85,14 @@ impl JobQueue {
         Ok(queue.len())
     }
 
+    /// Clones the pending queue in order (front first), leaving it intact.
+    /// Backs the `queue_snapshot` command so the UI can show pending jobs
+    /// without draining them.
+    pub fn snapshot(&self) -> Result<Vec<Job>, String> {
+        let queue = self.queue.lock().map_err(|e| e.to_string())?;
+        Ok(queue.iter().copied().collect())
+    }
+
     /// Returns true if the queue is empty. The worker's clear-then-recheck
     /// exit handshake depends on this re-check happening after the running
     /// flag clears.
@@ -202,5 +210,28 @@ mod tests {
         assert_eq!(q.pinned().unwrap(), Some(42));
         q.pin(None).unwrap();
         assert_eq!(q.pinned().unwrap(), None);
+    }
+
+    #[test]
+    fn snapshot_returns_queue_order_without_draining() {
+        let q = JobQueue::default();
+        q.enqueue(job(JobKind::Detect, 0), false).unwrap();
+        q.enqueue(job(JobKind::Heal, 1), false).unwrap();
+        q.enqueue(job(JobKind::Export, 2), false).unwrap();
+
+        let snap = q.snapshot().unwrap();
+        assert_eq!(
+            snap,
+            vec![
+                job(JobKind::Detect, 0),
+                job(JobKind::Heal, 1),
+                job(JobKind::Export, 2),
+            ]
+        );
+        // Snapshot must not drain: pop still returns the same front-first order.
+        assert_eq!(q.pop().unwrap(), Some(job(JobKind::Detect, 0)));
+        assert_eq!(q.pop().unwrap(), Some(job(JobKind::Heal, 1)));
+        assert_eq!(q.pop().unwrap(), Some(job(JobKind::Export, 2)));
+        assert_eq!(q.pop().unwrap(), None);
     }
 }
