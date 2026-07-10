@@ -705,7 +705,15 @@ async fn activate_frame(
 /// sidecar) follows the sensitivity slider instead of staying pinned at the
 /// scan's fixed `SCAN_THRESHOLD`. Returns the new count: `None` when the
 /// frame isn't resident or has no probabilities yet (nothing to recompute),
-/// in which case the frontend leaves the chip alone.
+/// or when the write was discarded because the roll changed mid-command --
+/// either way the frontend leaves the chip alone.
+///
+/// The generation is snapshotted at entry, before any lookup: this command
+/// takes three separate lock acquisitions (image-id read, components
+/// computation, sidecar write) with nothing held across them, so `open_roll`
+/// can swap the roll between any two. The setter re-checks the snapshot
+/// under the write lock and discards a stale write, same discipline as
+/// `record_scan_result`/`set_exported`.
 #[tauri::command]
 fn set_frame_threshold(
     roll: State<'_, roll::RollState>,
@@ -713,6 +721,7 @@ fn set_frame_threshold(
     index: usize,
     threshold: f32,
 ) -> Result<Option<usize>, String> {
+    let generation = roll.generation();
     let (count, bboxes) = match roll.image_id(index)? {
         Some(id) => {
             let images = images.lock().map_err(|e| e.to_string())?;
@@ -723,8 +732,11 @@ fn set_frame_threshold(
         }
         None => (None, None),
     };
-    roll.set_threshold_and_components(index, threshold, count, bboxes)?;
-    Ok(count)
+    if roll.set_threshold_and_components(generation, index, threshold, count, bboxes)? {
+        Ok(count)
+    } else {
+        Ok(None)
+    }
 }
 
 #[tauri::command]

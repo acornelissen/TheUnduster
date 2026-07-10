@@ -576,24 +576,38 @@ impl RollState {
     /// writing threshold there too keeps this a single seam instead of a
     /// second call racing the first.
     ///
-    /// No generation check: unlike `record_scan_result`/`set_exported`, this
-    /// runs synchronously off a direct command invoke against whatever roll
-    /// is open right now, not a background task that could still be working
-    /// against a roll the operator has since swapped out. Index-validated
-    /// like its neighbors.
+    /// `generation` is re-checked under the same lock that guards the write,
+    /// like `record_scan_result`/`set_exported`: the calling command spans
+    /// several separate lock acquisitions (image-id lookup, components
+    /// computation, this write) with nothing held across them, and
+    /// `open_roll` is free to swap the roll between any two of them -- a
+    /// threshold and count computed against roll A must never land in roll
+    /// B's sidecar just because the swap won the race.
+    ///
+    /// A mismatch returns `Ok(false)` (write discarded) rather than
+    /// `set_exported`'s `Err`: this setter's caller is the interactive
+    /// slider save, where a lost race against a roll swap is a benign no-op
+    /// the operator should never see an error toast for -- not a queue task
+    /// whose discards are logged. Returning the discard as data keeps the
+    /// caller from string-matching an error message to tell "benign race"
+    /// from real failures.
     pub fn set_threshold_and_components(
         &self,
+        generation: u64,
         index: usize,
         threshold: f32,
         count: Option<usize>,
         bboxes: Option<Vec<[u32; 4]>>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         if !(0.0..=1.0).contains(&threshold) {
             return Err(format!(
                 "threshold must be finite and within [0, 1], got {threshold}"
             ));
         }
         let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return Ok(false);
+        }
         let roll = guard.as_mut().ok_or("no roll open")?;
         let frame = roll
             .frames
@@ -602,7 +616,8 @@ impl RollState {
         frame.threshold = threshold;
         frame.defect_count = count;
         frame.bboxes = bboxes;
-        roll.save()
+        roll.save()?;
+        Ok(true)
     }
 
     pub fn set_approved(&self, index: usize, approved: bool) -> Result<(), String> {
@@ -919,7 +934,7 @@ mod state_tests {
         let dir = tempfile::tempdir().unwrap();
         let state = opened_state(dir.path(), 2);
         state
-            .set_threshold_and_components(0, 0.33, None, None)
+            .set_threshold_and_components(state.generation(), 0, 0.33, None, None)
             .unwrap();
         state.set_approved(1, true).unwrap();
         let reopened = Roll::open(dir.path()).unwrap();
@@ -933,16 +948,16 @@ mod state_tests {
         let state = opened_state(dir.path(), 1);
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 1.01] {
             let err = state
-                .set_threshold_and_components(0, bad, None, None)
+                .set_threshold_and_components(state.generation(), 0, bad, None, None)
                 .unwrap_err();
             assert!(err.contains("threshold"), "error was: {err}");
         }
         // Valid boundary values are accepted.
         state
-            .set_threshold_and_components(0, 0.0, None, None)
+            .set_threshold_and_components(state.generation(), 0, 0.0, None, None)
             .unwrap();
         state
-            .set_threshold_and_components(0, 1.0, None, None)
+            .set_threshold_and_components(state.generation(), 0, 1.0, None, None)
             .unwrap();
     }
 
@@ -950,9 +965,16 @@ mod state_tests {
     fn set_threshold_and_components_persists_all_three_together() {
         let dir = tempfile::tempdir().unwrap();
         let state = opened_state(dir.path(), 1);
-        state
-            .set_threshold_and_components(0, 0.72, Some(2), Some(vec![[1, 2, 3, 4], [5, 6, 7, 8]]))
+        let written = state
+            .set_threshold_and_components(
+                state.generation(),
+                0,
+                0.72,
+                Some(2),
+                Some(vec![[1, 2, 3, 4], [5, 6, 7, 8]]),
+            )
             .unwrap();
+        assert!(written);
         let reopened = Roll::open(dir.path()).unwrap();
         assert_eq!(reopened.frames[0].threshold, 0.72);
         assert_eq!(reopened.frames[0].defect_count, Some(2));
@@ -971,15 +993,47 @@ mod state_tests {
         // count and boxes are cleared, not left dangling under the new
         // threshold they no longer match.
         state
-            .set_threshold_and_components(0, 0.4, Some(3), Some(vec![[0, 0, 1, 1]]))
+            .set_threshold_and_components(
+                state.generation(),
+                0,
+                0.4,
+                Some(3),
+                Some(vec![[0, 0, 1, 1]]),
+            )
             .unwrap();
         state
-            .set_threshold_and_components(0, 0.6, None, None)
+            .set_threshold_and_components(state.generation(), 0, 0.6, None, None)
             .unwrap();
         let reopened = Roll::open(dir.path()).unwrap();
         assert_eq!(reopened.frames[0].threshold, 0.6);
         assert_eq!(reopened.frames[0].defect_count, None);
         assert_eq!(reopened.frames[0].bboxes, None);
+    }
+
+    #[test]
+    fn set_threshold_and_components_discards_a_stale_generation_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = opened_state(dir.path(), 1);
+        state
+            .set_threshold_and_components(
+                state.generation(),
+                0,
+                0.4,
+                Some(3),
+                Some(vec![[0, 0, 1, 1]]),
+            )
+            .unwrap();
+        let stale = state.generation();
+        state.open(dir.path()).unwrap(); // bumps generation, reloads sidecar
+        let written = state
+            .set_threshold_and_components(stale, 0, 0.9, Some(9), Some(vec![[9, 9, 9, 9]]))
+            .unwrap();
+        assert!(!written);
+        // The stale write left threshold, count, and bboxes all untouched.
+        let reopened = Roll::open(dir.path()).unwrap();
+        assert_eq!(reopened.frames[0].threshold, 0.4);
+        assert_eq!(reopened.frames[0].defect_count, Some(3));
+        assert_eq!(reopened.frames[0].bboxes, Some(vec![[0, 0, 1, 1]]));
     }
 
     #[test]
@@ -1033,7 +1087,7 @@ mod state_tests {
     fn operations_before_open_error_clearly() {
         let state = RollState::default();
         assert!(state
-            .set_threshold_and_components(0, 0.5, None, None)
+            .set_threshold_and_components(state.generation(), 0, 0.5, None, None)
             .unwrap_err()
             .contains("no roll"));
         assert!(state
