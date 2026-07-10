@@ -353,6 +353,29 @@
     zoomAt(1 / 1.25, canvas.width / 2, canvas.height / 2);
   }
 
+  /** Toggles paint/erase brush mode. Shared by the b/e key branches and the
+   * palette buttons, so it carries the full behavior those keys relied on:
+   * flipping the mode off if it's already active, and -- only when turning a
+   * brush on from off -- seeding the cursor at the current view center so the
+   * brush ring appears somewhere visible immediately. */
+  function toggleBrush(mode: "paint" | "erase") {
+    const turningOn = brushMode === "off";
+    brushMode = brushMode === mode ? "off" : mode;
+    if (turningOn && brushMode !== "off") {
+      cursorX = centerX;
+      cursorY = centerY;
+    }
+    requestFrame();
+  }
+
+  /** Toggles the defect overlay tint. Mutates the `overlay` prop in place --
+   * it's a $state object owned by App, and this is the same mutation path
+   * the m key has always used, so App's reactivity picks it up the same way. */
+  function toggleOverlay() {
+    overlay.enabled = !overlay.enabled;
+    requestFrame();
+  }
+
   function onWheel(e: WheelEvent) {
     e.preventDefault();
     const dpr = window.devicePixelRatio || 1;
@@ -402,8 +425,7 @@
       return;
     } else if (e.key === "m") {
       e.preventDefault();
-      overlay.enabled = !overlay.enabled;
-      requestFrame();
+      toggleOverlay();
       return;
     // Plain z/Z only: with cmd/ctrl held this must fall through untouched so
     // the event bubbles to App's window-level undo/redo handler instead of
@@ -425,17 +447,7 @@
       return;
     } else if (e.key === "b" || e.key === "e") {
       e.preventDefault();
-      const mode = e.key === "b" ? "paint" : "erase";
-      const turningOn = brushMode === "off";
-      brushMode = brushMode === mode ? "off" : mode;
-      // Initialize the cursor to the current view center rather than
-      // leaving it at a stale position (or (0,0) on first use) so the brush
-      // ring appears somewhere visible the moment brush mode turns on.
-      if (turningOn && brushMode !== "off") {
-        cursorX = centerX;
-        cursorY = centerY;
-      }
-      requestFrame();
+      toggleBrush(e.key === "b" ? "paint" : "erase");
       return;
     } else if (e.key === "Escape" && brushMode !== "off") {
       e.preventDefault();
@@ -578,12 +590,52 @@
     onkeydown={onKey}
   ></canvas>
   {#if !glError}
-    <div class="zoom-controls">
-      <button class="btn" title="Zoom out (-)" aria-label="Zoom out" onclick={zoomOut}>&minus;</button>
-      <span class="zoom-readout">{Math.round(zoom * 100)}%</span>
-      <button class="btn" title="Zoom in (+)" aria-label="Zoom in" onclick={zoomIn}>+</button>
-      <button class="btn" title="Fit (0)" aria-label="Fit to window" onclick={zoomFit}>Fit</button>
-      <button class="btn" title="100% (1)" aria-label="Actual size" onclick={zoomActual}>1:1</button>
+    <div class="tool-palette">
+      <div class="palette-group">
+        <button
+          class="btn"
+          class:btn-toggle-on={brushMode === "paint"}
+          title="Paint mask (b)"
+          aria-label="Paint mask"
+          aria-pressed={brushMode === "paint"}
+          onclick={() => {
+            toggleBrush("paint");
+            canvas.focus();
+          }}>Paint</button
+        >
+        <button
+          class="btn"
+          class:btn-toggle-on={brushMode === "erase"}
+          title="Erase mask (e)"
+          aria-label="Erase mask"
+          aria-pressed={brushMode === "erase"}
+          onclick={() => {
+            toggleBrush("erase");
+            canvas.focus();
+          }}>Erase</button
+        >
+        <button
+          class="btn"
+          class:btn-toggle-on={overlay.enabled}
+          title="Overlay (m)"
+          aria-label="Toggle defect overlay"
+          aria-pressed={overlay.enabled}
+          onclick={() => {
+            toggleOverlay();
+            canvas.focus();
+          }}>Overlay</button
+        >
+        {#if brushMode !== "off"}
+          <span class="radius-readout">{brushRadius}px</span>
+        {/if}
+      </div>
+      <div class="palette-group">
+        <button class="btn" title="Zoom out (-)" aria-label="Zoom out" onclick={zoomOut}>&minus;</button>
+        <span class="zoom-readout">{Math.round(zoom * 100)}%</span>
+        <button class="btn" title="Zoom in (+)" aria-label="Zoom in" onclick={zoomIn}>+</button>
+        <button class="btn" title="Fit (0)" aria-label="Fit to window" onclick={zoomFit}>Fit</button>
+        <button class="btn" title="100% (1)" aria-label="Actual size" onclick={zoomActual}>1:1</button>
+      </div>
     </div>
   {/if}
 </div>
@@ -605,7 +657,7 @@
   canvas.brushing {
     cursor: none;
   }
-  .zoom-controls {
+  .tool-palette {
     position: absolute;
     right: var(--space-3);
     bottom: var(--space-3);
@@ -617,8 +669,25 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-1);
   }
+  .palette-group {
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+  }
+  .palette-group + .palette-group {
+    border-left: 1px solid var(--border);
+    margin-left: var(--space-2);
+    padding-left: var(--space-2);
+  }
   .zoom-readout {
     min-width: 4ch;
+    text-align: center;
+    font-size: var(--text-sm);
+    color: var(--text-2);
+    font-variant-numeric: tabular-nums;
+  }
+  .radius-readout {
+    min-width: 5ch;
     text-align: center;
     font-size: var(--text-sm);
     color: var(--text-2);

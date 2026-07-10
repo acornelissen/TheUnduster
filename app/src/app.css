@@ -96,6 +96,11 @@ body {
   background: var(--accent-hover);
 }
 
+.btn-toggle-on {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
 /* Toolbar */
 .toolbar {
   display: flex;
