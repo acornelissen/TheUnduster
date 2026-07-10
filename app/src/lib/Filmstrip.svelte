@@ -19,7 +19,10 @@
     frames: FrameInfo[];
     currentIndex: number;
     thumbVersions?: Record<number, number>;
-    jobStates?: Record<number, { state: "queued" | "running"; kind: "detect" | "heal" }>;
+    jobStates?: Record<
+      number,
+      { state: "queued" | "running"; kind: "detect" | "heal" | "export" }
+    >;
     onSelect: (index: number) => void;
   } = $props();
 

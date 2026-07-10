@@ -99,8 +99,10 @@
   // `rollHealing`) so it self-corrects when the operator navigates to a
   // different frame mid-job instead of latching on the index that happened
   // to be current when the job started.
-  let jobStates: Record<number, { state: "queued" | "running"; kind: "detect" | "heal" }> =
-    $state({});
+  let jobStates: Record<
+    number,
+    { state: "queued" | "running"; kind: "detect" | "heal" | "export" }
+  > = $state({});
   // The generation the currently-open roll was opened under (from
   // `open_roll`'s response). Primary guard for the job-* listeners below:
   // every job event now carries the generation it was enqueued/run against,
@@ -143,6 +145,11 @@
   const isHealing = $derived(healing || rollHealing);
   // Count of queued jobs (all states, all frames) for the status line.
   const queuedJobCount = $derived(Object.keys(jobStates).length);
+  // Exporting is queue state now, not a hand-managed flag: any export job
+  // queued or running means the roll is exporting.
+  const rollExporting = $derived(
+    Object.values(jobStates).some((j) => j.kind === "export"),
+  );
   // The index of the frame actually on screen. `currentIndex` is set
   // synchronously on navigation (stepFrame/selectFrame/approveAndAdvance)
   // before `activate_frame` resolves, so during that window the OLD frame is
@@ -153,7 +160,6 @@
   // key off this instead of `currentIndex`.
   let displayedIndex = $state(0);
   let scanDone = $state(false);
-  let exporting = $state(false);
   let exportingSingle = $state(false);
   let scanFileName: string | null = $state(null);
   let scanFileExt: string | null = $state(null);
@@ -241,7 +247,7 @@
   });
 
   $effect(() => {
-    const un = listen<{ index: number; kind: "detect" | "heal"; generation: number }>(
+    const un = listen<{ index: number; kind: "detect" | "heal" | "export"; generation: number }>(
       "job-queued",
       (e) => {
         // Generation is the primary guard: a job event belongs to this
@@ -259,7 +265,7 @@
   });
 
   $effect(() => {
-    const un = listen<{ index: number; kind: "detect" | "heal"; generation: number }>(
+    const un = listen<{ index: number; kind: "detect" | "heal" | "export"; generation: number }>(
       "job-started",
       (e) => {
         if (e.payload.generation !== rollGeneration) return;
@@ -290,7 +296,7 @@
   });
 
   $effect(() => {
-    const un = listen<{ index: number; kind: "detect" | "heal"; generation: number }>(
+    const un = listen<{ index: number; kind: "detect" | "heal" | "export"; generation: number }>(
       "job-done",
       (e) => {
         if (e.payload.generation !== rollGeneration) return;
@@ -320,7 +326,7 @@
   $effect(() => {
     const un = listen<{
       index: number;
-      kind: "detect" | "heal";
+      kind: "detect" | "heal" | "export";
       message: string;
       generation: number;
     }>("job-error", (e) => {
@@ -329,6 +335,9 @@
       // job-started listener's comment.
       if (!(e.payload.index in jobStates)) return;
       delete jobStates[e.payload.index];
+      // A failed export frame's narration must not linger once the job is
+      // gone -- export-progress won't fire to clear it for this frame.
+      if (e.payload.kind === "export") exportDetail = null;
       const fileName = roll?.frames[e.payload.index]?.file_name ?? `frame ${e.payload.index}`;
       pushError(`Frame ${fileName}: ${e.payload.message}`);
     });
@@ -408,26 +417,6 @@
         exportDetail = `${roll.frames[e.payload.index].file_name}: healing ${e.payload.done}/${e.payload.total}`;
       },
     );
-    return () => {
-      un.then((f) => f());
-    };
-  });
-
-  $effect(() => {
-    const un = listen<{ index: number; message: string }>("export-frame-error", (e) => {
-      if (!roll) return;
-      pushError(`Frame ${roll.frames[e.payload.index].file_name}: ${e.payload.message}`);
-    });
-    return () => {
-      un.then((f) => f());
-    };
-  });
-
-  $effect(() => {
-    const un = listen("export-done", () => {
-      exporting = false;
-      exportDetail = null;
-    });
     return () => {
       un.then((f) => f());
     };
@@ -605,15 +594,13 @@
   }
 
   async function exportApproved() {
-    if (!roll || exporting) return;
+    if (!roll || rollExporting) return;
     const dir = await open({ directory: true });
     if (typeof dir !== "string") return;
-    exporting = true;
     try {
-      await invoke("export_approved", { destDir: dir });
+      await invoke("enqueue_exports", { destDir: dir });
     } catch (e) {
       pushError(String(e));
-      exporting = false;
     }
   }
 
@@ -974,7 +961,7 @@
     return composeActivity({
       modelStatus,
       modelProgressText: modelProgressText(),
-      exporting,
+      exporting: rollExporting,
       exportDetail,
       isHealing,
       healProgress,
@@ -1134,9 +1121,9 @@
           class="btn"
           title="Export approved"
           onclick={exportApproved}
-          disabled={exporting || roll.frames.every((f) => !f.approved)}
+          disabled={rollExporting || roll.frames.every((f) => !f.approved)}
         >
-          {exporting ? "Exporting..." : "Export approved"}
+          {rollExporting ? "Exporting..." : "Export approved"}
         </button>
       </div>
     {/if}
