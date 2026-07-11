@@ -22,11 +22,14 @@ uniform float overlayOn;
 void main() {
   vec4 base = texture(tile, vUv);
   float p = texture(probs, vUv).r;
-  // p is an 8-bit quantization of the native f32 probability (see
-  // build_prob_pyramid), so this GPU compare can disagree with Rust's
-  // f32 threshold compare (used by the components command) by up to
-  // ~0.002 (half a u8 step out of 255). That's below the slider's step
-  // granularity (0.01), so it never produces a visibly different result.
+  // p is the tile's u8-quantized probability (see fd_tiles::quantize_prob),
+  // normalized to [0,1] by the GPU's texture fetch (q/255) -- the same u8
+  // grid the Rust side quantizes onto. This compare is step(threshold, p),
+  // i.e. non-strict q/255 >= threshold; the components command
+  // (images::threshold_mask_from_probs) requantizes the threshold onto that
+  // same grid and compares strictly, q > qt. The two can disagree by up to
+  // ~0.002 (half a u8 step out of 255), below the slider's step granularity
+  // (0.01), so it never produces a visibly different result.
   float hit = overlayOn * step(threshold, p) * step(0.004, p); // never tint p==0
   // Saturated red at high opacity (operator preference over the teal
   // trial): masks must read at a glance; subtlety costs missed defects.

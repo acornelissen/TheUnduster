@@ -16,12 +16,15 @@ pub struct ProbPyramid {
 
 /// The one quantization rule for detection probabilities, shared by every
 /// caller that turns an f32 probability into the u8 the registry, the disk
-/// cache, and the display pyramid all store: clamp to `[0, 1]` (guards NaN
-/// and any out-of-range detector output), scale to `[0, 255]`, round to the
-/// nearest integer. `f32::round` breaks ties away from zero, which for a
-/// non-negative input after the clamp is the same as the codebase's older
-/// `+ 0.5` truncation -- restated as `.round()` here because it reads as the
-/// canonical rounding rule rather than a hand-rolled equivalent.
+/// cache, and the display pyramid all store: clamp to `[0, 1]` (guards any
+/// out-of-range detector output -- NaN passes through `f32::clamp` unchanged,
+/// since `clamp` propagates NaN rather than treating it as a bound; the
+/// saturating `as u8` cast below is what actually turns it into 0), scale to
+/// `[0, 255]`, round to the nearest integer, then cast to `u8`. Identical to
+/// the codebase's older `+ 0.5` truncation rule for the cache's on-disk
+/// bytes; the two rules differ at exactly one pathological f32 value
+/// (p ~= 0.0019607842), and even there the shader's `step(0.004, p)`
+/// suppresses any visible effect.
 pub fn quantize_prob(p: f32) -> u8 {
     (p.clamp(0.0, 1.0) * 255.0).round() as u8
 }
@@ -86,7 +89,9 @@ mod tests {
         // Out-of-range inputs clamp instead of wrapping or panicking.
         assert_eq!(quantize_prob(-1.0), 0);
         assert_eq!(quantize_prob(2.0), 255);
-        assert_eq!(quantize_prob(f32::NAN), 0); // clamp(NaN) is the lower bound
+        // f32::clamp propagates NaN rather than clamping it to a bound; the
+        // saturating `as u8` cast is what turns the resulting NaN into 0.
+        assert_eq!(quantize_prob(f32::NAN), 0);
     }
 
     #[test]
