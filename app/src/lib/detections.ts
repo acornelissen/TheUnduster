@@ -13,7 +13,10 @@ const ERASE_PAD = 4;
  * stamp (matches the existing Enter-to-stamp shape) whose radius covers the
  * bbox's larger dimension. Clamped to the brush radius cap (brush.ts
  * MAX_RADIUS) so an oversized detection can't request a stroke radius the
- * backend would reject. */
+ * backend would reject. Consequence of the clamp: a bbox wider than about
+ * 2*(MAX_RADIUS - ERASE_PAD) native px gets an erase circle that only
+ * partially covers it -- the operator can delete again or hand-erase the
+ * remainder. */
 export function eraseStrokeForBbox(
   bbox: [number, number, number, number],
 ): { cx: number; cy: number; radius: number } {

@@ -322,24 +322,23 @@
    * is fine, because the erase stroke has already made the heal mask
    * correct regardless of whether this box reappears in a later pass.
    *
-   * Only handles the `detected` (post-Detect) source: pre-Detect cycling
-   * over the roll queue's `bboxes` prop has no locally-owned array to trim,
-   * so deleting there still commits the erase stroke (the mask work is real
-   * and worth keeping) but can't make the ring disappear, and deselects
-   * rather than guessing at a "remaining" count it can't observe. */
+   * `detected` only: pre-Detect cycling runs over the roll queue's `bboxes`
+   * prop, an array Viewer doesn't own and so can't trim -- an erase stroke
+   * committed there would leave the ring drawn exactly where it was, an
+   * invisible mutation that reads as "nothing happened" and stacks another
+   * stroke on every retry. The onKey branch already gates on `detected`;
+   * this early return keeps the invariant local should another caller
+   * appear. */
   function deleteActiveDetection() {
+    if (!detected) return;
     const source = markerSource();
     if (current < 0 || current >= source.length) return;
     const { cx, cy, radius } = eraseStrokeForBbox(source[current]);
     commitStrokeAs([[cx, cy]], true, radius);
-    if (detected) {
-      const removed = current;
-      detections = detections.filter((_, i) => i !== removed);
-      onDetectionsChange?.(detections.length);
-      current = nextCurrentAfterRemoval(removed, detections.length);
-    } else {
-      current = -1;
-    }
+    const removed = current;
+    detections = detections.filter((_, i) => i !== removed);
+    onDetectionsChange?.(detections.length);
+    current = nextCurrentAfterRemoval(removed, detections.length);
     requestFrame();
   }
 
@@ -597,11 +596,14 @@
       e.preventDefault();
       cycleDetection(e.key === "z" ? 1 : -1);
       return;
-    // Only while a ring is actually selected, and never while brushing --
-    // Delete/Backspace has no brush-mode meaning of its own, but silently
-    // deleting a detection out from under an in-progress paint/erase stroke
-    // would surprise the operator more than doing nothing.
-    } else if ((e.key === "Delete" || e.key === "Backspace") && current >= 0 && brushMode === "off") {
+    // Only in detected mode with a ring actually selected, and never while
+    // brushing -- Delete/Backspace has no brush-mode meaning of its own, but
+    // silently deleting a detection out from under an in-progress
+    // paint/erase stroke would surprise the operator more than doing
+    // nothing. The `detected` gate excludes pre-Detect cycling over the roll
+    // queue's bboxes prop, where the ring couldn't be hidden (see
+    // deleteActiveDetection).
+    } else if ((e.key === "Delete" || e.key === "Backspace") && detected && current >= 0 && brushMode === "off") {
       e.preventDefault();
       deleteActiveDetection();
       return;
