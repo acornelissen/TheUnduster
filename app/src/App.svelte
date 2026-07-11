@@ -11,7 +11,7 @@
   import LogPanel from "./lib/LogPanel.svelte";
   import QueuePanel from "./lib/QueuePanel.svelte";
   import ShortcutsPanel from "./lib/ShortcutsPanel.svelte";
-  import { composeQueueEntries, type QueueProgress } from "./lib/queue";
+  import { composeQueueEntries, type QueueEntry, type QueueProgress } from "./lib/queue";
   import { routeDrop, type PathKind } from "./lib/drop";
   import type { Level } from "./lib/viewport";
   import { undoStroke, redoStroke, type StrokeData } from "./lib/brush";
@@ -142,6 +142,13 @@
   // show. Reset to null on job-started (a new job's progress starts fresh)
   // and cleared on job-done/job-error/queue-idle.
   let queueProgress: QueueProgress | null = $state(null);
+  // The queue-panel key (`${kind}:${index}`) of the RUNNING job whose cancel
+  // has been requested but not yet confirmed by a job-cancelled event -- the
+  // abort is cooperative, so the row shows "cancelling" in the meantime.
+  // Only ever set for a running entry: cancelling a queued entry removes it
+  // synchronously. Cleared when any terminal event (cancelled/done/error)
+  // arrives for that job, on queue-idle, and on roll swap/close.
+  let cancellingKey: string | null = $state(null);
   // The generation the currently-open roll was opened under (from
   // `open_roll`'s response). Primary guard for the job-* listeners below:
   // every job event now carries the generation it was enqueued/run against,
@@ -406,6 +413,9 @@
       (e) => {
         if (e.payload.generation !== rollGeneration) return;
         if (queueOpen) void refreshQueueSnapshot();
+        // The job the operator was cancelling finished first: the race is
+        // benign, the "cancelling" tag just must not outlive the row.
+        if (cancellingKey === `${e.payload.kind}:${e.payload.index}`) cancellingKey = null;
         // Index-in-jobStates guard stays as belt-and-braces: see the
         // job-started listener's comment.
         if (!(e.payload.index in jobStates)) return;
@@ -449,6 +459,7 @@
     }>("job-error", (e) => {
       if (e.payload.generation !== rollGeneration) return;
       if (queueOpen) void refreshQueueSnapshot();
+      if (cancellingKey === `${e.payload.kind}:${e.payload.index}`) cancellingKey = null;
       // Index-in-jobStates guard stays as belt-and-braces: see the
       // job-started listener's comment.
       if (!(e.payload.index in jobStates)) return;
@@ -466,6 +477,45 @@
   });
 
   $effect(() => {
+    // Mirrors job-error's cleanup, minus the error toast: a cancellation is
+    // the operator's own action, so it gets a quiet activity-log line
+    // instead. Fires both for queued jobs removed synchronously by
+    // cancel_job/cancel_all_jobs and for the running job once its
+    // cooperative abort actually lands.
+    const un = listen<{
+      index: number;
+      kind: "detect" | "heal" | "export" | "prefetch";
+      generation: number;
+    }>("job-cancelled", (e) => {
+      if (e.payload.generation !== rollGeneration) return;
+      if (queueOpen) void refreshQueueSnapshot();
+      if (cancellingKey === `${e.payload.kind}:${e.payload.index}`) cancellingKey = null;
+      // Index-in-jobStates guard stays as belt-and-braces: see the
+      // job-started listener's comment.
+      if (!(e.payload.index in jobStates)) return;
+      // Only a running job's cancellation clears the shared progress slot: a
+      // queued job being removed says nothing about the job that is running.
+      if (jobStates[e.payload.index].state === "running") queueProgress = null;
+      delete jobStates[e.payload.index];
+      if (e.payload.kind === "export") exportDetail = null;
+      const fileName = roll?.frames[e.payload.index]?.file_name ?? `frame ${e.payload.index}`;
+      activityLog = pushLog(
+        activityLog,
+        {
+          id: nextLogId++,
+          time: new Date().toLocaleTimeString(),
+          level: "info",
+          message: `Cancelled ${e.payload.kind} for ${fileName}`,
+        },
+        100,
+      );
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  $effect(() => {
     // queue-idle means the worker stopped (drained, roll swapped, or errored
     // out) -- NOT that every job succeeded. Treat it purely as a cleanup
     // signal for straggler jobState entries the done/error events missed
@@ -476,6 +526,7 @@
       if (e.payload.generation !== rollGeneration) return;
       if (queueOpen) void refreshQueueSnapshot();
       queueProgress = null; // the worker stopped, so nothing is running now
+      cancellingKey = null; // ...so there is nothing left to be cancelling
       // Grace-period cleanup instead of a blanket wipe: a same-generation
       // idle can race an enqueue whose job a fresh worker is about to run
       // (the worker's emit happens after its empty-check releases the lock).
@@ -773,6 +824,7 @@
       // same index) could be mistaken for a live job by the guards in the
       // job-started/job-done/job-error listeners below.
       jobStates = {};
+      cancellingKey = null;
       // Same reason for the export narration: it described the closed
       // roll's export, and nothing in single-image mode will clear it.
       exportDetail = null;
@@ -849,6 +901,7 @@
     // frames that no longer exist in this roll's index space, and must not
     // be mistaken for this roll's own in-flight work by the job listeners.
     jobStates = {};
+    cancellingKey = null;
     // Likewise the export narration: a stale line from the previous roll's
     // export would otherwise linger until this roll's first export event.
     exportDetail = null;
@@ -1503,8 +1556,33 @@
     const pending = queueSnapshot.filter(
       (j) => j.generation === rollGeneration && j.index >= 0 && j.index < r.frames.length,
     );
-    return composeQueueEntries(running, pending, r.frames, queueProgress);
+    return composeQueueEntries(running, pending, r.frames, queueProgress, cancellingKey);
   });
+
+  // Queue-panel row action: a queued entry is removed synchronously by
+  // cancel_job (its job-cancelled event follows at once); a running entry
+  // only gets a cooperative abort request, so it is marked "cancelling"
+  // until the worker's own job-cancelled (or a racing done/error) arrives.
+  async function cancelQueueEntry(entry: QueueEntry) {
+    if (entry.state === "running") cancellingKey = entry.key;
+    try {
+      await invoke("cancel_job", { kind: entry.kind, index: entry.index });
+    } catch (e) {
+      if (cancellingKey === entry.key) cancellingKey = null;
+      pushError(String(e));
+    }
+  }
+
+  async function cancelAllQueueJobs() {
+    const running = queueEntries.find((e) => e.state === "running");
+    if (running) cancellingKey = running.key;
+    try {
+      await invoke("cancel_all_jobs", {});
+    } catch (e) {
+      cancellingKey = null;
+      pushError(String(e));
+    }
+  }
 
   function onStrokesChange(strokes: StrokeData[], redo: StrokeData[]) {
     const key = strokeKey();
@@ -1855,7 +1933,12 @@
   <LogPanel entries={activityLog} id="activity-log-panel" />
 {/if}
 {#if queueOpen}
-  <QueuePanel entries={queueEntries} id="job-queue-panel" />
+  <QueuePanel
+    entries={queueEntries}
+    id="job-queue-panel"
+    onCancel={cancelQueueEntry}
+    onCancelAll={cancelAllQueueJobs}
+  />
 {/if}
 {#if shortcutsOpen}
   <ShortcutsPanel onClose={() => (shortcutsOpen = false)} />

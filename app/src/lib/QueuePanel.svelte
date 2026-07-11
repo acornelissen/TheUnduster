@@ -1,14 +1,29 @@
 <script lang="ts">
+  import Icon from "./Icon.svelte";
+
   type QueueProgress = { done: number; total: number } | { stage: string };
 
   interface QueueEntry {
     key: string;
+    kind: "detect" | "heal" | "export" | "prefetch";
+    index: number;
     label: string;
     state: "running" | "queued";
     progress?: QueueProgress;
+    cancelling?: true;
   }
 
-  let { entries, id }: { entries: QueueEntry[]; id: string } = $props();
+  let {
+    entries,
+    id,
+    onCancel,
+    onCancelAll,
+  }: {
+    entries: QueueEntry[];
+    id: string;
+    onCancel: (entry: QueueEntry) => void;
+    onCancelAll: () => void;
+  } = $props();
 
   function hasDoneTotal(p: QueueProgress): p is { done: number; total: number } {
     return "done" in p;
@@ -22,6 +37,9 @@
   {#if entries.length === 0}
     <p class="queue-empty">queue is empty</p>
   {:else}
+    <div class="queue-actions">
+      <button type="button" class="queue-cancel-all" onclick={onCancelAll}>Cancel all</button>
+    </div>
     <ul>
       {#each entries as entry (entry.key)}
         <li class="queue-entry">
@@ -30,8 +48,20 @@
               >{entry.label}</span
             >
             <span class="badge queue-tag" class:queue-tag-running={entry.state === "running"}
-              >{entry.state}</span
+              >{entry.cancelling ? "cancelling" : entry.state}</span
             >
+            <button
+              type="button"
+              class="queue-cancel"
+              aria-label={`Cancel ${entry.label}`}
+              title={entry.state === "running"
+                ? "Stop this job at its next check-in"
+                : "Remove from queue"}
+              disabled={entry.cancelling}
+              onclick={() => onCancel(entry)}
+            >
+              <Icon name="unapprove" />
+            </button>
           </div>
           {#if entry.progress}
             {#if hasDoneTotal(entry.progress)}
@@ -84,6 +114,28 @@
     font-size: var(--text-sm);
     margin: 0;
   }
+  .queue-actions {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: var(--space-2);
+  }
+  .queue-cancel-all {
+    font-size: var(--text-sm);
+    color: var(--text-2);
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-1);
+    padding: 2px var(--space-2);
+    cursor: pointer;
+  }
+  .queue-cancel-all:hover {
+    color: var(--text-1);
+    background: var(--bg-3);
+  }
+  .queue-cancel-all:focus-visible {
+    outline: 3px solid var(--focus);
+    outline-offset: 1px;
+  }
   ul {
     list-style: none;
     margin: 0;
@@ -114,6 +166,32 @@
   }
   .queue-label-queued {
     color: var(--text-2);
+  }
+  .queue-cancel {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    color: var(--text-2);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: var(--radius-1);
+    cursor: pointer;
+    padding: 0;
+  }
+  .queue-cancel:hover:not(:disabled) {
+    color: var(--text-1);
+    background: var(--bg-3);
+  }
+  .queue-cancel:focus-visible {
+    outline: 3px solid var(--focus);
+    outline-offset: 1px;
+  }
+  .queue-cancel:disabled {
+    opacity: 0.4;
+    cursor: default;
   }
   .queue-progress {
     display: flex;

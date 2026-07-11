@@ -13,9 +13,18 @@ export type QueueProgress = { done: number; total: number } | { stage: string };
 
 export interface QueueEntry {
   key: string;
+  /** Kind and index ride along so a row's cancel action can call the
+   * cancel_job command directly instead of parsing them back out of `key`. */
+  kind: "detect" | "heal" | "export" | "prefetch";
+  index: number;
   label: string;
   state: "running" | "queued";
   progress?: QueueProgress;
+  /** Set on the running entry once its cancel was requested: the abort is
+   * cooperative (the job stops at its next check-in), so the row shows
+   * "cancelling" until the backend's job-cancelled event removes it. Queued
+   * entries are removed instantly on cancel and never carry this. */
+  cancelling?: true;
 }
 
 export interface RunningJob {
@@ -40,15 +49,19 @@ export function composeQueueEntries(
   snapshot: SnapshotJob[],
   frames: { file_name: string }[],
   runningProgress?: QueueProgress | null,
+  cancellingKey?: string | null,
 ): QueueEntry[] {
   const label = (index: number, kind: string) =>
     `${frames[index]?.file_name ?? `frame ${index}`} — ${kind}`;
 
   const runningEntries: QueueEntry[] = running.map((j) => ({
     key: `${j.kind}:${j.index}`,
+    kind: j.kind,
+    index: j.index,
     label: label(j.index, j.kind),
-    state: "running",
+    state: "running" as const,
     ...(runningProgress ? { progress: runningProgress } : {}),
+    ...(cancellingKey === `${j.kind}:${j.index}` ? { cancelling: true as const } : {}),
   }));
   const runningKeys = new Set(runningEntries.map((e) => e.key));
 
@@ -56,8 +69,10 @@ export function composeQueueEntries(
     .filter((j) => !runningKeys.has(`${j.kind}:${j.index}`))
     .map((j) => ({
       key: `${j.kind}:${j.index}`,
+      kind: j.kind,
+      index: j.index,
       label: label(j.index, j.kind),
-      state: "queued",
+      state: "queued" as const,
     }));
 
   return [...runningEntries, ...queuedEntries];
