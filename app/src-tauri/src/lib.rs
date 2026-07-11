@@ -2607,7 +2607,8 @@ pub fn run() {
             cancel_all_jobs,
             models::inpainter_status,
             models::inpainter_load_error,
-            models::download_inpaint_model
+            models::download_inpaint_model,
+            models::cancel_model_download
         ])
         .register_uri_scheme_protocol("tiles", |ctx, request| {
             let images = ctx.app_handle().state::<Mutex<Images>>();
@@ -2631,9 +2632,14 @@ pub fn run() {
             let inpainter = app.state::<detect::InpainterState>();
             let mut loaded = false;
             if let Ok(lama) = models::lama_path(app.handle()) {
-                // A crash mid-download can orphan the ~200MB temp file; it is
-                // never loaded, only wasted disk. Clear it on startup.
-                let _ = std::fs::remove_file(lama.with_file_name("lama.onnx.tmp-unduster"));
+                // A crash or quit mid-download orphans a 100MB+ temp file;
+                // it is never loaded, only wasted disk. Sweep any that have
+                // not been written to for an hour -- the age gate is what
+                // makes this safe alongside another instance's live download
+                // (see sweep_stale_temps).
+                if let Some(dir) = lama.parent() {
+                    let _ = models::sweep_stale_temps(dir, std::time::Duration::from_secs(3600));
+                }
                 if lama.exists() {
                     match inpainter.load(&lama) {
                         Ok(()) => loaded = true,

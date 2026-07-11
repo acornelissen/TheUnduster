@@ -23,13 +23,53 @@ pub const LAMA_SHA256: &str = "1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed
 /// misbehaving/compromised host streaming an unbounded response.
 pub const LAMA_MAX_BYTES: u64 = 300_000_000;
 
-/// Single-flight guard for `download_inpaint_model`, mirroring `RollState`'s
-/// `scanning`/`exporting` flags.
-pub struct ModelDownloadState(pub AtomicBool);
+/// Single-flight guard plus cooperative cancel flag for
+/// `download_inpaint_model`, mirroring the job queue's running/cancel pair:
+/// begin clears any stale cancel, cancel only lands while a download runs,
+/// and the download loop polls the flag between chunks.
+#[derive(Default)]
+pub struct ModelDownloadState {
+    running: AtomicBool,
+    cancel_requested: AtomicBool,
+}
 
-impl Default for ModelDownloadState {
-    fn default() -> Self {
-        ModelDownloadState(AtomicBool::new(false))
+impl ModelDownloadState {
+    /// Claims the single-flight flag (false -> true) and clears any cancel
+    /// left over from a previous download. Returns false when a download is
+    /// already running.
+    pub fn try_begin(&self) -> bool {
+        let won = self
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        if won {
+            self.cancel_requested.store(false, Ordering::SeqCst);
+        }
+        won
+    }
+
+    /// Clears both flags; called by the drop guard when the download task
+    /// completes or unwinds.
+    pub fn finish(&self) {
+        self.cancel_requested.store(false, Ordering::SeqCst);
+        self.running.store(false, Ordering::SeqCst);
+    }
+
+    /// Requests a cooperative abort of the running download, if any.
+    /// Returns true when the request landed on a live download.
+    pub fn request_cancel(&self) -> bool {
+        if self.running.load(Ordering::SeqCst) {
+            self.cancel_requested.store(true, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// True when the running download has been asked to stop; polled by the
+    /// download loop between chunks.
+    pub fn cancel_requested(&self) -> bool {
+        self.cancel_requested.load(Ordering::SeqCst)
     }
 }
 
@@ -40,10 +80,7 @@ struct DownloadFlagGuard(tauri::AppHandle);
 
 impl Drop for DownloadFlagGuard {
     fn drop(&mut self) {
-        self.0
-            .state::<ModelDownloadState>()
-            .0
-            .store(false, Ordering::SeqCst);
+        self.0.state::<ModelDownloadState>().finish();
     }
 }
 
@@ -74,11 +111,48 @@ pub fn lama_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(models_dir(app)?.join("lama.onnx"))
 }
 
-/// Path for the in-progress download before it is verified and renamed into
-/// place. The `tmp-unduster` suffix keeps it visually distinct from a real
-/// model file and easy to filter out of any directory listing.
+/// File name for the in-progress download before it is verified and renamed
+/// into place. The `tmp-unduster` marker keeps it visually distinct from a
+/// real model file (and is what `sweep_stale_temps` filters on); the pid
+/// suffix keeps two app instances from clobbering each other's in-flight
+/// download.
+fn tmp_file_name(pid: u32) -> String {
+    format!("lama.onnx.tmp-unduster-{pid}")
+}
+
 fn lama_tmp_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    Ok(models_dir(app)?.join("lama.onnx.tmp-unduster"))
+    Ok(models_dir(app)?.join(tmp_file_name(std::process::id())))
+}
+
+/// Removes `lama.onnx.tmp-unduster*` files in `dir` whose mtime is older
+/// than `max_age`, returning how many went. Called once at startup so an
+/// interrupted download (app quit or crash mid-stream) does not leave a
+/// 100MB+ orphan sitting in Application Support forever. The age check is
+/// what makes this safe to run while another instance downloads: a live
+/// download rewrites its temp's mtime with every chunk, so anything an hour
+/// old is genuinely dead.
+pub fn sweep_stale_temps(dir: &Path, max_age: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("lama.onnx.tmp-unduster") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| mtime.elapsed().ok())
+            .is_some_and(|age| age >= max_age);
+        if stale && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// Streams `path` through SHA-256 in 1MB chunks, returning the raw digest.
@@ -173,15 +247,32 @@ pub fn inpainter_load_error(
     Ok(inpainter.load_error())
 }
 
+/// No chunk for this long means the connection stalled: fail the download
+/// with a clear message instead of hanging forever (a stalled `reqwest::get`
+/// used to wedge the single-flight flag until app restart). Also used as the
+/// connect timeout -- reqwest's whole-request `timeout()` would be wrong for
+/// a 207MB body, so stall detection is per chunk instead.
+const DOWNLOAD_STALL_SECS: u64 = 30;
+
 /// Runs the fallible body of the download: streams `LAMA_URL` to a temp
 /// file, verifies its checksum, renames it atomically into place, and loads
 /// it into the inpainter. Split out so `download_inpaint_model` can guarantee
-/// a terminal event (`model-done` or `model-error`) on every exit path.
+/// a terminal event (`model-done`, `model-cancelled`, or `model-error`) on
+/// every exit path. A cancel request or a stall surfaces as `Err` here; the
+/// caller reads the cancel flag to tell the two apart.
 async fn run_download(app: &tauri::AppHandle, inpainter: &InpainterState) -> Result<(), String> {
     let tmp = lama_tmp_path(app)?;
     let final_path = lama_path(app)?;
 
-    let response = reqwest::get(LAMA_URL).await.map_err(|e| e.to_string())?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(DOWNLOAD_STALL_SECS))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = client
+        .get(LAMA_URL)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
     if !response.status().is_success() {
         return Err(format!("download failed: HTTP {}", response.status()));
     }
@@ -194,8 +285,21 @@ async fn run_download(app: &tauri::AppHandle, inpainter: &InpainterState) -> Res
     let mut last_emit = std::time::Instant::now();
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
-    while let Some(chunk) = stream.next().await {
+    loop {
+        // Stall detection per chunk: a healthy download delivers chunks many
+        // times a second, so 30s of silence is a dead connection, not a slow
+        // one.
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(DOWNLOAD_STALL_SECS),
+            stream.next(),
+        )
+        .await
+        .map_err(|_| format!("download stalled: no data for {DOWNLOAD_STALL_SECS}s"))?;
+        let Some(chunk) = next else { break };
         let chunk = chunk.map_err(|e| e.to_string())?;
+        if app.state::<ModelDownloadState>().cancel_requested() {
+            return Err("download cancelled".to_string());
+        }
         received += chunk.len() as u64;
         if received > LAMA_MAX_BYTES {
             return Err("download exceeded the expected size".to_string());
@@ -230,12 +334,7 @@ pub fn download_inpaint_model(
     app: tauri::AppHandle,
     inpainter: State<'_, InpainterState>,
 ) -> Result<(), String> {
-    let flag = app.state::<ModelDownloadState>();
-    if flag
-        .0
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    if !app.state::<ModelDownloadState>().try_begin() {
         return Ok(()); // already running; idempotent from the caller's view
     }
     let inpainter = inpainter.inner().clone();
@@ -243,6 +342,13 @@ pub fn download_inpaint_model(
     tauri::async_runtime::spawn(async move {
         let _flag_guard = DownloadFlagGuard(app_for_task.clone());
         let result = run_download(&app_for_task, &inpainter).await;
+        // Read the cancel flag BEFORE the guard drops and clears it: an Err
+        // after a cancel request is the operator's own stop, not a failure
+        // to toast about. Same decided-on-the-flag pattern as the job
+        // worker's job-cancelled emit.
+        let was_cancelled = app_for_task
+            .state::<ModelDownloadState>()
+            .cancel_requested();
         match result {
             Ok(()) => {
                 let _ = app_for_task.emit("model-done", ());
@@ -251,10 +357,24 @@ pub fn download_inpaint_model(
                 if let Ok(tmp) = lama_tmp_path(&app_for_task) {
                     let _ = std::fs::remove_file(&tmp);
                 }
-                let _ = app_for_task.emit("model-error", ModelError { message });
+                if was_cancelled {
+                    let _ = app_for_task.emit("model-cancelled", ());
+                } else {
+                    let _ = app_for_task.emit("model-error", ModelError { message });
+                }
             }
         }
     });
+    Ok(())
+}
+
+/// Requests a cooperative abort of the running model download; the download
+/// loop notices between chunks (or its stall timeout fires first) and the
+/// terminal `model-cancelled` event follows. A no-op when nothing is
+/// downloading -- the outcome the operator wanted already holds.
+#[tauri::command]
+pub fn cancel_model_download(app: tauri::AppHandle) -> Result<(), String> {
+    app.state::<ModelDownloadState>().request_cancel();
     Ok(())
 }
 
@@ -272,6 +392,64 @@ mod tests {
         assert!(verify_sha256(&p, good).is_ok());
         let err = verify_sha256(&p, &good.replace('9', "a")).unwrap_err();
         assert!(err.contains("checksum"));
+    }
+
+    #[test]
+    fn download_state_single_flights_and_cancels_only_while_running() {
+        let s = ModelDownloadState::default();
+        // Nothing running: a cancel request lands nowhere.
+        assert!(!s.request_cancel());
+        assert!(!s.cancel_requested());
+
+        assert!(s.try_begin()); // wins the flag
+        assert!(!s.try_begin()); // second caller loses
+        assert!(s.request_cancel());
+        assert!(s.cancel_requested());
+        s.finish();
+        assert!(!s.cancel_requested());
+
+        // A stale cancel from a previous run must not abort the next one.
+        assert!(s.try_begin());
+        assert!(!s.cancel_requested());
+        s.finish();
+    }
+
+    #[test]
+    fn tmp_file_name_is_per_process_and_keeps_the_marker() {
+        let a = tmp_file_name(123);
+        let b = tmp_file_name(456);
+        assert_ne!(a, b);
+        for name in [&a, &b] {
+            assert!(name.starts_with("lama.onnx.tmp-unduster"));
+        }
+        assert!(a.contains("123"));
+    }
+
+    #[test]
+    fn sweep_removes_only_stale_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale_tmp = dir.path().join("lama.onnx.tmp-unduster-999");
+        let real_model = dir.path().join("lama.onnx");
+        let unrelated = dir.path().join("other.bin");
+        for p in [&stale_tmp, &real_model, &unrelated] {
+            std::fs::write(p, b"x").unwrap();
+        }
+
+        // max_age zero: everything just written already counts as stale, so
+        // only the filename filter decides what goes.
+        let removed = sweep_stale_temps(dir.path(), std::time::Duration::ZERO);
+        assert_eq!(removed, 1);
+        assert!(!stale_tmp.exists());
+        assert!(real_model.exists());
+        assert!(unrelated.exists());
+
+        // A temp younger than max_age survives: it may belong to a live
+        // download in another instance.
+        let live_tmp = dir.path().join("lama.onnx.tmp-unduster-1000");
+        std::fs::write(&live_tmp, b"x").unwrap();
+        let removed = sweep_stale_temps(dir.path(), std::time::Duration::from_secs(3600));
+        assert_eq!(removed, 0);
+        assert!(live_tmp.exists());
     }
 
     #[test]
