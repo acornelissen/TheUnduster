@@ -72,7 +72,13 @@ struct Entry {
     /// one quantization rule) plus their max-pooled display pyramid. None
     /// until `detect` has run for this image. u8, not f32: a detected 168MP
     /// frame retains ~168MB instead of ~672MB.
-    probs: Option<(Vec<u8>, ProbPyramid)>,
+    ///
+    /// `Arc`, not a bare `Vec`: [`Images::probs_snapshot`] hands a clone of
+    /// this Arc to a caller that walks the CCL outside the registry lock
+    /// (see `components` and `set_frame_threshold` in lib.rs) -- cloning the
+    /// Arc is O(1) and shares the same backing buffer, so the lock is held
+    /// only long enough to bump a refcount, not to copy 168MB.
+    probs: Option<(Arc<Vec<u8>>, ProbPyramid)>,
     /// Memoized [`Images::components`] result for the most recently queried
     /// threshold, keyed by its quantized value ([`quantize_prob`] -- the same
     /// rule `threshold_mask_from_probs` compares against, so the memo key
@@ -401,7 +407,7 @@ impl Images {
                 return false;
             }
         }
-        entry.probs = Some((probs, pyramid));
+        entry.probs = Some((Arc::new(probs), pyramid));
         // Fresh probabilities invalidate any memoized component walk -- it
         // was computed against the probs this call just replaced.
         entry.components_memo = None;
@@ -432,19 +438,73 @@ impl Images {
     /// the activation probe re-deriving what a frame switch just fetched, or
     /// a slider settling back where it started -- returns the cached boxes
     /// instead of re-running the CCL walk.
+    ///
+    /// Runs the walk under the registry lock (the caller already holds
+    /// `&mut self`); callers that want the walk OFF the lock -- the
+    /// `components` and `set_frame_threshold` commands, which would
+    /// otherwise starve tile serving behind a ~785ms walk on the wry main
+    /// thread -- use [`Self::components_memo_hit`] plus
+    /// [`Self::probs_snapshot`] instead, see lib.rs's `compute_components`.
     pub fn components(&mut self, id: u64, threshold: f32) -> Option<Vec<[u32; 4]>> {
-        let qt = quantize_prob(threshold);
-        let entry = self.entries.get_mut(&id)?;
-        if let Some((memo_qt, boxes)) = &entry.components_memo {
-            if *memo_qt == qt {
-                return Some(boxes.clone());
-            }
+        if let Some(hit) = self.components_memo_hit(id, threshold) {
+            return Some(hit);
         }
+        let entry = self.entries.get(&id)?;
         let (probs, _) = entry.probs.as_ref()?;
         let (w, h) = (entry.image.width, entry.image.height);
         let boxes = components_from_probs(probs, w, h, threshold);
-        entry.components_memo = Some((qt, boxes.clone()));
+        let entry = self.entries.get_mut(&id)?;
+        entry.components_memo = Some((quantize_prob(threshold), boxes.clone()));
         Some(boxes)
+    }
+
+    /// Read-only memo check, without running or storing anything: `Some` iff
+    /// a memoized walk exists for `id` at `threshold`'s quantized value.
+    /// Shared by the in-lock [`Self::components`] and the lock-free async
+    /// path in lib.rs, which checks this before deciding whether a
+    /// `spawn_blocking` walk is even needed.
+    pub fn components_memo_hit(&self, id: u64, threshold: f32) -> Option<Vec<[u32; 4]>> {
+        let qt = quantize_prob(threshold);
+        let entry = self.entries.get(&id)?;
+        let (memo_qt, boxes) = entry.components_memo.as_ref()?;
+        (*memo_qt == qt).then(|| boxes.clone())
+    }
+
+    /// Cheap (`Arc::clone`) snapshot of an entry's probs plus native dims,
+    /// for a caller that walks the CCL outside the registry lock. None when
+    /// `id` is unknown or has no probabilities yet.
+    pub fn probs_snapshot(&self, id: u64) -> Option<(Arc<Vec<u8>>, u32, u32)> {
+        let entry = self.entries.get(&id)?;
+        let (probs, _) = entry.probs.as_ref()?;
+        Some((probs.clone(), entry.image.width, entry.image.height))
+    }
+
+    /// Writes back a component walk computed lock-free from a
+    /// [`Self::probs_snapshot`]. Guarded against the entry having been
+    /// closed or re-detected while the walk ran: `probs` must still be the
+    /// SAME allocation as the entry's current probs (`Arc::ptr_eq`, not just
+    /// an equal id) -- a fresh detect replaces probs with a new Arc, so a
+    /// walk that started against the old one is stale and silently
+    /// discarded here rather than overwriting a newer generation's memo (or,
+    /// worse, being written after a close+new-detect race with nothing to
+    /// distinguish it from a current result).
+    pub fn store_components_memo(
+        &mut self,
+        id: u64,
+        probs: &Arc<Vec<u8>>,
+        threshold: f32,
+        boxes: Vec<[u32; 4]>,
+    ) {
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return;
+        };
+        let Some((current, _)) = &entry.probs else {
+            return;
+        };
+        if !Arc::ptr_eq(current, probs) {
+            return;
+        }
+        entry.components_memo = Some((quantize_prob(threshold), boxes));
     }
 
     pub fn close(&mut self, id: u64) {
@@ -584,14 +644,19 @@ mod tests {
         // Mutate the stored probs directly, bypassing `set_probs` -- the
         // memo is NOT invalidated by this. A genuine recompute at the same
         // threshold would see the added component; a memoized result won't.
-        images
-            .entries
-            .get_mut(&info.id)
-            .unwrap()
-            .probs
-            .as_mut()
-            .unwrap()
-            .0[300 * 600 + 400] = quantize_prob(0.9);
+        // `Arc::get_mut` succeeds because nothing else has cloned this Arc
+        // yet (no `probs_snapshot`/lock-free walk has run in this test).
+        Arc::get_mut(
+            &mut images
+                .entries
+                .get_mut(&info.id)
+                .unwrap()
+                .probs
+                .as_mut()
+                .unwrap()
+                .0,
+        )
+        .unwrap()[300 * 600 + 400] = quantize_prob(0.9);
 
         let memoized = images.components(info.id, 0.5).unwrap();
         assert_eq!(memoized.len(), 1, "same-threshold call must not recompute");
@@ -637,6 +702,65 @@ mod tests {
         // A same-threshold call after set_probs must reflect the new probs,
         // not a stale memoized count.
         assert_eq!(images.components(info.id, 0.5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn probs_snapshot_and_memo_write_back_round_trip_lock_free() {
+        // Mirrors the lock-free path in lib.rs's `compute_components`: snapshot
+        // the probs Arc + dims, walk outside any lock, write the memo back
+        // guarded by `Arc::ptr_eq`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_png(&dir, 600, 400);
+        let mut images = Images::default();
+        let info = images.open(&path).unwrap();
+        let mut probs = vec![0u8; 600 * 400];
+        probs[100 * 600 + 200] = quantize_prob(0.8);
+        assert!(images.set_probs(info.id, probs));
+
+        assert!(images.components_memo_hit(info.id, 0.5).is_none());
+        let (probs_arc, w, h) = images.probs_snapshot(info.id).unwrap();
+        assert_eq!((w, h), (600, 400));
+
+        let boxes = components_from_probs(&probs_arc, w, h, 0.5);
+        assert_eq!(boxes.len(), 1);
+        images.store_components_memo(info.id, &probs_arc, 0.5, boxes.clone());
+        assert_eq!(images.components_memo_hit(info.id, 0.5), Some(boxes));
+    }
+
+    #[test]
+    fn store_components_memo_discards_a_stale_write() {
+        // A walk snapshot taken before a fresh detect must not clobber the
+        // new detect's memo when it finally writes back: set_probs replaces
+        // the Arc, so Arc::ptr_eq against the OLD snapshot must fail.
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_png(&dir, 600, 400);
+        let mut images = Images::default();
+        let info = images.open(&path).unwrap();
+        let mut probs = vec![0u8; 600 * 400];
+        probs[100 * 600 + 200] = quantize_prob(0.8);
+        assert!(images.set_probs(info.id, probs));
+
+        // Snapshot taken for a walk that's about to run "lock-free".
+        let (stale_probs, w, h) = images.probs_snapshot(info.id).unwrap();
+        let stale_boxes = components_from_probs(&stale_probs, w, h, 0.5);
+
+        // A fresh detect lands while that walk was in flight.
+        let mut fresh = vec![0u8; 600 * 400];
+        fresh[300 * 600 + 400] = quantize_prob(0.9);
+        assert!(images.set_probs(info.id, fresh));
+
+        // The stale walk's write-back must be discarded, not overwrite the
+        // (currently empty, post-set_probs) memo with old-generation data.
+        images.store_components_memo(info.id, &stale_probs, 0.5, stale_boxes);
+        assert!(images.components_memo_hit(info.id, 0.5).is_none());
+
+        // And a close mid-flight is discarded the same way (id gone, not a
+        // stale Arc).
+        let (probs_arc, w, h) = images.probs_snapshot(info.id).unwrap();
+        let boxes = components_from_probs(&probs_arc, w, h, 0.5);
+        images.close(info.id);
+        images.store_components_memo(info.id, &probs_arc, 0.5, boxes);
+        assert!(images.components_memo_hit(info.id, 0.5).is_none());
     }
 
     #[test]

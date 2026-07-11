@@ -401,15 +401,51 @@ fn load_inpainter(state: State<'_, detect::InpainterState>, path: String) -> Res
     state.load(std::path::Path::new(&path))
 }
 
+/// Runs the connected-component walk for `(id, threshold)` for a caller that
+/// wants it OFF the registry lock: a memo hit returns without ever touching
+/// the probs, and a miss clones the probs `Arc` under a brief lock, walks
+/// the CCL in a blocking-pool thread (so it holds neither the lock nor --
+/// when invoked from a sync-turned-async command -- the wry main thread that
+/// tile serving shares), then re-acquires the lock only to write the memo
+/// back. `None` means `id` is unknown or has no probabilities yet, mirroring
+/// [`Images::components`]. Shared by the `components` and
+/// `set_frame_threshold` commands below.
+async fn compute_components(
+    images: &State<'_, Mutex<Images>>,
+    id: u64,
+    threshold: f32,
+) -> Result<Option<Vec<[u32; 4]>>, String> {
+    let snapshot = {
+        let images = images.lock().map_err(|e| e.to_string())?;
+        if let Some(hit) = images.components_memo_hit(id, threshold) {
+            return Ok(Some(hit));
+        }
+        images.probs_snapshot(id)
+    };
+    let Some((probs, width, height)) = snapshot else {
+        return Ok(None);
+    };
+    let probs_for_walk = probs.clone();
+    let boxes = tauri::async_runtime::spawn_blocking(move || {
+        images::components_from_probs(&probs_for_walk, width, height, threshold)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    {
+        let mut images = images.lock().map_err(|e| e.to_string())?;
+        images.store_components_memo(id, &probs, threshold, boxes.clone());
+    }
+    Ok(Some(boxes))
+}
+
 #[tauri::command]
-fn components(
+async fn components(
     images: State<'_, Mutex<Images>>,
     id: u64,
     threshold: f32,
 ) -> Result<Vec<[u32; 4]>, String> {
-    let mut images = images.lock().map_err(|e| e.to_string())?;
-    images
-        .components(id, threshold)
+    compute_components(&images, id, threshold)
+        .await?
         .ok_or_else(|| format!("no detection for image {id}"))
 }
 
@@ -884,10 +920,12 @@ async fn activate_frame(
 /// old roll's generation and is discarded -- a fresh snapshot at command
 /// entry would legitimize it against the new roll. The setter re-checks
 /// under the write lock, closing the mid-command swap window too (this
-/// command takes three separate lock acquisitions -- image-id read,
-/// components computation, sidecar write -- with nothing held across them).
+/// command takes several separate lock acquisitions -- image-id read,
+/// `compute_components`'s memo check/snapshot and, on a miss, its write-back,
+/// sidecar write -- with nothing held across them, and the CCL walk itself
+/// (see `compute_components`) runs off the lock entirely).
 #[tauri::command]
-fn set_frame_threshold(
+async fn set_frame_threshold(
     roll: State<'_, roll::RollState>,
     images: State<'_, Mutex<Images>>,
     index: usize,
@@ -895,13 +933,10 @@ fn set_frame_threshold(
     generation: u64,
 ) -> Result<Option<usize>, String> {
     let (count, bboxes) = match roll.image_id(index)? {
-        Some(id) => {
-            let mut images = images.lock().map_err(|e| e.to_string())?;
-            match images.components(id, threshold) {
-                Some(bboxes) => (Some(bboxes.len()), Some(bboxes)),
-                None => (None, None),
-            }
-        }
+        Some(id) => match compute_components(&images, id, threshold).await? {
+            Some(bboxes) => (Some(bboxes.len()), Some(bboxes)),
+            None => (None, None),
+        },
         None => (None, None),
     };
     if roll.set_threshold_and_components(generation, index, threshold, count, bboxes)? {
