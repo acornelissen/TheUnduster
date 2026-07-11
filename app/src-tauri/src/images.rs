@@ -10,7 +10,7 @@ const CACHE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 /// Upper bound on defect bboxes returned to the UI; see [`Images::components`].
 pub const MAX_COMPONENTS: usize = 2000;
 
-pub use fd_tiles::{build_prob_pyramid_u8, quantize_prob, ProbPyramid};
+pub use fd_tiles::{build_prob_pyramid_u8, quantize_prob, threshold_mask_u8, ProbPyramid};
 
 /// Extract a single-channel tile from a level's data, mirroring
 /// `Pyramid::tile`'s grid/edge-size logic.
@@ -130,9 +130,13 @@ pub fn components_from_probs(
 /// pre-change cached heals still match and replay; a FRESH heal may differ
 /// from an old cached one by boundary pixels. Accepted -- no codec version
 /// bump.
+///
+/// Thin caller: the actual per-pixel pass lives in `fd_tiles::threshold_mask_u8`
+/// (next to `quantize_prob`, its closest neighbor) so it compiles optimized
+/// in dev builds -- at this crate's opt-level 0 it cost ~745ms of the
+/// activation-probe stall on a 168-megapixel frame (TheUnduster-89m).
 pub(crate) fn threshold_mask_from_probs(probs: &[u8], threshold: f32) -> Vec<bool> {
-    let qt = quantize_prob(threshold);
-    probs.iter().map(|&q| q > qt).collect()
+    threshold_mask_u8(probs, quantize_prob(threshold))
 }
 
 pub struct Images {

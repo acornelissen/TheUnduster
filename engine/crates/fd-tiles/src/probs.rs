@@ -29,6 +29,19 @@ pub fn quantize_prob(p: f32) -> u8 {
     (p.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
+/// Membership mask of u8-quantized probabilities strictly above an
+/// already-quantized threshold (`q > qt`; see [`quantize_prob`] for the one
+/// quantization rule and the app crate's `threshold_mask_from_probs` for the
+/// boundary-honesty note on comparing two quantized values). Lives in this
+/// crate, not the app, for the same reason `build_prob_pyramid_u8` does: at
+/// the app crate's dev opt-level 0 this per-pixel pass over a 168-megapixel
+/// frame cost ~745ms, most of the activation-probe stall it sat on (field
+/// report / TheUnduster-89m); this crate is opt-level 3 in dev (see the
+/// workspace `Cargo.toml`'s `[profile.dev.package.fd-tiles]` override).
+pub fn threshold_mask_u8(probs: &[u8], qt: u8) -> Vec<bool> {
+    probs.iter().map(|&q| q > qt).collect()
+}
+
 /// Quantize native-res probabilities and max-pool down the given level dims
 /// (which must match the display pyramid). Max, not mean: a 3px dust speck
 /// must stay visible when zoomed out.
@@ -113,6 +126,26 @@ mod tests {
         assert!(quantize_prob(at + 1.0 / 255.0) > qt);
         // A value a full quantum below must strictly fall below qt.
         assert!(quantize_prob(at - 1.0 / 255.0) < qt);
+    }
+
+    #[test]
+    fn threshold_mask_u8_is_strictly_greater_than_qt() {
+        let qt = quantize_prob(0.5);
+        assert_eq!(qt, 128);
+        let probs = vec![0, 127, 128, 129, 255];
+        let mask = threshold_mask_u8(&probs, qt);
+        assert_eq!(mask, vec![false, false, false, true, true]);
+    }
+
+    #[test]
+    fn threshold_mask_u8_matches_the_length_and_order_of_its_input() {
+        let probs: Vec<u8> = (0..=255).collect();
+        let qt = 200;
+        let mask = threshold_mask_u8(&probs, qt);
+        assert_eq!(mask.len(), probs.len());
+        for (i, &p) in probs.iter().enumerate() {
+            assert_eq!(mask[i], p > qt, "index {i}");
+        }
     }
 
     #[test]
