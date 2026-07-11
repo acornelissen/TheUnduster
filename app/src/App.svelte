@@ -204,6 +204,11 @@
   let modelStatus: ModelStatus = $state("loaded");
   let modelReceived = $state(0);
   let modelTotal: number | null = $state(null);
+  // True between clicking the download's Cancel button and the terminal
+  // model-cancelled/-error/-done event: the abort is cooperative (the
+  // backend notices between chunks), so the button reads "Cancelling" and
+  // goes inert in the meantime.
+  let modelCancelRequested = $state(false);
 
   let roll: RollInfo | null = $state(null);
   let currentIndex = $state(0);
@@ -741,6 +746,43 @@
       modelStatus = "loaded";
       modelReceived = 0;
       modelTotal = null;
+      // A cancel that raced completion: the model made it, better outcome.
+      modelCancelRequested = false;
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  $effect(() => {
+    // The operator's own cancel: same state reset as model-error, but a
+    // quiet activity-log line instead of an error toast.
+    const un = listen("model-cancelled", () => {
+      modelReceived = 0;
+      modelTotal = null;
+      modelCancelRequested = false;
+      activityLog = pushLog(
+        activityLog,
+        {
+          id: nextLogId++,
+          time: new Date().toLocaleTimeString(),
+          level: "info",
+          message: "Healing model download cancelled",
+        },
+        100,
+      );
+      (async () => {
+        try {
+          const s = await invoke<"loaded" | "available" | "missing" | "fixture">(
+            "inpainter_status",
+          );
+          // Same guard as model-error's refetch: a retry click may already
+          // be downloading again.
+          if (modelStatus !== "downloading") modelStatus = s;
+        } catch (e2) {
+          pushError(String(e2));
+        }
+      })();
     });
     return () => {
       un.then((f) => f());
@@ -752,6 +794,7 @@
       pushError(e.payload.message);
       modelReceived = 0;
       modelTotal = null;
+      modelCancelRequested = false;
       (async () => {
         try {
           const s = await invoke<"loaded" | "available" | "missing" | "fixture">(
@@ -1418,6 +1461,7 @@
     modelStatus = "downloading";
     modelReceived = 0;
     modelTotal = null;
+    modelCancelRequested = false;
     try {
       await invoke("download_inpaint_model");
     } catch (e) {
@@ -1438,6 +1482,16 @@
 
   function modelProgressText(): string {
     return formatModelProgress(modelReceived, modelTotal);
+  }
+
+  async function cancelModelDownload() {
+    modelCancelRequested = true;
+    try {
+      await invoke("cancel_model_download");
+    } catch (e) {
+      modelCancelRequested = false;
+      pushError(String(e));
+    }
   }
 
   function strokeKey(): string | null {
@@ -1867,6 +1921,14 @@
               </div>
             {/if}
             <span class="model-progress-text">{modelProgressText()}</span>
+            <button
+              class="btn"
+              onclick={cancelModelDownload}
+              disabled={modelCancelRequested}
+              aria-label="Cancel healing model download"
+            >
+              {modelCancelRequested ? "Cancelling" : "Cancel"}
+            </button>
           </div>
         {:else}
           <button class="btn" onclick={downloadModel}>
