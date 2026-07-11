@@ -646,18 +646,26 @@
         modelStatus = "missing";
         return;
       }
-      // A "fixture" status alone already tells the operator real LaMa isn't
-      // loaded; this fetches the WHY when it's a genuine load failure (a
-      // corrupt/incompatible lama.onnx on disk) rather than a plain missing
-      // file, so that surprising case reaches the error toast/log instead
-      // of staying an eprintln-only dead end on the backend.
-      if (modelStatus === "fixture") {
-        try {
-          const loadError = await invoke<string | null>("inpainter_load_error");
-          if (loadError) pushError(`healing model failed to load: ${loadError}`);
-        } catch (e) {
-          pushError(String(e));
-        }
+      // Fetch the load-error detail regardless of which status came back,
+      // not just for "fixture". The backend records a load failure (a
+      // corrupt/incompatible lama.onnx on disk) unconditionally, but the
+      // "fixture" status it would otherwise pair with is debug-only -- the
+      // autoload that falls back to the dev stub is #[cfg(debug_assertions)].
+      // In a release build the same failed load leaves the file on disk and
+      // nothing loaded, i.e. status "available", so gating on "fixture"
+      // would leave a packaged operator with the exact eprintln-only dead
+      // end this whole change set is meant to close. `inpainter_load_error`
+      // returns None cheaply in every no-failure case (including the common
+      // "loaded"/"missing" ones), so an unconditional fetch only ever toasts
+      // when there is genuinely something to say. This effect runs once at
+      // mount (it reads no reactive state synchronously), so a single
+      // recorded error toasts exactly once -- no "already shown" guard
+      // needed.
+      try {
+        const loadError = await invoke<string | null>("inpainter_load_error");
+        if (loadError) pushError(`healing model failed to load: ${loadError}`);
+      } catch (e) {
+        pushError(String(e));
       }
     })();
   });
