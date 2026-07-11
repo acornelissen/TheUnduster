@@ -3,6 +3,7 @@
 //! 512px tiles, 64px overlap (stride 448), edge-replicate padding,
 //! probability averaging in overlaps.
 
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use fd_io::ImageBuf;
@@ -26,6 +27,10 @@ pub enum InferError {
     Run(String),
     #[error("model has unsupported input channels: {0}")]
     Channels(i64),
+    /// The progress callback returned `Break`: the caller asked for a
+    /// cooperative abort. Mirrors `fd_heal::HealError::Cancelled`.
+    #[error("detect cancelled")]
+    Cancelled,
 }
 
 pub struct Detector {
@@ -159,7 +164,7 @@ impl Detector {
     }
 
     pub fn probabilities(&mut self, img: &ImageBuf) -> Result<Vec<f32>, InferError> {
-        self.probabilities_with_progress(img, &mut |_, _| {})
+        self.probabilities_with_progress(img, &mut |_, _| ControlFlow::Continue(()))
     }
 
     /// `probabilities` with a per-tile progress callback `(done, total)`,
@@ -168,10 +173,14 @@ impl Detector {
     /// CoreML EP the whole detect still takes several seconds, so the
     /// callback lets the app show motion instead of a frozen "Detecting..."
     /// label.
+    ///
+    /// The callback's return value is a cooperative stop signal, again
+    /// mirroring `heal_with_progress`: `Break` aborts after the current tile
+    /// with `InferError::Cancelled` and no probabilities are returned.
     pub fn probabilities_with_progress(
         &mut self,
         img: &ImageBuf,
-        progress: &mut dyn FnMut(usize, usize),
+        progress: &mut dyn FnMut(usize, usize) -> ControlFlow<()>,
     ) -> Result<Vec<f32>, InferError> {
         let planes = planes_for(img, self.in_ch);
         let (w, h) = (img.width as usize, img.height as usize);
@@ -223,7 +232,9 @@ impl Detector {
                     }
                 }
                 done += 1;
-                progress(done, total);
+                if progress(done, total).is_break() {
+                    return Err(InferError::Cancelled);
+                }
                 if x0 + stride >= w.saturating_sub(OVERLAP).max(1) {
                     break;
                 }

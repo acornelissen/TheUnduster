@@ -1,3 +1,4 @@
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -45,7 +46,7 @@ impl DetectorState {
     }
 
     pub fn detect(&self, img: &ImageBuf) -> Result<Vec<f32>, String> {
-        self.detect_with_progress(img, &mut |_, _| {})
+        self.detect_with_progress(img, &mut |_, _| ControlFlow::Continue(()))
     }
 
     /// `detect` with a per-tile progress callback `(done, total)`, threaded
@@ -58,7 +59,7 @@ impl DetectorState {
     pub fn detect_with_progress(
         &self,
         img: &ImageBuf,
-        progress: &mut dyn FnMut(usize, usize),
+        progress: &mut dyn FnMut(usize, usize) -> ControlFlow<()>,
     ) -> Result<Vec<f32>, String> {
         let mut guard = self.0.lock().map_err(|e| e.to_string())?;
         match guard.as_mut() {
@@ -80,7 +81,7 @@ impl DetectorState {
     /// detected" the same observation, closing that race. Errors exactly
     /// like `detect()` when no detector is loaded.
     pub fn detect_hashed(&self, img: &ImageBuf) -> Result<(Vec<f32>, [u8; 32]), String> {
-        self.detect_hashed_with_progress(img, &mut |_, _| {})
+        self.detect_hashed_with_progress(img, &mut |_, _| ControlFlow::Continue(()))
     }
 
     /// `detect_hashed` with a per-tile progress callback `(done, total)`.
@@ -91,7 +92,7 @@ impl DetectorState {
     pub fn detect_hashed_with_progress(
         &self,
         img: &ImageBuf,
-        progress: &mut dyn FnMut(usize, usize),
+        progress: &mut dyn FnMut(usize, usize) -> ControlFlow<()>,
     ) -> Result<(Vec<f32>, [u8; 32]), String> {
         let mut guard = self.0.lock().map_err(|e| e.to_string())?;
         match guard.as_mut() {
@@ -292,7 +293,10 @@ mod tests {
         };
         let mut calls: Vec<(usize, usize)> = Vec::new();
         let probs = state
-            .detect_with_progress(&img, &mut |done, total| calls.push((done, total)))
+            .detect_with_progress(&img, &mut |done, total| {
+                calls.push((done, total));
+                ControlFlow::Continue(())
+            })
             .unwrap();
         assert_eq!(probs.len(), 64 * 48);
         assert!(!calls.is_empty());
@@ -331,7 +335,10 @@ mod tests {
         };
         let mut calls: Vec<(usize, usize)> = Vec::new();
         let (probs, hash) = state
-            .detect_hashed_with_progress(&img, &mut |done, total| calls.push((done, total)))
+            .detect_hashed_with_progress(&img, &mut |done, total| {
+                calls.push((done, total));
+                ControlFlow::Continue(())
+            })
             .unwrap();
         assert_eq!(probs.len(), 64 * 48);
         assert_eq!(hash, expected_hash);
@@ -358,7 +365,7 @@ mod tests {
             exif: None,
         };
         assert!(state
-            .detect_hashed_with_progress(&img, &mut |_, _| {})
+            .detect_hashed_with_progress(&img, &mut |_, _| ControlFlow::Continue(()))
             .unwrap_err()
             .contains("no detector"));
     }

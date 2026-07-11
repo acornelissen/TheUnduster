@@ -1,3 +1,4 @@
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 
 use fd_infer::{Detector, Ep};
@@ -84,7 +85,10 @@ fn progress_callback_fires_once_per_tile_with_monotonic_done() {
     let mut det = Detector::load(&fixtures().join("tiny-detector.onnx"), Ep::Cpu).unwrap();
     let mut calls: Vec<(usize, usize)> = Vec::new();
     let probs = det
-        .probabilities_with_progress(&img, &mut |done, total| calls.push((done, total)))
+        .probabilities_with_progress(&img, &mut |done, total| {
+            calls.push((done, total));
+            ControlFlow::Continue(())
+        })
         .unwrap();
     assert_eq!(probs.len(), 600 * 600);
 
@@ -105,9 +109,36 @@ fn probabilities_without_progress_matches_the_progress_variant() {
     let mut det = Detector::load(&fixtures().join("tiny-detector.onnx"), Ep::Cpu).unwrap();
     let via_wrapper = det.probabilities(&img).unwrap();
     let via_progress = det
-        .probabilities_with_progress(&img, &mut |_, _| {})
+        .probabilities_with_progress(&img, &mut |_, _| ControlFlow::Continue(()))
         .unwrap();
     assert_eq!(via_wrapper, via_progress);
+}
+
+/// A Break from the per-tile callback aborts the detect with
+/// InferError::Cancelled after the current tile -- an operator cancelling a
+/// queued-roll detect should not wait out hundreds of remaining tiles.
+#[test]
+fn break_from_progress_cancels_the_detect() {
+    let img = ImageBuf {
+        width: 600,
+        height: 600,
+        channels: 1,
+        data: PixelData::U8(vec![128; 600 * 600]),
+        icc: None,
+        exif: None,
+    };
+    let mut det = Detector::load(&fixtures().join("tiny-detector.onnx"), Ep::Cpu).unwrap();
+    let mut calls = 0usize;
+    let err = det
+        .probabilities_with_progress(&img, &mut |_, _| {
+            calls += 1;
+            ControlFlow::Break(())
+        })
+        .unwrap_err();
+    assert!(matches!(err, fd_infer::InferError::Cancelled));
+    // Break after the first tile stops the loop: no further callbacks on a
+    // 2x2 grid that would otherwise fire 4 times.
+    assert_eq!(calls, 1);
 }
 
 #[test]

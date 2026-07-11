@@ -161,6 +161,7 @@ async fn run_detect(
         // run_heal's per-defect heal-progress emit.
         let (probs, hash) = detector.detect_hashed_with_progress(&img, &mut |done, total| {
             let _ = app_for_progress.emit("detect-progress", DetectProgress { id, done, total });
+            std::ops::ControlFlow::Continue(())
         })?;
         // Quantize once at the fresh-detect boundary; the registry, the
         // disk cache, and the display pyramid all share these u8 bytes.
@@ -1640,6 +1641,7 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                                         DetectProgress { id, done, total },
                                     );
                                 }
+                                std::ops::ControlFlow::Continue(())
                             })?;
                         // Quantize once at the fresh-detect boundary (the
                         // cache-hit arm above is already u8 from disk).
