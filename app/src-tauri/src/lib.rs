@@ -1641,6 +1641,13 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                                         DetectProgress { id, done, total },
                                     );
                                 }
+                                // Cooperative abort check-in, once per tile.
+                                if app_for_progress
+                                    .state::<jobs::JobQueue>()
+                                    .cancel_requested()
+                                {
+                                    return std::ops::ControlFlow::Break(());
+                                }
                                 std::ops::ControlFlow::Continue(())
                             })?;
                         // Quantize once at the fresh-detect boundary (the
@@ -1893,6 +1900,13 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                             let _ = app_for_progress
                                 .emit("heal-progress", HealProgress { id, done, total });
                         }
+                        // Cooperative abort check-in, once per defect.
+                        if app_for_progress
+                            .state::<jobs::JobQueue>()
+                            .cancel_requested()
+                        {
+                            return std::ops::ControlFlow::Break(());
+                        }
                         std::ops::ControlFlow::Continue(())
                     })
                     .map_err(|e| e.to_string())?;
@@ -1960,6 +1974,12 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
             };
 
             if let Some((original, healed, mask)) = registry_export {
+                // Last check-in before the file write: a write in flight is
+                // never interrupted (no partial files), so cancellation for
+                // the already-healed fast path means not starting it.
+                if app.state::<jobs::JobQueue>().cancel_requested() {
+                    return Err("export cancelled".to_string());
+                }
                 let dest_for_write = dest.clone();
                 tauri::async_runtime::spawn_blocking(move || {
                     export::export_healed(&original, &healed, &mask, &dest_for_write).map(|_| ())
@@ -1990,12 +2010,22 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                             },
                         );
                     };
+                    // Between-stage abort check-ins; the detect and heal
+                    // stages additionally check per tile / per defect via
+                    // their progress callbacks. The file write itself is
+                    // never interrupted, so a cancelled export leaves no
+                    // partial file -- it just never starts writing.
+                    let cancelled =
+                        || app_for_stages.state::<jobs::JobQueue>().cancel_requested();
                     // Stamp BEFORE decoding -- see run_heal's identical comment.
                     // A stat failure skips the heal-cache interaction (read AND
                     // write); it must never fail the export.
                     let stamp = stamp_or_skip(&path_for_task);
                     let image = images::Images::decode_stage(&path_for_task)?;
                     masks::validate_strokes(&strokes)?;
+                    if cancelled() {
+                        return Err("export cancelled".to_string());
+                    }
 
                     inpainter.with_inpainter_hashed(|pair| {
                         let inpainter_hash = pair.as_ref().map(|(_, h)| *h).unwrap_or([0u8; 32]);
@@ -2014,6 +2044,9 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                             if let Some((healed, mask)) =
                                 cache::read_heal(&cache_path, &image, provenance)
                             {
+                                if cancelled() {
+                                    return Err("export cancelled".to_string());
+                                }
                                 stage("writing");
                                 return export::export_healed(&image, &healed, &mask, &dest)
                                     .map(|_| ());
@@ -2025,7 +2058,15 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                         // exported frame's fresh mask must match what an
                         // in-app heal (u8 registry probs) would produce.
                         let probs: Vec<u8> = detector
-                            .detect(&image)?
+                            .detect_with_progress(&image, &mut |_, _| {
+                                // No narration for the transient detect (the
+                                // stage marker covers it); the callback is
+                                // here purely as the per-tile abort check-in.
+                                if cancelled() {
+                                    return std::ops::ControlFlow::Break(());
+                                }
+                                std::ops::ControlFlow::Continue(())
+                            })?
                             .iter()
                             .map(|&p| quantize_prob(p))
                             .collect();
@@ -2050,6 +2091,10 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                                     generation,
                                 },
                             );
+                            // Cooperative abort check-in, once per defect.
+                            if cancelled() {
+                                return std::ops::ControlFlow::Break(());
+                            }
                             std::ops::ControlFlow::Continue(())
                         })
                         .map_err(|e| e.to_string())?;
@@ -2064,6 +2109,9 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                                     "[cache] heal write failed for frame {index} ({file_name_for_log}): {_e}"
                                 );
                             }
+                        }
+                        if cancelled() {
+                            return Err("export cancelled".to_string());
                         }
                         stage("writing");
                         export::export_healed(&image, &copy, &mask, &dest).map(|_| ())
@@ -2218,6 +2266,65 @@ fn queue_snapshot(queue: State<'_, jobs::JobQueue>) -> Result<Vec<jobs::Job>, St
     queue.snapshot()
 }
 
+/// Cancels one job: removed outright if it is still queued (job-cancelled
+/// emitted immediately), or flagged for cooperative abort if it is the one
+/// running (the worker emits job-cancelled once the job actually stops --
+/// the frontend shows "cancelling" until then). The job identity is built
+/// against the CURRENT generation: the queue panel only shows current-roll
+/// jobs, and a stale-generation straggler is already discarded by the
+/// worker's top-of-loop check.
+#[tauri::command]
+fn cancel_job(
+    app: tauri::AppHandle,
+    roll: State<'_, roll::RollState>,
+    queue: State<'_, jobs::JobQueue>,
+    kind: jobs::JobKind,
+    index: usize,
+) -> Result<(), String> {
+    let generation = roll.generation();
+    let job = jobs::Job {
+        kind,
+        index,
+        generation,
+    };
+    if queue.remove(job)? {
+        let _ = app.emit(
+            "job-cancelled",
+            JobEvent {
+                index,
+                kind,
+                generation,
+            },
+        );
+        return Ok(());
+    }
+    // Not queued: request an abort if it is the running job. A miss on both
+    // (the job finished in the meantime) is not an error -- the outcome the
+    // operator wanted already happened.
+    queue.request_cancel(job);
+    Ok(())
+}
+
+/// Cancels everything: drains the queue (one job-cancelled per dropped job,
+/// each under its own generation so the frontend's listeners apply their
+/// usual filter) and requests a cooperative abort of the running job,
+/// whichever it is.
+#[tauri::command]
+fn cancel_all_jobs(app: tauri::AppHandle, queue: State<'_, jobs::JobQueue>) -> Result<(), String> {
+    for job in queue.drain()? {
+        let _ = app.emit(
+            "job-cancelled",
+            JobEvent {
+                index: job.index,
+                kind: job.kind,
+                generation: job.generation,
+            },
+        );
+    }
+    queue.request_cancel_running();
+    Ok(())
+}
+
 #[tauri::command]
 fn enqueue_exports(
     app: tauri::AppHandle,
@@ -2298,10 +2405,33 @@ fn spawn_worker_if_idle(app: &tauri::AppHandle, spawn_generation: u64) {
                     continue;
                 }
                 let generation = job.generation;
-                match run_job(&app_for_task, generation, job).await {
+                // begin_job records this job as the cancel target (and clears
+                // any request left over from the previous job); the flag is
+                // read back BEFORE end_job clears it, so "did the operator
+                // ask this job to stop" survives into the emit decision.
+                app_for_task.state::<jobs::JobQueue>().begin_job(job);
+                let outcome = run_job(&app_for_task, generation, job).await;
+                let was_cancelled = app_for_task.state::<jobs::JobQueue>().cancel_requested();
+                app_for_task.state::<jobs::JobQueue>().end_job();
+                match outcome {
                     Ok(()) => {
                         let _ = app_for_task.emit(
                             "job-done",
+                            JobEvent {
+                                index: job.index,
+                                kind: job.kind,
+                                generation,
+                            },
+                        );
+                    }
+                    // A job that failed after a cancel request stopped
+                    // because the operator asked it to -- report that, not a
+                    // scary error. Decided on the flag rather than by
+                    // matching error strings: the engine's Cancelled errors
+                    // arrive here stringified.
+                    Err(_) if was_cancelled => {
+                        let _ = app_for_task.emit(
+                            "job-cancelled",
                             JobEvent {
                                 index: job.index,
                                 kind: job.kind,
@@ -2473,6 +2603,8 @@ pub fn run() {
             enqueue_job,
             enqueue_exports,
             queue_snapshot,
+            cancel_job,
+            cancel_all_jobs,
             models::inpainter_status,
             models::inpainter_load_error,
             models::download_inpaint_model

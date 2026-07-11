@@ -36,6 +36,17 @@ pub struct JobQueue {
     queue: Mutex<VecDeque<Job>>,
     pub running: AtomicBool,
     pinned: Mutex<Option<u64>>,
+    /// The job the worker is currently executing, if any. Both the worker
+    /// (begin_job/end_job) and cancel requests (request_cancel*) take this
+    /// lock, so "does this cancel target the job that is running right now"
+    /// is decided under one guard -- a cancel aimed at a job that just
+    /// finished can never leak onto the next job the worker picks up.
+    running_job: Mutex<Option<Job>>,
+    /// Cooperative abort flag for the running job. Set only under the
+    /// `running_job` lock (see request_cancel), cleared by begin_job before
+    /// each job starts; job bodies read it lock-free from their progress
+    /// callbacks and between export stages.
+    cancel_requested: AtomicBool,
 }
 
 impl JobQueue {
@@ -79,6 +90,79 @@ impl JobQueue {
         let count = queue.len();
         queue.clear();
         Ok(count)
+    }
+
+    /// Removes the job equal to `job` (kind, index AND generation must all
+    /// match) from the pending queue. Returns true if it was there. The
+    /// running job is not in the queue, so this never touches it -- that is
+    /// `request_cancel`'s side of the split.
+    pub fn remove(&self, job: Job) -> Result<bool, String> {
+        let mut queue = self.queue.lock().map_err(|e| e.to_string())?;
+        match queue.iter().position(|&j| j == job) {
+            Some(pos) => {
+                queue.remove(pos);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Empties the queue and returns the removed jobs in order (front
+    /// first), so cancel-all can emit a job-cancelled event per dropped job
+    /// -- `clear` only counts them.
+    pub fn drain(&self) -> Result<Vec<Job>, String> {
+        let mut queue = self.queue.lock().map_err(|e| e.to_string())?;
+        Ok(queue.drain(..).collect())
+    }
+
+    /// Records `job` as the one the worker is executing and clears any
+    /// cancel request left over from the previous job, so a cancel that
+    /// arrived too late to stop its target can never abort an innocent
+    /// successor.
+    pub fn begin_job(&self, job: Job) {
+        let mut running = self.running_job.lock().unwrap_or_else(|e| e.into_inner());
+        self.cancel_requested.store(false, Ordering::SeqCst);
+        *running = Some(job);
+    }
+
+    /// Clears the running-job record (and the cancel flag, for symmetry)
+    /// once the worker is done with it.
+    pub fn end_job(&self) {
+        let mut running = self.running_job.lock().unwrap_or_else(|e| e.into_inner());
+        self.cancel_requested.store(false, Ordering::SeqCst);
+        *running = None;
+    }
+
+    /// Requests a cooperative abort of `job` IF it is the one currently
+    /// running. Returns true when the request landed. Decided under the
+    /// running_job lock -- see that field's doc comment for the race this
+    /// closes.
+    pub fn request_cancel(&self, job: Job) -> bool {
+        let running = self.running_job.lock().unwrap_or_else(|e| e.into_inner());
+        if *running == Some(job) {
+            self.cancel_requested.store(true, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Requests a cooperative abort of whatever job is running, if any --
+    /// cancel-all's counterpart to `request_cancel`.
+    pub fn request_cancel_running(&self) -> bool {
+        let running = self.running_job.lock().unwrap_or_else(|e| e.into_inner());
+        if running.is_some() {
+            self.cancel_requested.store(true, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// True when the running job has been asked to stop. Job bodies poll
+    /// this from progress callbacks and between export stages.
+    pub fn cancel_requested(&self) -> bool {
+        self.cancel_requested.load(Ordering::SeqCst)
     }
 
     /// Returns the number of jobs currently in the queue.
@@ -218,6 +302,76 @@ mod tests {
         // any of the other kinds.
         assert!(!q.enqueue(job(JobKind::Prefetch, 1), false).unwrap());
         assert_eq!(q.len().unwrap(), 4);
+    }
+
+    #[test]
+    fn remove_takes_out_exactly_the_matching_job() {
+        let q = JobQueue::default();
+        q.enqueue(job(JobKind::Heal, 1), false).unwrap();
+        q.enqueue(job(JobKind::Export, 1), false).unwrap();
+        // Wrong kind, wrong index, wrong generation: all no-ops.
+        assert!(!q.remove(job(JobKind::Detect, 1)).unwrap());
+        assert!(!q.remove(job(JobKind::Heal, 2)).unwrap());
+        assert!(!q.remove(job_gen(JobKind::Heal, 1, 9)).unwrap());
+        assert_eq!(q.len().unwrap(), 2);
+        // Exact match removes only that job.
+        assert!(q.remove(job(JobKind::Heal, 1)).unwrap());
+        assert_eq!(q.snapshot().unwrap(), vec![job(JobKind::Export, 1)]);
+        // Removing it again is a no-op.
+        assert!(!q.remove(job(JobKind::Heal, 1)).unwrap());
+    }
+
+    #[test]
+    fn drain_returns_the_jobs_it_empties_in_order() {
+        let q = JobQueue::default();
+        q.enqueue(job(JobKind::Detect, 0), false).unwrap();
+        q.enqueue(job(JobKind::Heal, 1), false).unwrap();
+        assert_eq!(
+            q.drain().unwrap(),
+            vec![job(JobKind::Detect, 0), job(JobKind::Heal, 1)]
+        );
+        assert!(q.is_empty().unwrap());
+        assert!(q.drain().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancel_targets_only_the_job_that_is_actually_running() {
+        let q = JobQueue::default();
+        // Nothing running: a cancel request lands nowhere.
+        assert!(!q.request_cancel(job(JobKind::Heal, 1)));
+        assert!(!q.cancel_requested());
+
+        q.begin_job(job(JobKind::Heal, 1));
+        // Mismatches never set the flag.
+        assert!(!q.request_cancel(job(JobKind::Heal, 2)));
+        assert!(!q.request_cancel(job(JobKind::Export, 1)));
+        assert!(!q.request_cancel(job_gen(JobKind::Heal, 1, 9)));
+        assert!(!q.cancel_requested());
+        // The exact running job sets it.
+        assert!(q.request_cancel(job(JobKind::Heal, 1)));
+        assert!(q.cancel_requested());
+        q.end_job();
+        assert!(!q.cancel_requested());
+    }
+
+    #[test]
+    fn begin_job_clears_a_stale_cancel_from_the_previous_job() {
+        let q = JobQueue::default();
+        q.begin_job(job(JobKind::Heal, 1));
+        assert!(q.request_cancel(job(JobKind::Heal, 1)));
+        // The worker moves on without end_job (e.g. the job noticed the flag
+        // and returned): the next begin_job must not inherit the request.
+        q.begin_job(job(JobKind::Heal, 2));
+        assert!(!q.cancel_requested());
+    }
+
+    #[test]
+    fn request_cancel_running_cancels_whatever_runs() {
+        let q = JobQueue::default();
+        assert!(!q.request_cancel_running());
+        q.begin_job(job(JobKind::Export, 3));
+        assert!(q.request_cancel_running());
+        assert!(q.cancel_requested());
     }
 
     #[test]

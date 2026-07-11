@@ -45,6 +45,11 @@ impl DetectorState {
         Ok(())
     }
 
+    // No production caller since the export path switched to
+    // detect_with_progress for its per-tile cancellation check-in; kept for
+    // API symmetry and direct testing, same as detect_with_progress was
+    // before it gained that caller.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn detect(&self, img: &ImageBuf) -> Result<Vec<f32>, String> {
         self.detect_with_progress(img, &mut |_, _| ControlFlow::Continue(()))
     }
