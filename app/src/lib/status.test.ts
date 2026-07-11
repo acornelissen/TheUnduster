@@ -10,6 +10,7 @@ describe("composeActivity", () => {
     isHealing: false,
     healProgress: null,
     isDetecting: false,
+    detectProgress: null,
     roll: false,
     scanDone: true,
     scannedCount: 0,
@@ -66,6 +67,34 @@ describe("composeActivity", () => {
 
   it("falls back to detecting when nothing higher-priority is active", () => {
     expect(composeActivity({ ...base, isDetecting: true })).toBe("detecting");
+  });
+
+  it("shows tile progress while detecting once it is available", () => {
+    expect(
+      composeActivity({
+        ...base,
+        isDetecting: true,
+        detectProgress: { done: 12, total: 870 },
+      }),
+    ).toBe("detecting (12/870 tiles)");
+  });
+
+  it("renders detecting without tile counts when none are available yet", () => {
+    expect(composeActivity({ ...base, isDetecting: true, detectProgress: null })).toBe(
+      "detecting",
+    );
+  });
+
+  it("prioritizes current-frame healing over a detecting tile progress", () => {
+    expect(
+      composeActivity({
+        ...base,
+        isHealing: true,
+        healProgress: { done: 34, total: 87 },
+        isDetecting: true,
+        detectProgress: { done: 12, total: 870 },
+      }),
+    ).toBe("healing 34/87");
   });
 
   it("falls back to roll scanning when the roll has not finished scanning", () => {

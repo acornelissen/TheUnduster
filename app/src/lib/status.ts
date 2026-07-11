@@ -11,6 +11,7 @@ export interface ActivityInput {
   isHealing: boolean;
   healProgress: { done: number; total: number } | null;
   isDetecting: boolean;
+  detectProgress: { done: number; total: number } | null;
   roll: boolean;
   scanDone: boolean;
   scannedCount: number;
@@ -33,7 +34,9 @@ export function composeActivity(input: ActivityInput): string | null {
       : "healing";
   }
   if (input.isDetecting) {
-    return "detecting";
+    return input.detectProgress
+      ? `detecting (${input.detectProgress.done}/${input.detectProgress.total} tiles)`
+      : "detecting";
   }
   if (input.roll && !input.scanDone) {
     return `scanning ${input.scannedCount}/${input.totalCount}`;

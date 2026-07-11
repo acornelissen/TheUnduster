@@ -123,6 +123,7 @@
   let detecting = $state(false);
   let healing = $state(false);
   let healProgress: { done: number; total: number } | null = $state(null);
+  let detectProgress: { done: number; total: number } | null = $state(null);
   // Roll-mode queue state: index -> { state, kind }, driven entirely by
   // job-queued/job-started/job-done/job-error/queue-idle. Single-image mode
   // never touches this (it invokes detect/heal directly and awaits them).
@@ -155,6 +156,21 @@
     const un = listen<{ id: number; done: number; total: number }>("heal-progress", (e) => {
       if (info && e.payload.id === info.id) {
         healProgress = { done: e.payload.done, total: e.payload.total };
+      }
+      // Queue attribution: the worker is single-flight, so this event always
+      // belongs to whichever job is currently running -- no id/index guard
+      // needed here (unlike the displayed-frame branch above).
+      queueProgress = { done: e.payload.done, total: e.payload.total };
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  $effect(() => {
+    const un = listen<{ id: number; done: number; total: number }>("detect-progress", (e) => {
+      if (info && e.payload.id === info.id) {
+        detectProgress = { done: e.payload.done, total: e.payload.total };
       }
       // Queue attribution: the worker is single-flight, so this event always
       // belongs to whichever job is currently running -- no id/index guard
@@ -1091,6 +1107,7 @@
       return;
     }
     detecting = true;
+    detectProgress = null;
     try {
       // The report's `components_at_half` is a fixed-0.5 count used only for
       // the backend's own bookkeeping; the immediately following
@@ -1293,6 +1310,7 @@
       isHealing,
       healProgress,
       isDetecting,
+      detectProgress,
       roll: r !== null,
       scanDone,
       scannedCount: r ? r.frames.filter((f) => f.defect_count !== null).length : 0,
