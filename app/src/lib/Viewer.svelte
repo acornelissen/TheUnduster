@@ -74,7 +74,14 @@
   // actually changed" apart from "detected flipped true/false at the same
   // threshold", so a probe-driven detected flip doesn't schedule a redundant
   // refetch of data it was just handed.
-  let lastFetchedThreshold: number | null = null;
+  //
+  // $state, deliberately: the slider $effect's equality gate reads this, so
+  // a refetch that RESOLVES at a threshold the slider has since left (drag
+  // A -> B, B's fetch lands after a return to A) reruns the effect, which
+  // sees the mismatch and schedules the corrective refetch. As a plain
+  // variable the resolve-time write would be invisible and B's boxes would
+  // sit undimmed under an A slider with nothing left to fix them.
+  let lastFetchedThreshold: number | null = $state(null);
   // True from the moment a slider-driven refetch is (re)scheduled until
   // refreshDetections resolves; drives the dimmed defect-ring paint below so
   // the operator can see the rings are stale rather than trusting circles
@@ -239,6 +246,13 @@
       refreshTimer = setTimeout(() => {
         refreshDetections(threshold);
       }, 250);
+    } else {
+      // A slider wiggle back to the fetched threshold within the debounce
+      // (A -> B -> A) lands here having cleared B's timer above; the rings
+      // aren't stale -- detections match this threshold -- so undim them.
+      // Without this the dimmed paint would persist until the next real
+      // refetch resolved.
+      refreshPending = false;
     }
     return () => clearTimeout(refreshTimer);
   });

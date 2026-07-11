@@ -882,10 +882,19 @@
    * frame. */
   function probeDetected(id: number) {
     async function attempt(): Promise<boolean> {
+      // Captured ONCE, before the await: these boxes are the answer for THIS
+      // threshold. Reading overlay.threshold again after the await would,
+      // if the operator moved the slider mid-probe, record T1's boxes as
+      // current for T2 -- and the slider effect's lastFetchedThreshold
+      // equality check would then suppress the corrective refetch forever.
+      // Recording the true fetch threshold keeps that check honest: a
+      // mid-await slider move leaves it different from the live threshold,
+      // so the effect refetches as it should.
+      const threshold = overlay.threshold;
       try {
         const components = await invoke<[number, number, number, number][]>("components", {
           id,
-          threshold: overlay.threshold,
+          threshold,
         });
         if (info?.id !== id) return true; // stale: a newer frame is active, but not a miss
         // Fill the Viewer's live detections BEFORE flipping `detected`:
@@ -895,7 +904,7 @@
         // also feeds liveDefectCount via onDetectionsChange.) Synchronous --
         // no invoke, so no stale-frame check needed between this and the
         // flip below.
-        viewer?.setDetections(components, overlay.threshold);
+        viewer?.setDetections(components, threshold);
         detected = true;
         liveDefectCount = components.length;
         return true;
