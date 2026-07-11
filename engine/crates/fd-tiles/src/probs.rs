@@ -14,20 +14,37 @@ pub struct ProbPyramid {
     pub levels: Vec<ProbLevel>,
 }
 
+/// The one quantization rule for detection probabilities, shared by every
+/// caller that turns an f32 probability into the u8 the registry, the disk
+/// cache, and the display pyramid all store: clamp to `[0, 1]` (guards NaN
+/// and any out-of-range detector output), scale to `[0, 255]`, round to the
+/// nearest integer. `f32::round` breaks ties away from zero, which for a
+/// non-negative input after the clamp is the same as the codebase's older
+/// `+ 0.5` truncation -- restated as `.round()` here because it reads as the
+/// canonical rounding rule rather than a hand-rolled equivalent.
+pub fn quantize_prob(p: f32) -> u8 {
+    (p.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
 /// Quantize native-res probabilities and max-pool down the given level dims
 /// (which must match the display pyramid). Max, not mean: a 3px dust speck
 /// must stay visible when zoomed out.
 pub fn build_prob_pyramid(probs: &[f32], level_dims: &[(u32, u32)]) -> ProbPyramid {
+    let quantized: Vec<u8> = probs.iter().map(|&p| quantize_prob(p)).collect();
+    build_prob_pyramid_u8(&quantized, level_dims)
+}
+
+/// Same as [`build_prob_pyramid`] but for probabilities already quantized to
+/// u8 -- the registry restore path (disk cache is already u8) and any fresh
+/// detection that quantized once at its own call boundary both use this to
+/// avoid a second, redundant quantize pass.
+pub fn build_prob_pyramid_u8(probs: &[u8], level_dims: &[(u32, u32)]) -> ProbPyramid {
     let (w0, h0) = level_dims[0];
     let mut levels = Vec::with_capacity(level_dims.len());
-    let base: Vec<u8> = probs
-        .iter()
-        .map(|p| (p.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
-        .collect();
     levels.push(ProbLevel {
         width: w0,
         height: h0,
-        data: base,
+        data: probs.to_vec(),
     });
     for &(w, h) in &level_dims[1..] {
         let prev = levels.last().unwrap();
@@ -53,4 +70,64 @@ pub fn build_prob_pyramid(probs: &[f32], level_dims: &[(u32, u32)]) -> ProbPyram
         });
     }
     ProbPyramid { levels }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quantize_prob_matches_hand_computed_values() {
+        assert_eq!(quantize_prob(0.0), 0);
+        assert_eq!(quantize_prob(1.0), 255);
+        assert_eq!(quantize_prob(0.5), 128); // 127.5 rounds away from zero
+        assert_eq!(quantize_prob(0.9), 230); // 229.5 rounds away from zero
+
+        // Out-of-range inputs clamp instead of wrapping or panicking.
+        assert_eq!(quantize_prob(-1.0), 0);
+        assert_eq!(quantize_prob(2.0), 255);
+        assert_eq!(quantize_prob(f32::NAN), 0); // clamp(NaN) is the lower bound
+    }
+
+    #[test]
+    fn quantize_prob_boundary_quanta_around_a_threshold() {
+        // Threshold t = 0.5 quantizes to qt = 128. Probabilities exactly at,
+        // just above, and just below the threshold quantum's f32 value
+        // (128/255) must land on the expected side of `q > qt`.
+        let qt = quantize_prob(0.5);
+        assert_eq!(qt, 128);
+
+        let at = 128.0 / 255.0;
+        let just_above = at + 0.001;
+        let just_below = at - 0.001;
+
+        assert_eq!(quantize_prob(at), 128);
+        assert!(quantize_prob(just_above) >= qt); // may still quantize to 128
+        assert!(quantize_prob(just_below) <= qt);
+        // A value a full quantum above must strictly exceed qt.
+        assert!(quantize_prob(at + 1.0 / 255.0) > qt);
+        // A value a full quantum below must strictly fall below qt.
+        assert!(quantize_prob(at - 1.0 / 255.0) < qt);
+    }
+
+    #[test]
+    fn build_prob_pyramid_u8_skips_requantizing() {
+        // Feeding already-quantized u8 through the u8 entry point must not
+        // alter the values -- this is the no-second-quantize-pass guarantee
+        // the registry restore path and fresh-detect boundary both rely on.
+        let probs: Vec<u8> = vec![0, 1, 254, 255];
+        let p = build_prob_pyramid_u8(&probs, &[(4, 1)]);
+        assert_eq!(p.levels[0].data, probs);
+    }
+
+    #[test]
+    fn build_prob_pyramid_matches_build_prob_pyramid_u8_after_quantizing() {
+        let mut probs = vec![0.0f32; 16];
+        probs[5] = 0.9;
+        let from_f32 = build_prob_pyramid(&probs, &[(4, 4), (2, 2)]);
+        let quantized: Vec<u8> = probs.iter().map(|&p| quantize_prob(p)).collect();
+        let from_u8 = build_prob_pyramid_u8(&quantized, &[(4, 4), (2, 2)]);
+        assert_eq!(from_f32.levels[0].data, from_u8.levels[0].data);
+        assert_eq!(from_f32.levels[1].data, from_u8.levels[1].data);
+    }
 }

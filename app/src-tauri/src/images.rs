@@ -10,7 +10,7 @@ const CACHE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 /// Upper bound on defect bboxes returned to the UI; see [`Images::components`].
 pub const MAX_COMPONENTS: usize = 2000;
 
-pub use fd_tiles::{build_prob_pyramid, ProbPyramid};
+pub use fd_tiles::{build_prob_pyramid_u8, quantize_prob, ProbPyramid};
 
 /// Extract a single-channel tile from a level's data, mirroring
 /// `Pyramid::tile`'s grid/edge-size logic.
@@ -68,9 +68,11 @@ type HealedParts = (Arc<fd_io::ImageBuf>, Arc<fd_io::ImageBuf>, Arc<Vec<bool>>);
 struct Entry {
     image: Arc<fd_io::ImageBuf>,
     pyramid: Pyramid,
-    /// Native-res f32 probabilities plus their max-pooled display pyramid.
-    /// None until `detect` has run for this image.
-    probs: Option<(Vec<f32>, ProbPyramid)>,
+    /// Native-res u8-quantized probabilities (see [`quantize_prob`] for the
+    /// one quantization rule) plus their max-pooled display pyramid. None
+    /// until `detect` has run for this image. u8, not f32: a detected 168MP
+    /// frame retains ~168MB instead of ~672MB.
+    probs: Option<(Vec<u8>, ProbPyramid)>,
     healed: Option<HealedData>,
 }
 
@@ -87,17 +89,35 @@ pub struct Prepared {
 /// roll background queue (which never inserts its frame into the `Images`
 /// registry -- see `scan_roll`) can compute bboxes without a registry entry.
 pub fn components_from_probs(
-    probs: &[f32],
+    probs: &[u8],
     width: u32,
     height: u32,
     threshold: f32,
 ) -> Vec<[u32; 4]> {
-    let mask: Vec<bool> = probs.iter().map(|&p| p > threshold).collect();
+    let mask = threshold_mask_from_probs(probs, threshold);
     fd_heal::components(&mask, width, height)
         .into_iter()
         .take(MAX_COMPONENTS)
         .map(|d| [d.bbox.x0, d.bbox.y0, d.bbox.x1, d.bbox.y1])
         .collect()
+}
+
+/// Membership of u8-quantized probabilities against an f32 threshold: the
+/// threshold is quantized once with the same rule as the probabilities
+/// ([`quantize_prob`]) and compared strictly (`q > qt`), preserving the f32
+/// era's strict `p > threshold`.
+///
+/// Boundary honesty: a probability within about half a quantum (~0.002) of a
+/// threshold can land on the other side of the comparison than it would have
+/// in f32 -- both values collapse onto the same 1/255 grid before comparing.
+/// Heal-cache entries stay valid regardless: heal provenance is keyed on the
+/// threshold VALUE (see `cache::heal_provenance`), not the mask bytes, so
+/// pre-change cached heals still match and replay; a FRESH heal may differ
+/// from an old cached one by boundary pixels. Accepted -- no codec version
+/// bump.
+pub(crate) fn threshold_mask_from_probs(probs: &[u8], threshold: f32) -> Vec<bool> {
+    let qt = quantize_prob(threshold);
+    probs.iter().map(|&q| q > qt).collect()
 }
 
 pub struct Images {
@@ -200,7 +220,7 @@ impl Images {
     }
 
     /// Approximate resident pixel bytes for an activated image: native
-    /// pixels + display pyramid RGBA + (after detect) f32 probs and their u8
+    /// pixels + display pyramid RGBA + (after detect) u8 probs and their u8
     /// pyramid. Drives byte-budget eviction in `activate_frame`.
     pub fn retained_bytes(&self, id: u64) -> Option<usize> {
         let entry = self.entries.get(&id)?;
@@ -214,7 +234,7 @@ impl Images {
             total += (l.width as usize) * (l.height as usize) * 4;
         }
         if let Some((probs, pyr)) = &entry.probs {
-            total += probs.len() * 4;
+            total += probs.len();
             for l in &pyr.levels {
                 total += l.data.len();
             }
@@ -276,12 +296,14 @@ impl Images {
         true
     }
 
-    /// Boolean mask of probs > threshold at native resolution; None until a
-    /// detection has stored probabilities for this image.
+    /// Boolean mask of quantized probs strictly above the quantized
+    /// threshold at native resolution (see [`threshold_mask_from_probs`] for
+    /// the rule and its boundary semantics); None until a detection has
+    /// stored probabilities for this image.
     pub fn threshold_mask(&self, id: u64, threshold: f32) -> Option<Vec<bool>> {
         let entry = self.entries.get(&id)?;
         let (probs, _) = entry.probs.as_ref()?;
-        Some(probs.iter().map(|&p| p > threshold).collect())
+        Some(threshold_mask_from_probs(probs, threshold))
     }
 
     pub fn has_healed(&self, id: u64) -> bool {
@@ -324,17 +346,18 @@ impl Images {
             .get_or_insert(key, || pyramid.tile(level, tx, ty))
     }
 
-    /// Store native-res probabilities from detection, building the
-    /// max-pooled display pyramid to match this entry's tile levels.
-    /// Returns false if `id` is unknown (e.g. the image was closed while
-    /// inference ran).
+    /// Store native-res u8-quantized probabilities from detection (fresh
+    /// f32 detector output is quantized once at the caller's boundary with
+    /// [`quantize_prob`]), building the max-pooled display pyramid to match
+    /// this entry's tile levels. Returns false if `id` is unknown (e.g. the
+    /// image was closed while inference ran).
     ///
     /// This is the slow path: it builds the (already computed elsewhere,
     /// ideally) pyramid under the lock. Kept only so its existing tests stay
     /// green; the `detect` command uses `level_dims` + `set_probs_built`
     /// instead, which builds the pyramid outside the lock.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn set_probs(&mut self, id: u64, probs: Vec<f32>) -> bool {
+    pub fn set_probs(&mut self, id: u64, probs: Vec<u8>) -> bool {
         let Some(level_dims) = self.level_dims(id) else {
             return false;
         };
@@ -344,16 +367,16 @@ impl Images {
         if probs.len() != (entry.image.width * entry.image.height) as usize {
             return false;
         }
-        let pyramid = build_prob_pyramid(&probs, &level_dims);
+        let pyramid = build_prob_pyramid_u8(&probs, &level_dims);
         self.set_probs_built(id, probs, pyramid)
     }
 
-    /// Store already-built native-res probabilities and their display
+    /// Store already-built native-res u8 probabilities and their display
     /// pyramid (typically built off-lock alongside inference). Validates
     /// `probs.len()` against the entry's native dims and each pyramid level's
     /// dims against the entry's display-pyramid levels; rejects on any
     /// mismatch or unknown id, storing nothing.
-    pub fn set_probs_built(&mut self, id: u64, probs: Vec<f32>, pyramid: ProbPyramid) -> bool {
+    pub fn set_probs_built(&mut self, id: u64, probs: Vec<u8>, pyramid: ProbPyramid) -> bool {
         let Some(entry) = self.entries.get_mut(&id) else {
             return false;
         };
@@ -479,11 +502,11 @@ mod tests {
     #[test]
     fn prob_pyramid_max_pools_and_matches_level_dims() {
         // 4x4 probs with one hot pixel; two levels (4x4, 2x2)
-        let mut probs = vec![0.0f32; 16];
-        probs[5] = 0.9; // (1,1)
-        let p = build_prob_pyramid(&probs, &[(4, 4), (2, 2)]);
+        let mut probs = vec![0u8; 16];
+        probs[5] = quantize_prob(0.9); // (1,1)
+        let p = build_prob_pyramid_u8(&probs, &[(4, 4), (2, 2)]);
         assert_eq!(p.levels.len(), 2);
-        assert_eq!(p.levels[0].data[5], (0.9f32 * 255.0 + 0.5) as u8);
+        assert_eq!(p.levels[0].data[5], quantize_prob(0.9));
         // max-pool keeps the speck at (0,0) of the 2x2 level
         assert_eq!(p.levels[1].data[0], p.levels[0].data[5]);
         assert_eq!(p.levels[1].data[3], 0);
@@ -495,10 +518,10 @@ mod tests {
         let path = temp_png(&dir, 600, 400);
         let mut images = Images::default();
         let info = images.open(&path).unwrap();
-        let mut probs = vec![0.0f32; 600 * 400];
+        let mut probs = vec![0u8; 600 * 400];
         for y in 100..104 {
             for x in 200..205 {
-                probs[y * 600 + x] = 0.8;
+                probs[y * 600 + x] = quantize_prob(0.8);
             }
         }
         images.set_probs(info.id, probs.clone());
@@ -521,13 +544,13 @@ mod tests {
         let mut images = Images::default();
         let info = images.open(&path).unwrap();
         // 2500 isolated single-pixel defects on an 8px grid
-        let mut probs = vec![0.0f32; 600 * 400];
+        let mut probs = vec![0u8; 600 * 400];
         let mut painted = 0;
         'outer: for gy in 0..50 {
             for gx in 0..50 {
                 let (x, y) = (gx * 8 + 4, gy * 8 + 4);
                 if x < 600 && y < 400 {
-                    probs[y * 600 + x] = 0.9;
+                    probs[y * 600 + x] = quantize_prob(0.9);
                     painted += 1;
                     if painted == 2500 {
                         break 'outer;
@@ -547,16 +570,16 @@ mod tests {
         let path = temp_png(&dir, 600, 400);
         let mut images = Images::default();
         let info = images.open(&path).unwrap();
-        assert!(!images.set_probs(info.id, vec![0.0; 10]));
+        assert!(!images.set_probs(info.id, vec![0u8; 10]));
         assert!(images.components(info.id, 0.5).is_none()); // nothing stored
     }
 
     #[test]
     fn components_from_probs_matches_the_method_it_replaces() {
-        let mut probs = vec![0.0f32; 600 * 400];
+        let mut probs = vec![0u8; 600 * 400];
         for y in 100..104 {
             for x in 200..205 {
-                probs[y * 600 + x] = 0.8;
+                probs[y * 600 + x] = quantize_prob(0.8);
             }
         }
         let direct = components_from_probs(&probs, 600, 400, 0.5);
@@ -651,10 +674,10 @@ mod tests {
         let info = images.open(&path).unwrap();
         assert!(images.threshold_mask(info.id, 0.5).is_none());
 
-        let mut probs = vec![0.0f32; 600 * 400];
+        let mut probs = vec![0u8; 600 * 400];
         for y in 100..104 {
             for x in 200..205 {
-                probs[y * 600 + x] = 0.8;
+                probs[y * 600 + x] = quantize_prob(0.8);
             }
         }
         images.set_probs(info.id, probs);
@@ -673,22 +696,99 @@ mod tests {
         let info = images.open(&path).unwrap();
         let level_dims = images.level_dims(info.id).unwrap();
         assert_eq!(level_dims, vec![(600, 400), (300, 200)]);
-        let probs = vec![0.0f32; 600 * 400];
+        let probs = vec![0u8; 600 * 400];
 
         // Pyramid built against the right level count but a corrupted
         // second-level width: disagrees with the entry's real pyramid.
-        let mut mismatched = build_prob_pyramid(&probs, &level_dims);
+        let mut mismatched = build_prob_pyramid_u8(&probs, &level_dims);
         mismatched.levels[1].width = 299;
         assert!(!images.set_probs_built(info.id, probs.clone(), mismatched));
         assert!(images.components(info.id, 0.5).is_none()); // nothing stored
 
         // Sanity: a correctly-shaped pyramid is accepted.
-        let good = build_prob_pyramid(&probs, &level_dims);
+        let good = build_prob_pyramid_u8(&probs, &level_dims);
         assert!(images.set_probs_built(info.id, probs.clone(), good));
         assert!(images.components(info.id, 0.5).is_some());
 
         // Unknown id is rejected too.
-        let another = build_prob_pyramid(&probs, &level_dims);
+        let another = build_prob_pyramid_u8(&probs, &level_dims);
         assert!(!images.set_probs_built(999, probs, another));
+    }
+
+    #[test]
+    fn components_membership_parity_at_boundary_quanta() {
+        // Threshold 0.5 quantizes to qt = 128 (see quantize_prob); membership
+        // is strict q > qt. Three isolated pixels one quantum apart around
+        // the threshold: 127 (below), 128 (exactly at -- excluded, strict
+        // comparison), 129 (just above -- the only member).
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_png(&dir, 600, 400);
+        let mut images = Images::default();
+        let info = images.open(&path).unwrap();
+        assert_eq!(quantize_prob(0.5), 128);
+
+        let mut probs = vec![0u8; 600 * 400];
+        probs[50 * 600 + 50] = 127;
+        probs[100 * 600 + 100] = 128;
+        probs[200 * 600 + 200] = 129;
+        assert!(images.set_probs(info.id, probs));
+
+        // bbox x1/y1 are exclusive (see prob_tiles_and_components_roundtrip).
+        let comps = images.components(info.id, 0.5).unwrap();
+        assert_eq!(comps, vec![[200, 200, 201, 201]]);
+
+        // The same set through the free function and the mask.
+        let mask = images.threshold_mask(info.id, 0.5).unwrap();
+        assert_eq!(mask.iter().filter(|&&b| b).count(), 1);
+        assert!(mask[200 * 600 + 200]);
+    }
+
+    #[test]
+    fn retained_bytes_counts_probs_at_one_byte_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_png(&dir, 600, 400);
+        let mut images = Images::default();
+        let info = images.open(&path).unwrap();
+        let base = images.retained_bytes(info.id).unwrap();
+
+        let probs = vec![0u8; 600 * 400];
+        assert!(images.set_probs(info.id, probs));
+
+        // The probs term is len() x1 (u8), plus the prob pyramid's own u8
+        // levels: 600x400 base + 300x200 second level.
+        let expected_delta = 600 * 400 + (600 * 400 + 300 * 200);
+        assert_eq!(
+            images.retained_bytes(info.id).unwrap(),
+            base + expected_delta
+        );
+    }
+
+    #[test]
+    fn codec_round_trip_into_registry_is_byte_identical() {
+        // u8 probs written to the disk codec, read back, and stored in the
+        // registry must be the same bytes end-to-end: no
+        // quantize-dequantize-requantize drift anywhere on the restore path.
+        // prob_tile serves the base pyramid level, which
+        // build_prob_pyramid_u8 copies verbatim from the stored probs.
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_png(&dir, 64, 48);
+        let mut images = Images::default();
+        let info = images.open(&path).unwrap();
+
+        let probs: Vec<u8> = (0..64 * 48).map(|i| (i % 256) as u8).collect();
+        let cache_file = dir.path().join("t.probs");
+        let hash = [9u8; 32];
+        let stamp = crate::cache::SourceStamp {
+            size: 1,
+            mtime_nanos: 2,
+        };
+        crate::cache::write_probs(&cache_file, &probs, 64, 48, &hash, &stamp).unwrap();
+        let restored = crate::cache::read_probs(&cache_file, 64, 48, &hash, &stamp).unwrap();
+        assert_eq!(restored, probs);
+
+        assert!(images.set_probs(info.id, restored));
+        let (w, h, bytes) = images.prob_tile(info.id, 0, 0, 0).unwrap();
+        assert_eq!((w, h), (64, 48));
+        assert_eq!(bytes, probs);
     }
 }

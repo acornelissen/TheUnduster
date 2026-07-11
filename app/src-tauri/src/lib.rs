@@ -13,7 +13,7 @@ mod roll;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
-use images::{build_prob_pyramid, ImageInfo, Images, Prepared};
+use images::{build_prob_pyramid_u8, quantize_prob, ImageInfo, Images, Prepared};
 use tauri::{Emitter, Manager, State};
 
 #[derive(serde::Serialize, Clone)]
@@ -142,7 +142,7 @@ async fn run_detect(
     };
     // Resolved before spawn_blocking so the closure can write the probs
     // cache from the borrowed slice, before handing the Vec's ownership to
-    // set_probs_built -- avoids cloning a 671MB vector for a 168MP frame.
+    // set_probs_built -- avoids cloning a 168MB vector for a 168MP frame.
     // The cache path and the source path (dir/file_name) both come from the
     // same frame mapping: the source path is what the write is stamped
     // against.
@@ -157,6 +157,9 @@ async fn run_detect(
         // produced it under one lock -- see its doc comment -- so the cache
         // write below can never record a different model's hash.
         let (probs, hash) = detector.detect_hashed(&img)?;
+        // Quantize once at the fresh-detect boundary; the registry, the
+        // disk cache, and the display pyramid all share these u8 bytes.
+        let probs: Vec<u8> = probs.iter().map(|&p| quantize_prob(p)).collect();
         if let Some((path, source_path)) = &cache_source {
             if let Some(stamp) = stamp_or_skip(source_path) {
                 if let Err(_e) =
@@ -167,7 +170,7 @@ async fn run_detect(
                 }
             }
         }
-        let pyramid = build_prob_pyramid(&probs, &level_dims);
+        let pyramid = build_prob_pyramid_u8(&probs, &level_dims);
         Ok::<_, String>((probs, pyramid))
     })
     .await
@@ -799,8 +802,10 @@ async fn activate_frame(
 
     // Decode-path frames start with no probs; restore a cache hit so a
     // scanned frame becomes detection-ready across relaunches without
-    // re-running the (seconds-long) detector. Fire-and-forget: the restore
-    // costs file IO plus a full-image dequantize and pyramid build, and
+    // re-running the (seconds-long) detector. The cache stores u8 and the
+    // registry now retains u8, so the read lands directly -- no
+    // dequantize-to-f32 step. Fire-and-forget: the restore
+    // costs file IO plus a pyramid build, and
     // awaiting it here made every first frame visit seconds slower (field
     // report) -- activation must return at decode speed. A stale or closed
     // id is harmless: set_probs_built validates and drops the result.
@@ -819,7 +824,7 @@ async fn activate_frame(
             let hit = tauri::async_runtime::spawn_blocking(move || {
                 let stamp = stamp_or_skip(&source_path)?;
                 cache::read_probs(&cache_path, width, height, &hash, &stamp)
-                    .map(|probs| (build_prob_pyramid(&probs, &level_dims), probs))
+                    .map(|probs| (build_prob_pyramid_u8(&probs, &level_dims), probs))
             })
             .await
             .ok()
@@ -1171,6 +1176,10 @@ fn scan_roll(
                     // so the cache write below can never record a different
                     // model's hash.
                     let (probs, hash) = detector.detect_hashed(&image)?;
+                    // Quantize once at the fresh-detect boundary: the bbox
+                    // computation and the cache write below both consume
+                    // the same u8 bytes the registry would retain.
+                    let probs: Vec<u8> = probs.iter().map(|&p| quantize_prob(p)).collect();
                     let bboxes = images::components_from_probs(
                         &probs,
                         image.width,
@@ -1456,6 +1465,9 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                         // doc comment -- so the cache write below can never
                         // record a different model's hash.
                         let (probs, hash) = detector.detect_hashed(&image)?;
+                        // Quantize once at the fresh-detect boundary (the
+                        // cache-hit arm above is already u8 from disk).
+                        let probs: Vec<u8> = probs.iter().map(|&p| quantize_prob(p)).collect();
                         if let Some(stamp) = &stamp {
                             if let Err(_e) = cache::write_probs(
                                 &cache_path,
@@ -1478,7 +1490,7 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                     image.height,
                     SCAN_THRESHOLD,
                 );
-                let pyramid = level_dims.map(|dims| build_prob_pyramid(&probs, &dims));
+                let pyramid = level_dims.map(|dims| build_prob_pyramid_u8(&probs, &dims));
                 Ok::<_, String>((probs, pyramid, bboxes))
             })
             .await
@@ -1503,7 +1515,7 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                             .ok()
                             .and_then(|images| images.level_dims(id))
                     });
-                    dims.map(|dims| build_prob_pyramid(&probs, &dims))
+                    dims.map(|dims| build_prob_pyramid_u8(&probs, &dims))
                 }
             };
             // Land in the registry only when this job's generation is still
@@ -1659,6 +1671,11 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                                     // -- so the cache write below can never
                                     // record a different model's hash.
                                     let (probs, hash) = detector.detect_hashed(&image)?;
+                                    // Quantize once at the fresh-detect
+                                    // boundary (the cache-hit arm above is
+                                    // already u8 from disk).
+                                    let probs: Vec<u8> =
+                                        probs.iter().map(|&p| quantize_prob(p)).collect();
                                     if let Some(stamp) = &stamp {
                                         if let Err(_e) = cache::write_probs(
                                             &probs_cache_path,
@@ -1677,7 +1694,7 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                                     probs
                                 }
                             };
-                            probs.iter().map(|&p| p > threshold).collect()
+                            images::threshold_mask_from_probs(&probs, threshold)
                         }
                     };
 
@@ -1825,8 +1842,15 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                         }
 
                         stage("detecting");
-                        let probs = detector.detect(&image)?;
-                        let raw: Vec<bool> = probs.iter().map(|&p| p > threshold).collect();
+                        // Quantize the transient detect output too: an
+                        // exported frame's fresh mask must match what an
+                        // in-app heal (u8 registry probs) would produce.
+                        let probs: Vec<u8> = detector
+                            .detect(&image)?
+                            .iter()
+                            .map(|&p| quantize_prob(p))
+                            .collect();
+                        let raw = images::threshold_mask_from_probs(&probs, threshold);
                         let mask = masks::compose_heal_mask(
                             raw,
                             image.width,
@@ -2345,7 +2369,7 @@ mod roll_queue_tests {
         // Once its probs cache exists, a counted frame leaves the queue.
         let cache_path = roll::probs_cache_path(dir.path(), "a.png");
         let stamp = crate::cache::source_stamp(&dir.path().join("a.png")).unwrap();
-        crate::cache::write_probs(&cache_path, &[0.5], 1, 1, &[7u8; 32], &stamp).unwrap();
+        crate::cache::write_probs(&cache_path, &[128u8], 1, 1, &[7u8; 32], &stamp).unwrap();
         assert_eq!(state.frames_to_scan().unwrap(), vec![1]);
     }
 

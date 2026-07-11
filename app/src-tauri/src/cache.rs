@@ -91,12 +91,14 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Writes width*height probabilities as u8 (round(p*255)), zstd-compressed,
-/// with the producing detector's file hash and the source file's stamp in
-/// the header. Atomic.
+/// Writes width*height u8-quantized probabilities (see
+/// `fd_tiles::quantize_prob` for the quantization rule -- callers quantize
+/// once at their own boundary; this function no longer quantizes), zstd-
+/// compressed, with the producing detector's file hash and the source
+/// file's stamp in the header. Atomic.
 pub fn write_probs(
     path: &Path,
-    probs: &[f32],
+    probs: &[u8],
     width: u32,
     height: u32,
     detector_hash: &[u8; 32],
@@ -114,9 +116,6 @@ pub fn write_probs(
         ));
     }
 
-    // Quantize probabilities to u8
-    let quantized: Vec<u8> = probs.iter().map(|&p| (p * 255.0).round() as u8).collect();
-
     // Build header
     let mut header = Vec::new();
     header.extend_from_slice(PROBS_MAGIC);
@@ -127,9 +126,9 @@ pub fn write_probs(
     header.extend_from_slice(&stamp.size.to_le_bytes());
     header.extend_from_slice(&stamp.mtime_nanos.to_le_bytes());
 
-    // Compress the quantized data
+    // Compress the already-quantized data
     let compressed =
-        zstd::encode_all(&quantized[..], 3).map_err(|e| format!("zstd compression failed: {e}"))?;
+        zstd::encode_all(probs, 3).map_err(|e| format!("zstd compression failed: {e}"))?;
 
     let compressed_len = compressed.len() as u64;
     header.extend_from_slice(&compressed_len.to_le_bytes());
@@ -149,7 +148,7 @@ pub fn read_probs(
     height: u32,
     detector_hash: &[u8; 32],
     stamp: &SourceStamp,
-) -> Option<Vec<f32>> {
+) -> Option<Vec<u8>> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(_) => return None, // absent file is not corruption
@@ -272,10 +271,9 @@ pub fn read_probs(
         return corrupt();
     }
 
-    // Dequantize
-    let probs = quantized.iter().map(|&q| q as f32 / 255.0).collect();
-
-    Some(probs)
+    // Already u8-quantized on disk; the registry stores u8 directly, no
+    // dequantize-to-f32 step.
+    Some(quantized)
 }
 
 // Bumped from UNDHEAL1 to UNDHEAL2 because the source stamp joined
@@ -919,8 +917,15 @@ pub fn prune_pyramid_cache(dir: &Path, budget_bytes: u64, keep: &Path) {
 mod tests {
     use super::*;
 
-    fn synth_probs(n: usize) -> Vec<f32> {
-        (0..n).map(|i| ((i % 97) as f32) / 96.0).collect()
+    // The same on-disk bytes the pre-u8 write path produced by quantizing
+    // ((i % 97) / 96.0): compressible enough that the corruption tests'
+    // byte flips reliably break the zstd frame (a raw 0..255 ramp would be
+    // stored nearly uncompressed and a flipped payload byte could decode
+    // "cleanly" to the right length).
+    fn synth_probs(n: usize) -> Vec<u8> {
+        (0..n)
+            .map(|i| ((i % 97) as f32 / 96.0 * 255.0).round() as u8)
+            .collect()
     }
 
     fn stamp() -> SourceStamp {
@@ -931,7 +936,11 @@ mod tests {
     }
 
     #[test]
-    fn probs_round_trip_within_quantization() {
+    fn probs_round_trip_is_byte_identical() {
+        // The codec stores and returns u8 directly now -- no
+        // quantize-dequantize-requantize drift is possible, so every byte
+        // must survive the round trip exactly, not just within half a
+        // quantum.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("a.probs");
         let probs = synth_probs(64 * 48);
@@ -939,10 +948,7 @@ mod tests {
         let s = stamp();
         write_probs(&p, &probs, 64, 48, &hash, &s).unwrap();
         let back = read_probs(&p, 64, 48, &hash, &s).expect("cache readable");
-        assert_eq!(back.len(), probs.len());
-        for (a, b) in probs.iter().zip(&back) {
-            assert!((a - b).abs() <= 0.5 / 255.0 + 1e-6, "{a} vs {b}");
-        }
+        assert_eq!(back, probs);
     }
 
     #[test]
