@@ -18,6 +18,7 @@ enum Contract {
 pub struct Inpainter {
     session: Session,
     contract: Contract,
+    calls: usize,
 }
 
 impl Inpainter {
@@ -40,7 +41,11 @@ impl Inpainter {
             Contract::Dynamic
         };
 
-        Ok(Inpainter { session, contract })
+        Ok(Inpainter {
+            session,
+            contract,
+            calls: 0,
+        })
     }
 
     /// Returns the fixed window size if the model uses a fixed-size contract,
@@ -50,6 +55,13 @@ impl Inpainter {
             Contract::Fixed(n) => Some(n),
             Contract::Dynamic => None,
         }
+    }
+
+    /// Number of forward passes run so far. Test-facing: lets heal-window
+    /// batching tests assert clustered defects share one window instead of
+    /// paying for one inpainter call per defect.
+    pub fn calls(&self) -> usize {
+        self.calls
     }
 
     /// image: 3 planes HxW in [0,1]; mask: HxW (true = fill). Returns 3 planes.
@@ -68,6 +80,7 @@ impl Inpainter {
                 )));
             }
         }
+        self.calls += 1;
 
         let mut image = Array4::<f32>::zeros((1, 3, height, width));
         let mut m = Array4::<f32>::zeros((1, 1, height, width));

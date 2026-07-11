@@ -103,3 +103,110 @@ fn corner_defect_windows_safely() {
     }
     heal(&mut img, &mask, Some(&mut fixed_inpainter())).unwrap();
 }
+
+/// Paints five 8px specks into `mask`, clustered so every pairwise gap is
+/// well under the window margin (n/8 = 8 for the 64px fixture, so the merge
+/// threshold is a 16px gap) and the union bbox (32x32) fits inside one
+/// window's 48px interior. Returns the specks' pixel count (should equal
+/// 5 * 8 * 8 = 320) for reference.
+fn five_clustered_specks(mask: &mut [bool], width: u32, x_off: u32, y_off: u32) {
+    let speck = |mask: &mut [bool], x0: u32, y0: u32| {
+        for y in y0..y0 + 8 {
+            for x in x0..x0 + 8 {
+                mask[(y * width + x) as usize] = true;
+            }
+        }
+    };
+    speck(mask, x_off + 10, y_off + 10);
+    speck(mask, x_off + 22, y_off + 10); // 4px gap from the first, in x
+    speck(mask, x_off + 10, y_off + 22); // 4px gap from the first, in y
+    speck(mask, x_off + 34, y_off + 10); // 4px gap from the second, in x
+    speck(mask, x_off + 10, y_off + 34); // 4px gap from the third, in y
+}
+
+/// Five clustered specks, all well within one 64px window's 48px interior,
+/// must share ONE inpainter call -- not one call per defect. This is the
+/// batching behaviour Task 2 adds; on unbatched code this test is red (5
+/// calls, one per defect).
+#[test]
+fn clustered_specks_share_one_inpainter_call() {
+    let mut img = noisy_image(64, 64);
+    let original = img.clone();
+    let mut mask = vec![false; 64 * 64];
+    five_clustered_specks(&mut mask, 64, 0, 0);
+
+    let mut inp = fixed_inpainter();
+    let report = heal(&mut img, &mask, Some(&mut inp)).unwrap();
+
+    assert_eq!(inp.calls(), 1, "clustered specks should share one window");
+    assert_eq!(report.inpainted, 5);
+
+    let (PixelData::U16(a), PixelData::U16(b)) = (&original.data, &img.data) else {
+        panic!("depth changed");
+    };
+    let mut unchanged_masked = 0usize;
+    for i in 0..64 * 64 {
+        if mask[i] {
+            if (0..3).all(|c| a[i * 3 + c] == b[i * 3 + c]) {
+                unchanged_masked += 1;
+            }
+        } else {
+            for c in 0..3 {
+                assert_eq!(a[i * 3 + c], b[i * 3 + c], "pixel {i} changed outside mask");
+            }
+        }
+    }
+    assert!(
+        unchanged_masked < 10,
+        "{unchanged_masked} masked pixels untouched -- a speck was missed"
+    );
+}
+
+/// Progress advances monotonically by member count and ends at (total,
+/// total) even when a group heals more than one defect per callback.
+#[test]
+fn clustered_specks_progress_ends_at_total() {
+    let mut img = noisy_image(64, 64);
+    let mut mask = vec![false; 64 * 64];
+    five_clustered_specks(&mut mask, 64, 0, 0);
+
+    let mut inp = fixed_inpainter();
+    let mut calls: Vec<(usize, usize)> = Vec::new();
+    let report =
+        fd_heal::heal_with_progress(&mut img, &mask, Some(&mut inp), &mut |done, total| {
+            calls.push((done, total));
+        })
+        .unwrap();
+
+    assert_eq!(report.inpainted, 5);
+    assert_eq!(calls, vec![(5, 5)]);
+}
+
+/// Two clusters of five specks each, placed far enough apart that their
+/// margin-expanded bboxes never touch, must NOT share a window: two
+/// clusters, two inpainter calls.
+#[test]
+fn far_apart_clusters_get_separate_calls() {
+    let mut img = noisy_image(300, 64);
+    let original = img.clone();
+    let mut mask = vec![false; 300 * 64];
+    five_clustered_specks(&mut mask, 300, 0, 0);
+    five_clustered_specks(&mut mask, 300, 200, 0); // >150px from the first cluster
+
+    let mut inp = fixed_inpainter();
+    let report = heal(&mut img, &mask, Some(&mut inp)).unwrap();
+
+    assert_eq!(inp.calls(), 2, "far-apart clusters must not share a window");
+    assert_eq!(report.inpainted, 10);
+
+    let (PixelData::U16(a), PixelData::U16(b)) = (&original.data, &img.data) else {
+        panic!("depth changed");
+    };
+    for i in 0..300 * 64 {
+        if !mask[i] {
+            for c in 0..3 {
+                assert_eq!(a[i * 3 + c], b[i * 3 + c], "pixel {i} changed outside mask");
+            }
+        }
+    }
+}

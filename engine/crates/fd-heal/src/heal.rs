@@ -1,6 +1,8 @@
 use fd_io::{ImageBuf, PixelData};
 
-use crate::{add_grain, classical_fill, components, Defect, HealError, Inpainter};
+use crate::{
+    add_grain, classical_fill, components, group_defects, Defect, Group, HealError, Inpainter,
+};
 
 pub const TINY_MAX_DIM: u32 = 5;
 
@@ -131,26 +133,39 @@ fn inpaint_defect(
     Ok(())
 }
 
-/// Fixed-size windowed inpainting: window interiors tile the defect bbox,
-/// margins supply context, and each window writes back only its interior
-/// defect pixels -- every masked pixel is filled exactly once, with no
-/// resampling, so grain scale and sharpness survive. Windows shift (never
-/// shrink) to stay inside the image; when the image itself is smaller than
-/// the window, edge-replicate padding fills the remainder, mirroring the
-/// detector's tile padding.
-fn inpaint_defect_windowed(
+/// Fixed-size windowed inpainting, batched across a `Group`: window
+/// interiors tile the group's shared bbox, margins supply context, and each
+/// window writes back only the interior pixels of every member defect --
+/// every masked pixel is filled exactly once, with no resampling, so grain
+/// scale and sharpness survive. Windows shift (never shrink) to stay inside
+/// the image; when the image itself is smaller than the window,
+/// edge-replicate padding fills the remainder, mirroring the detector's
+/// tile padding.
+///
+/// A singleton group (one member, bbox == that member's bbox) degenerates
+/// to the old per-defect windowed heal, so this is the only tiling
+/// implementation for both the batched and unbatched cases.
+///
+/// Eight parameters: one more than `inpaint_defect_windowed` had, because
+/// batching needs both the full defect slice (to resolve member pixels)
+/// and the group (membership + shared bbox) where the old signature only
+/// needed a single `&Defect`. Splitting into a struct would obscure the
+/// close correspondence with the pre-batching signature; allowed instead.
+#[allow(clippy::too_many_arguments)]
+fn inpaint_group_windowed(
     planes: &mut [Vec<f32>],
     width: usize,
     height: usize,
-    defect: &Defect,
+    defects: &[Defect],
+    group: &Group,
     mask: &[bool],
     inpainter: &mut Inpainter,
     n: usize,
 ) -> Result<(), HealError> {
     let margin = n / 8;
     let interior = n - 2 * margin;
-    let (bx0, by0) = (defect.bbox.x0 as usize, defect.bbox.y0 as usize);
-    let (bx1, by1) = (defect.bbox.x1 as usize, defect.bbox.y1 as usize); // exclusive
+    let (bx0, by0) = (group.bbox.x0 as usize, group.bbox.y0 as usize);
+    let (bx1, by1) = (group.bbox.x1 as usize, group.bbox.y1 as usize); // exclusive
 
     let mut iy = by0;
     while iy < by1 {
@@ -185,19 +200,25 @@ fn inpaint_defect_windowed(
             }
             let filled = inpainter.inpaint(&crop, &crop_mask, n, n)?;
 
-            // Write back: defect pixels inside THIS window's interior only.
-            for &(px, py) in &defect.pixels {
-                let (px, py) = (px as usize, py as usize);
-                if px < ix || px >= ix1 || py < iy || py >= iy1 {
-                    continue;
-                }
-                let (lx, ly) = (px - wx0, py - wy0);
-                if lx >= n || ly >= n {
-                    continue; // interior clamped past the window; unreachable when image >= n
-                }
-                for (c, plane) in planes.iter_mut().enumerate() {
-                    let src_c = if c < 3 { c } else { 0 };
-                    plane[py * width + px] = filled[src_c][ly * n + lx];
+            // Write back: EVERY member's defect pixels inside THIS window's
+            // interior only. The guard that gave each defect-pixel exactly
+            // one writer now applies per (member-pixel, window) instead --
+            // still exactly one writer per pixel, because window interiors
+            // still tile the (now shared) bbox without overlap.
+            for &member in &group.members {
+                for &(px, py) in &defects[member].pixels {
+                    let (px, py) = (px as usize, py as usize);
+                    if px < ix || px >= ix1 || py < iy || py >= iy1 {
+                        continue;
+                    }
+                    let (lx, ly) = (px - wx0, py - wy0);
+                    if lx >= n || ly >= n {
+                        continue; // interior clamped past the window; unreachable when image >= n
+                    }
+                    for (c, plane) in planes.iter_mut().enumerate() {
+                        let src_c = if c < 3 { c } else { 0 };
+                        plane[py * width + px] = filled[src_c][ly * n + lx];
+                    }
                 }
             }
             ix = ix1;
@@ -251,15 +272,86 @@ pub fn heal_with_progress(
         defects: total,
         ..Default::default()
     };
-    for (i, d) in defects.iter().enumerate() {
+
+    let has_inpainter = inpainter.is_some();
+    // Tier check per defect, BEFORE grouping: the TINY_MAX_DIM classical
+    // tier never joins a shared window.
+    let inpaint_tier: Vec<usize> = defects
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| has_inpainter && d.max_dim() > TINY_MAX_DIM)
+        .map(|(i, _)| i)
+        .collect();
+
+    // Only the Fixed(n) contract batches defects into shared windows; the
+    // Dynamic contract and the no-inpainter path stay per-defect below
+    // (`groups` stays empty, so every defect index falls through to the
+    // `else` branch in the loop, byte-identical to the old behaviour).
+    let window_n = inpainter.as_deref_mut().and_then(|inp| inp.window_size());
+    let groups: Vec<Group> = match window_n {
+        Some(n) => {
+            let tier_defects: Vec<Defect> =
+                inpaint_tier.iter().map(|&i| defects[i].clone()).collect();
+            group_defects(&tier_defects, n as u32 / 8)
+                .into_iter()
+                .map(|g| Group {
+                    members: g.members.iter().map(|&local| inpaint_tier[local]).collect(),
+                    bbox: g.bbox,
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    // Map each grouped defect's global index to its group, so the main loop
+    // below can recognize group membership in O(1).
+    let mut owning_group: Vec<Option<usize>> = vec![None; total];
+    for (gi, g) in groups.iter().enumerate() {
+        for &m in &g.members {
+            owning_group[m] = Some(gi);
+        }
+    }
+
+    let mut done = 0usize;
+    for i in 0..total {
+        if let Some(gi) = owning_group[i] {
+            // `group_defects` orders members ascending, and the mapping
+            // from local (inpaint_tier) index to global index is itself
+            // monotonic, so the group's first member is its smallest
+            // global index. The group is therefore handled exactly once,
+            // right here, the first time the loop reaches any of its
+            // members; later members are skipped.
+            if groups[gi].members[0] != i {
+                continue;
+            }
+            let n = window_n.expect("groups only exist for the Fixed(n) contract");
+            let inp = inpainter
+                .as_deref_mut()
+                .expect("groups only exist with an inpainter");
+            inpaint_group_windowed(
+                &mut planes,
+                width,
+                height,
+                &defects,
+                &groups[gi],
+                mask,
+                inp,
+                n,
+            )?;
+            for &m in &groups[gi].members {
+                add_grain(&mut planes, width, height, &defects[m], mask);
+            }
+            report.inpainted += groups[gi].members.len();
+            done += groups[gi].members.len();
+            progress(done, total);
+            continue;
+        }
+
+        let d = &defects[i];
         match inpainter.as_deref_mut() {
             Some(inp) if d.max_dim() > TINY_MAX_DIM => {
-                match inp.window_size() {
-                    Some(n) => {
-                        inpaint_defect_windowed(&mut planes, width, height, d, mask, inp, n)?
-                    }
-                    None => inpaint_defect(&mut planes, width, height, d, mask, inp)?,
-                }
+                // Only the Dynamic contract reaches here -- Fixed(n)
+                // defects were grouped and handled above.
+                inpaint_defect(&mut planes, width, height, d, mask, inp)?;
                 add_grain(&mut planes, width, height, d, mask);
                 report.inpainted += 1;
             }
@@ -268,7 +360,8 @@ pub fn heal_with_progress(
                 report.tiny += 1;
             }
         }
-        progress(i + 1, total);
+        done += 1;
+        progress(done, total);
     }
     write_back(img, &planes, mask);
     Ok(report)
