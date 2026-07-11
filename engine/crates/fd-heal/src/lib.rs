@@ -22,4 +22,8 @@ pub enum HealError {
     Model(String),
     #[error("mask size {got} does not match image size {want}")]
     MaskSize { got: usize, want: usize },
+    /// The progress callback returned `Break`: the caller asked for a
+    /// cooperative abort. The image was not modified (write-back never ran).
+    #[error("heal cancelled")]
+    Cancelled,
 }

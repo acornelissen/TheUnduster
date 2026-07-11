@@ -1,3 +1,5 @@
+use std::ops::ControlFlow;
+
 use fd_io::{ImageBuf, PixelData};
 
 use crate::{
@@ -245,18 +247,24 @@ pub fn heal(
     mask: &[bool],
     inpainter: Option<&mut Inpainter>,
 ) -> Result<HealReport, HealError> {
-    heal_with_progress(img, mask, inpainter, &mut |_, _| {})
+    heal_with_progress(img, mask, inpainter, &mut |_, _| ControlFlow::Continue(()))
 }
 
 /// `heal` with a per-defect progress callback `(done, total)`. A real
 /// inpainting model costs seconds of CPU per defect window, so a frame with
 /// dozens of defects heals for minutes; the callback lets the app show
 /// motion instead of a frozen "Healing..." label.
+///
+/// The callback's return value is a cooperative stop signal: `Break` aborts
+/// the heal with `HealError::Cancelled` before anything is written back to
+/// `img`, so a cancelled heal leaves the image bit-identical -- there is no
+/// partially-healed state to reason about. All healing up to that point
+/// happened only in the working planes, which are dropped.
 pub fn heal_with_progress(
     img: &mut ImageBuf,
     mask: &[bool],
     mut inpainter: Option<&mut Inpainter>,
-    progress: &mut dyn FnMut(usize, usize),
+    progress: &mut dyn FnMut(usize, usize) -> ControlFlow<()>,
 ) -> Result<HealReport, HealError> {
     let (width, height) = (img.width as usize, img.height as usize);
     if mask.len() != width * height {
@@ -344,7 +352,9 @@ pub fn heal_with_progress(
             }
             report.inpainted += groups[gi].members.len();
             done += groups[gi].members.len();
-            progress(done, total);
+            if progress(done, total).is_break() {
+                return Err(HealError::Cancelled);
+            }
             continue;
         }
 
@@ -363,7 +373,9 @@ pub fn heal_with_progress(
             }
         }
         done += 1;
-        progress(done, total);
+        if progress(done, total).is_break() {
+            return Err(HealError::Cancelled);
+        }
     }
     write_back(img, &planes, mask);
     Ok(report)

@@ -1,3 +1,4 @@
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 
 use fd_heal::{heal, Inpainter, TINY_MAX_DIM};
@@ -191,8 +192,39 @@ fn heal_reports_per_defect_progress() {
     let mut calls: Vec<(usize, usize)> = Vec::new();
     let report = fd_heal::heal_with_progress(&mut img, &mask, None, &mut |done, total| {
         calls.push((done, total));
+        ControlFlow::Continue(())
     })
     .unwrap();
     assert_eq!(report.defects, 3);
     assert_eq!(calls, vec![(1, 3), (2, 3), (3, 3)]);
+}
+
+/// A Break from the progress callback aborts the heal before write-back:
+/// the caller gets HealError::Cancelled and the image is bit-identical
+/// everywhere -- a cancelled job commits nothing, not a half-healed frame.
+#[test]
+fn break_from_progress_cancels_before_any_write_back() {
+    let mut img = noisy_image(64, 64);
+    let before = img.clone();
+    let mut mask = vec![false; 64 * 64];
+    for (cx, cy) in [(10u32, 10u32), (30, 30), (50, 50)] {
+        for y in cy - 2..=cy + 2 {
+            for x in cx - 2..=cx + 2 {
+                mask[(y * 64 + x) as usize] = true;
+            }
+        }
+    }
+    let mut calls = 0usize;
+    let err = fd_heal::heal_with_progress(&mut img, &mask, None, &mut |_, _| {
+        calls += 1;
+        ControlFlow::Break(())
+    })
+    .unwrap_err();
+    assert!(matches!(err, fd_heal::HealError::Cancelled));
+    // Break after the first defect stops the loop: no further callbacks.
+    assert_eq!(calls, 1);
+    let (PixelData::U16(a), PixelData::U16(b)) = (&before.data, &img.data) else {
+        panic!("expected u16")
+    };
+    assert_eq!(a, b, "cancelled heal must not touch the image");
 }

@@ -175,6 +175,7 @@ fn clustered_specks_progress_ends_at_total() {
     let report =
         fd_heal::heal_with_progress(&mut img, &mask, Some(&mut inp), &mut |done, total| {
             calls.push((done, total));
+            std::ops::ControlFlow::Continue(())
         })
         .unwrap();
 

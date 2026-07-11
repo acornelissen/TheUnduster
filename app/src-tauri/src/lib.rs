@@ -341,6 +341,7 @@ async fn run_heal(
                     fd_heal::heal_with_progress(&mut copy, &mask, inp, &mut |done, total| {
                         let _ = app_for_progress
                             .emit("heal-progress", HealProgress { id, done, total });
+                        std::ops::ControlFlow::Continue(())
                     })
                     .map_err(|e| e.to_string())?;
                 if let Some((path, provenance)) = &path_and_provenance {
@@ -1890,6 +1891,7 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                             let _ = app_for_progress
                                 .emit("heal-progress", HealProgress { id, done, total });
                         }
+                        std::ops::ControlFlow::Continue(())
                     })
                     .map_err(|e| e.to_string())?;
                     if let Some(provenance) = &provenance {
@@ -2046,6 +2048,7 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                                     generation,
                                 },
                             );
+                            std::ops::ControlFlow::Continue(())
                         })
                         .map_err(|e| e.to_string())?;
                         // Cache the fresh heal so the next export or heal of this
