@@ -94,9 +94,36 @@ export interface Ring {
   r: number;
 }
 
-/** Maps native-resolution defect bboxes to screen-space ring markers, using
+/** Projects one native-resolution defect bbox to a screen-space ring, using
  * the same pan/zoom convention as Viewer's zoomAt/onPointerMove (screen
  * origin at canvas center, image point (centerX, centerY) maps there).
+ * Unfiltered -- the caller decides whether an offscreen ring is worth
+ * drawing. Shared by ringsFor (below) and Viewer's active-ring highlight,
+ * which needs this same projection for a single box that ringsFor's own
+ * offscreen filter might otherwise have dropped. */
+export function ringForBbox(
+  [x0, y0, x1, y1]: [number, number, number, number],
+  zoom: number,
+  centerX: number,
+  centerY: number,
+  canvasW: number,
+  canvasH: number,
+  minR: number,
+): Ring {
+  const bx = (x0 + x1) / 2;
+  const by = (y0 + y1) / 2;
+  const x = (bx - centerX) * zoom + canvasW / 2;
+  const y = (by - centerY) * zoom + canvasH / 2;
+  const extent = Math.max(x1 - x0, y1 - y0);
+  const r = Math.max((extent / 2) * zoom, minR);
+  return { x, y, r };
+}
+
+function ringOnscreen(ring: Ring, canvasW: number, canvasH: number): boolean {
+  return ring.x + ring.r >= 0 && ring.x - ring.r <= canvasW && ring.y + ring.r >= 0 && ring.y - ring.r <= canvasH;
+}
+
+/** Maps native-resolution defect bboxes to screen-space ring markers.
  * Filters out rings whose bounding circle doesn't intersect the canvas. */
 export function ringsFor(
   bboxes: [number, number, number, number][],
@@ -108,16 +135,9 @@ export function ringsFor(
   minR: number,
 ): Ring[] {
   const out: Ring[] = [];
-  for (const [x0, y0, x1, y1] of bboxes) {
-    const bx = (x0 + x1) / 2;
-    const by = (y0 + y1) / 2;
-    const x = (bx - centerX) * zoom + canvasW / 2;
-    const y = (by - centerY) * zoom + canvasH / 2;
-    const extent = Math.max(x1 - x0, y1 - y0);
-    const r = Math.max((extent / 2) * zoom, minR);
-    const onscreen =
-      x + r >= 0 && x - r <= canvasW && y + r >= 0 && y - r <= canvasH;
-    if (onscreen) out.push({ x, y, r });
+  for (const bbox of bboxes) {
+    const ring = ringForBbox(bbox, zoom, centerX, centerY, canvasW, canvasH, minR);
+    if (ringOnscreen(ring, canvasW, canvasH)) out.push(ring);
   }
   return out;
 }

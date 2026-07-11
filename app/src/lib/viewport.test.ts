@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { fitZoom, pickLevel, ringsFor, visibleTiles, wheelZoomFactor, type Level } from "./viewport";
+import {
+  fitZoom,
+  pickLevel,
+  ringForBbox,
+  ringsFor,
+  visibleTiles,
+  wheelZoomFactor,
+  type Level,
+} from "./viewport";
 
 const LEVELS: Level[] = [
   { width: 2000, height: 1200 },
@@ -120,6 +128,23 @@ describe("ringsFor", () => {
     // screen x = (1410 - 1000) * 1 + 400 = 810, r = max(20, 12) = 20;
     // circle spans 790..830, canvas right edge is 800 -> still overlaps
     expect(rings).toHaveLength(1);
+  });
+});
+
+describe("ringForBbox", () => {
+  it("matches what ringsFor computes for the same box", () => {
+    const ring = ringForBbox([980, 580, 1020, 620], 1, 1000, 600, 800, 600, 12);
+    expect(ring.x).toBeCloseTo(400);
+    expect(ring.y).toBeCloseTo(300);
+    expect(ring.r).toBeCloseTo(20);
+  });
+
+  it("does not filter offscreen boxes, unlike ringsFor", () => {
+    const offscreen: [number, number, number, number] = [10000, 10000, 10010, 10010];
+    expect(ringsFor([offscreen], 1, 1000, 600, 800, 600, 12)).toHaveLength(0);
+    const ring = ringForBbox(offscreen, 1, 1000, 600, 800, 600, 12);
+    expect(ring.x).toBeGreaterThan(800);
+    expect(ring.y).toBeGreaterThan(600);
   });
 });
 

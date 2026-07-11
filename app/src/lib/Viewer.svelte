@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import Icon from "./Icon.svelte";
-  import { fitZoom, visibleTiles, ringsFor, wheelZoomFactor, TILE, type Level } from "./viewport";
+  import { fitZoom, visibleTiles, ringsFor, ringForBbox, wheelZoomFactor, TILE, type Level } from "./viewport";
   import { TileRenderer, probPathFor, type StrokeSegment } from "./renderer";
   import {
     screenToImage,
@@ -351,16 +351,47 @@
       const source = markerSource();
       const ringsVisible = overlay.enabled;
       if (ringsVisible && source.length > 0) {
-        const rings = ringsFor(source, zoom, centerX, centerY, canvas.width, canvas.height, 12);
-        // --detect red; app.css token is the CSS-side mirror. Dimmed while a
-        // threshold refetch is in flight so the operator can see the drawn
-        // circles are stale rather than trusting them at full strength.
-        renderer.drawRings(
-          rings,
-          refreshPending ? [1.0, 0.05, 0.05, 0.35] : [1.0, 0.05, 0.05, 1.0],
-          canvas.width,
-          canvas.height,
-        );
+        // Dimmed while a threshold refetch is in flight, for both colors
+        // below, so the operator can see the drawn circles are stale rather
+        // than trusting them at full strength.
+        const alpha = refreshPending ? 0.35 : 1.0;
+        // The z/shift-z cycling target (`current`) gets its own ring pass in
+        // amber so the operator can see which detection is selected before
+        // deleting it; every other ring stays the plain --detect red. It is
+        // excluded from the list handed to ringsFor (rather than drawn twice
+        // on top) so the two passes never fight over the same pixels.
+        const rest = source.filter((_, i) => i !== current);
+        const rings = ringsFor(rest, zoom, centerX, centerY, canvas.width, canvas.height, 12);
+        // --detect red; app.css token is the CSS-side mirror.
+        renderer.drawRings(rings, [1.0, 0.05, 0.05, alpha], canvas.width, canvas.height);
+        if (current >= 0 && current < source.length) {
+          // Project the active box directly with ringForBbox instead of
+          // going through ringsFor: ringsFor's offscreen filter would drop
+          // the active ring's index out of that array's positions entirely
+          // once it (or another ring before it) pans offscreen, and the
+          // highlight must still track it, ready to reappear the moment it
+          // comes back onscreen.
+          const active = ringForBbox(
+            source[current],
+            zoom,
+            centerX,
+            centerY,
+            canvas.width,
+            canvas.height,
+            12,
+          );
+          // Amber: mirrors --accent (app.css) and the paint-stroke amber
+          // used for brush strokes below, so "selected" reads consistently
+          // across the app. A few px larger than the plain ring so the
+          // highlight is visible even where it would otherwise sit flush
+          // under the red ring it replaces.
+          renderer.drawRings(
+            [{ ...active, r: active.r + 4 }],
+            [1.0, 0.72, 0.24, alpha],
+            canvas.width,
+            canvas.height,
+          );
+        }
       }
       // Strokes are edit state, not a detector overlay: they stay visible
       // regardless of the `m` tint toggle. The in-progress stroke (not yet
