@@ -104,29 +104,49 @@ export function composeLeft(input: LeftZoneInput): string {
   return parts.join("  ");
 }
 
+/** Human-readable download progress for the healing model: "82 / 207 MB
+ * (39%)" when the server sent a content length, plain "82 MB" when it did
+ * not (a zero total counts as unknown too). Whole megabytes -- at 207MB the
+ * decimals are noise. Shared by the status bar's activity line and the
+ * Model toolbar group's progress bar. */
+export function formatModelProgress(received: number, total: number | null): string {
+  const mb = (n: number) => Math.floor(n / (1024 * 1024));
+  if (total !== null && total > 0) {
+    return `${mb(received)} / ${mb(total)} MB (${Math.floor((received / total) * 100)}%)`;
+  }
+  return `${mb(received)} MB`;
+}
+
 export interface RightZoneInput {
   roll: boolean;
   approvedCount: number;
   totalCount: number;
   queuedJobCount: number;
-  /** True when the loaded inpainter is the mean-fill dev fixture, not real
-   * LaMa -- i.e. every heal right now produces a flat grey fill on brushed
-   * areas instead of an actual inpaint. This has to be persistent and
-   * impossible to miss (unlike `composeActivity`'s single transient slot,
-   * which real activity like exporting or detecting would otherwise push
-   * this out of), so it lives in the always-visible right zone instead. */
-  healingStubbed: boolean;
+  /** Which engine a heal would run with right now. "lama" is the real
+   * inpainting model; "placeholder" is the mean-fill dev fixture -- every
+   * heal produces a flat grey fill on brushed areas instead of an actual
+   * inpaint; "classical" means no inpainting model is loaded at all, so
+   * only tiny defects get healed (classical fill). Persistent and
+   * impossible to miss on purpose (unlike `composeActivity`'s single
+   * transient slot, which real activity like exporting or detecting would
+   * otherwise push this out of), so it lives in the always-visible right
+   * zone instead -- in ALL three states, not just the warning ones, so the
+   * operator can always answer "what is healing my frames". */
+  healingEngine: "lama" | "placeholder" | "classical";
 }
 
-/** Counts string for the right zone: the development-stub hint (when the
- * inpainter is the dev fixture), roll approval progress, and queued job
- * count -- in that order, so the stub hint is never the part truncated by
- * the zone's overflow ellipsis. */
+const HEALING_ENGINE_LABEL: Record<RightZoneInput["healingEngine"], string> = {
+  lama: "healing: LaMa",
+  placeholder: "healing: placeholder model",
+  classical: "healing: classical only",
+};
+
+/** Counts string for the right zone: the healing-engine indicator, roll
+ * approval progress, and queued job count -- in that order, so the engine
+ * indicator (the placeholder warning especially) is never the part
+ * truncated by the zone's overflow ellipsis. */
 export function composeRight(input: RightZoneInput): string {
-  const parts: string[] = [];
-  if (input.healingStubbed) {
-    parts.push("healing: development stub");
-  }
+  const parts: string[] = [HEALING_ENGINE_LABEL[input.healingEngine]];
   if (input.roll) {
     parts.push(`${input.approvedCount}/${input.totalCount} approved`);
   }

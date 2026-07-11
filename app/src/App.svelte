@@ -15,7 +15,12 @@
   import { routeDrop, type PathKind } from "./lib/drop";
   import type { Level } from "./lib/viewport";
   import { undoStroke, redoStroke, type StrokeData } from "./lib/brush";
-  import { composeActivity, composeLeft, composeRight } from "./lib/status";
+  import {
+    composeActivity,
+    composeLeft,
+    composeRight,
+    formatModelProgress,
+  } from "./lib/status";
   import { pushToast, dismissToast, pushLog, type Toast } from "./lib/toasts";
 
   // Monotonic id source for toasts; module-scoped so ids stay unique across
@@ -1432,10 +1437,7 @@
   }
 
   function modelProgressText(): string {
-    if (modelTotal !== null && modelTotal > 0) {
-      return `${Math.floor((modelReceived / modelTotal) * 100)}%`;
-    }
-    return `${(modelReceived / (1024 * 1024)).toFixed(1)} MB`;
+    return formatModelProgress(modelReceived, modelTotal);
   }
 
   function strokeKey(): string | null {
@@ -1527,10 +1529,21 @@
       totalCount: r ? r.frames.length : 0,
     });
   });
+  // Which engine a heal would run with right now, from the same modelStatus
+  // the Model toolbar group renders. "missing"/"available"/"downloading" all
+  // mean nothing is loaded, i.e. classical fill only. (Dev-build nuance:
+  // during a download started FROM the fixture state this briefly says
+  // "classical only" while the fixture would still heal -- same transient
+  // imprecision the old stub hint had, and healing mid-download is rare.)
+  const healingEngine = $derived.by((): "lama" | "placeholder" | "classical" => {
+    if (modelStatus === "loaded") return "lama";
+    if (modelStatus === "fixture") return "placeholder";
+    return "classical";
+  });
   // Shared by the status bar and the Heal button titles below -- one
-  // definition of "is healing currently stubbed" so both surfaces can never
-  // disagree.
-  const healingStubbed = $derived.by(() => modelStatus === "fixture");
+  // definition of "is healing currently the placeholder" so both surfaces
+  // can never disagree.
+  const healingStubbed = $derived.by(() => healingEngine === "placeholder");
   const statusRight = $derived.by(() => {
     const r = roll;
     return composeRight({
@@ -1538,7 +1551,7 @@
       approvedCount: r ? r.frames.filter((f) => f.approved).length : 0,
       totalCount: r ? r.frames.length : 0,
       queuedJobCount,
-      healingStubbed,
+      healingEngine,
     });
   });
 
@@ -1764,7 +1777,7 @@
         <button
           class="btn btn-primary"
           title={healingStubbed
-            ? "Heal (h) — development stub: no real healing model loaded"
+            ? "Heal (h) — placeholder healing model: download the real one for quality results"
             : "Heal (h)"}
           onclick={requestHeal}
           disabled={loading !== null || isDetecting || isHealing || !info}
@@ -1794,7 +1807,7 @@
         <button
           class="btn btn-primary"
           title={healingStubbed
-            ? "Heal approved — development stub: no real healing model loaded"
+            ? "Heal approved — placeholder healing model: download the real one for quality results"
             : "Heal approved"}
           onclick={healApproved}
           disabled={roll.frames.every((f) => !f.approved)}
@@ -1833,18 +1846,40 @@
     <!-- Model group: visible when modelStatus !== "loaded" -->
     {#if modelStatus !== "loaded"}
       <div class="toolbar-group">
-        <button class="btn" onclick={downloadModel} disabled={modelStatus === "downloading"}>
-          <Icon name="download" />
-          {#if modelStatus === "missing"}
-            Download healing model (207 MB)
-          {:else if modelStatus === "available"}
-            Repair healing model
-          {:else if modelStatus === "fixture"}
-            Download real healing model (207 MB)
-          {:else if modelStatus === "downloading"}
-            Downloading...
-          {/if}
-        </button>
+        {#if modelStatus === "downloading"}
+          <!-- aria-live so screen readers hear progress without focus; the
+               text only changes every 250ms (backend throttle), so "polite"
+               stays quiet enough. -->
+          <div class="model-download" aria-live="polite">
+            {#if modelTotal !== null && modelTotal > 0}
+              <div
+                class="model-progress-track"
+                role="progressbar"
+                aria-valuenow={Math.floor((modelReceived / modelTotal) * 100)}
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-label="Healing model download"
+              >
+                <div
+                  class="model-progress-fill"
+                  style:width={`${(modelReceived / modelTotal) * 100}%`}
+                ></div>
+              </div>
+            {/if}
+            <span class="model-progress-text">{modelProgressText()}</span>
+          </div>
+        {:else}
+          <button class="btn" onclick={downloadModel}>
+            <Icon name="download" />
+            {#if modelStatus === "missing"}
+              Download healing model (207 MB)
+            {:else if modelStatus === "available"}
+              Repair healing model
+            {:else if modelStatus === "fixture"}
+              Download real healing model (207 MB)
+            {/if}
+          </button>
+        {/if}
       </div>
     {/if}
   </header>
@@ -2025,5 +2060,29 @@
     border: 2px solid var(--accent);
     background: var(--accent-soft);
     pointer-events: none;
+  }
+
+  .model-download {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .model-progress-track {
+    width: 120px;
+    height: 4px;
+    border-radius: var(--radius-1);
+    background: var(--bg-3);
+    overflow: hidden;
+  }
+  .model-progress-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: var(--radius-1);
+  }
+  .model-progress-text {
+    color: var(--text-2);
+    font-size: var(--text-sm);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
   }
 </style>

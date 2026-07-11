@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { composeActivity, composeLeft, composeRight } from "./status";
+import { composeActivity, composeLeft, composeRight, formatModelProgress } from "./status";
 
 describe("composeActivity", () => {
   const base = {
@@ -210,49 +210,75 @@ describe("composeLeft", () => {
   });
 });
 
+describe("formatModelProgress", () => {
+  const MB = 1024 * 1024;
+
+  it("shows received of total with a percentage when the total is known", () => {
+    expect(formatModelProgress(82 * MB, 207 * MB)).toBe("82 / 207 MB (39%)");
+  });
+
+  it("shows received alone when the server sent no content length", () => {
+    expect(formatModelProgress(82 * MB, null)).toBe("82 MB");
+  });
+
+  it("starts at zero without dividing by anything odd", () => {
+    expect(formatModelProgress(0, 207 * MB)).toBe("0 / 207 MB (0%)");
+    expect(formatModelProgress(0, null)).toBe("0 MB");
+  });
+
+  it("treats a zero total as unknown rather than reporting infinity", () => {
+    expect(formatModelProgress(5 * MB, 0)).toBe("5 MB");
+  });
+});
+
 describe("composeRight", () => {
   const base = {
     roll: false,
     approvedCount: 0,
     totalCount: 0,
     queuedJobCount: 0,
-    healingStubbed: false,
+    healingEngine: "lama" as const,
   };
 
-  it("renders nothing when there is no roll and no queued jobs", () => {
-    expect(composeRight(base)).toBe("");
+  it("always shows the healing engine, even with no roll and no jobs", () => {
+    // The indicator is persistent on purpose: the operator asked for an
+    // always-visible answer to "what is healing my frames right now".
+    expect(composeRight(base)).toBe("healing: LaMa");
+  });
+
+  it("names the placeholder engine when the inpainter is the dev fixture", () => {
+    expect(composeRight({ ...base, healingEngine: "placeholder" })).toBe(
+      "healing: placeholder model",
+    );
+  });
+
+  it("names classical-only healing when no inpainting model is loaded", () => {
+    expect(composeRight({ ...base, healingEngine: "classical" })).toBe(
+      "healing: classical only",
+    );
   });
 
   it("renders approved counts for a roll", () => {
     expect(composeRight({ ...base, roll: true, approvedCount: 2, totalCount: 4 })).toBe(
-      "2/4 approved",
+      "healing: LaMa  2/4 approved",
     );
   });
 
   it("appends queued job count when jobs are queued", () => {
     expect(
       composeRight({ ...base, roll: true, approvedCount: 2, totalCount: 4, queuedJobCount: 3 }),
-    ).toBe("2/4 approved  3 jobs queued");
+    ).toBe("healing: LaMa  2/4 approved  3 jobs queued");
   });
 
   it("uses singular job wording for exactly one queued job", () => {
     expect(
       composeRight({ ...base, roll: true, approvedCount: 0, totalCount: 4, queuedJobCount: 1 }),
-    ).toBe("0/4 approved  1 job queued");
+    ).toBe("healing: LaMa  0/4 approved  1 job queued");
   });
 
-  it("renders only the queued job count outside roll mode", () => {
-    expect(composeRight({ ...base, queuedJobCount: 2 })).toBe("2 jobs queued");
-  });
-
-  it("leads with the development-stub hint when the inpainter is the dev fixture", () => {
-    // Unmissable and persistent: this must show regardless of roll state or
-    // activity, and ahead of everything else in the zone so it never gets
-    // truncated by the zone's ellipsis overflow.
-    expect(composeRight({ ...base, healingStubbed: true })).toBe("healing: development stub");
-  });
-
-  it("keeps the stub hint ahead of roll and queue info", () => {
+  it("keeps the engine indicator ahead of roll and queue info", () => {
+    // First in the zone so the zone's ellipsis overflow can never truncate
+    // it away -- the placeholder warning especially must stay unmissable.
     expect(
       composeRight({
         ...base,
@@ -260,8 +286,8 @@ describe("composeRight", () => {
         approvedCount: 2,
         totalCount: 4,
         queuedJobCount: 1,
-        healingStubbed: true,
+        healingEngine: "placeholder",
       }),
-    ).toBe("healing: development stub  2/4 approved  1 job queued");
+    ).toBe("healing: placeholder model  2/4 approved  1 job queued");
   });
 });
