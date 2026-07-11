@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use fd_infer::{Detector, Ep};
@@ -126,16 +127,55 @@ struct LoadedInpainter {
 /// Cheaply cloneable handle to the (optional) inpainting model, mirroring
 /// DetectorState. None means heal_frame falls back to classical fill only.
 #[derive(Clone)]
-pub struct InpainterState(Arc<Mutex<Option<LoadedInpainter>>>);
+pub struct InpainterState {
+    inner: Arc<Mutex<Option<LoadedInpainter>>>,
+    /// Set by `load_fixture` and cleared by `load`. This is the fixture-ness
+    /// detection seam: the debug-build autoload in `lib.rs` is the one place
+    /// that KNOWS it is falling back to the mean-fill dev stub instead of
+    /// real LaMa, so it records that fact explicitly at load time by calling
+    /// `load_fixture` rather than `load`. `models::inpainter_status` reads
+    /// this flag directly -- comparing file hashes after the fact would be
+    /// guessing at something the loader already knew for certain.
+    fixture: Arc<AtomicBool>,
+    /// A real `lama.onnx` that exists on disk but failed to load (corrupt or
+    /// incompatible file), as opposed to no file at all. Recorded by the
+    /// setup path via `record_load_error` so `inpainter_load_error` can
+    /// surface it to the frontend through the same polled-status channel
+    /// `inpainter_status` already uses, instead of the previous eprintln-only
+    /// dead end. Cleared on the next successful `load`.
+    load_error: Arc<Mutex<Option<String>>>,
+}
 
 impl Default for InpainterState {
     fn default() -> Self {
-        InpainterState(Arc::new(Mutex::new(None)))
+        InpainterState {
+            inner: Arc::new(Mutex::new(None)),
+            fixture: Arc::new(AtomicBool::new(false)),
+            load_error: Arc::new(Mutex::new(None)),
+        }
     }
 }
 
 impl InpainterState {
     pub fn load(&self, path: &Path) -> Result<(), String> {
+        self.load_internal(path)?;
+        self.fixture.store(false, Ordering::SeqCst);
+        *self.load_error.lock().map_err(|e| e.to_string())? = None;
+        Ok(())
+    }
+
+    /// Loads `path` exactly like `load`, but marks the result as the dev
+    /// fixture inpainter rather than real LaMa (see the `fixture` field doc
+    /// comment for why this is a separate entry point rather than a bool
+    /// parameter on `load`: the distinct name makes every call site's intent
+    /// readable without checking an argument).
+    pub fn load_fixture(&self, path: &Path) -> Result<(), String> {
+        self.load_internal(path)?;
+        self.fixture.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn load_internal(&self, path: &Path) -> Result<(), String> {
         // CPU on purpose, with measurements (2026-07-10 benchmark): LaMa's
         // FFC/Fourier blocks are not CoreML-convertible -- the CoreML EP
         // shatters the graph into 621 partitions (46% node coverage), runs
@@ -144,11 +184,35 @@ impl InpainterState {
         // CoreML-first like the detector without re-measuring.
         let inp = fd_heal::Inpainter::load(path, fd_infer::Ep::Cpu).map_err(|e| e.to_string())?;
         let hash = crate::models::file_sha256(path)?;
-        *self.0.lock().map_err(|e| e.to_string())? = Some(LoadedInpainter {
+        *self.inner.lock().map_err(|e| e.to_string())? = Some(LoadedInpainter {
             inpainter: inp,
             hash,
         });
         Ok(())
+    }
+
+    /// True when the currently loaded model (if any) was loaded via
+    /// `load_fixture` rather than `load`. Meaningless when nothing is
+    /// loaded; callers that care check `with_inpainter(|i| i.is_some())`
+    /// first, same as `models::inpainter_status` does.
+    pub fn is_fixture(&self) -> bool {
+        self.fixture.load(Ordering::SeqCst)
+    }
+
+    /// Records a real-LaMa load failure for `inpainter_load_error` to read
+    /// back. Swallows a poisoned lock the same way `DetectorState::hash`
+    /// does elsewhere in this file: recording a diagnostic detail is not
+    /// worth propagating a hard error over.
+    pub fn record_load_error(&self, message: String) {
+        if let Ok(mut guard) = self.load_error.lock() {
+            *guard = Some(message);
+        }
+    }
+
+    /// The most recent real-LaMa load failure, if any and if not since
+    /// superseded by a successful `load`.
+    pub fn load_error(&self) -> Option<String> {
+        self.load_error.lock().ok()?.clone()
     }
 
     /// Runs `f` with mutable access to the loaded inpainter (or None).
@@ -156,7 +220,7 @@ impl InpainterState {
         &self,
         f: impl FnOnce(Option<&mut fd_heal::Inpainter>) -> R,
     ) -> Result<R, String> {
-        let mut guard = self.0.lock().map_err(|e| e.to_string())?;
+        let mut guard = self.inner.lock().map_err(|e| e.to_string())?;
         Ok(f(guard.as_mut().map(|loaded| &mut loaded.inpainter)))
     }
 
@@ -173,7 +237,7 @@ impl InpainterState {
         &self,
         f: impl FnOnce(Option<(&mut fd_heal::Inpainter, [u8; 32])>) -> R,
     ) -> Result<R, String> {
-        let mut guard = self.0.lock().map_err(|e| e.to_string())?;
+        let mut guard = self.inner.lock().map_err(|e| e.to_string())?;
         Ok(f(guard
             .as_mut()
             .map(|loaded| (&mut loaded.inpainter, loaded.hash))))
@@ -185,7 +249,7 @@ impl InpainterState {
     // and any future non-racy caller.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn hash(&self) -> Option<[u8; 32]> {
-        let guard = self.0.lock().ok()?;
+        let guard = self.inner.lock().ok()?;
         guard.as_ref().map(|loaded| loaded.hash)
     }
 }
@@ -393,5 +457,65 @@ mod tests {
             })
             .unwrap();
         assert!(saw_matching_pair);
+    }
+
+    #[test]
+    fn fresh_state_is_not_a_fixture() {
+        let state = InpainterState::default();
+        assert!(!state.is_fixture());
+    }
+
+    #[test]
+    fn load_fixture_marks_the_state_as_a_fixture() {
+        // The detection seam: `load_fixture` is a distinctly-named entry
+        // point the debug autoload calls precisely because it KNOWS it is
+        // falling back to the dev stub -- `inpainter_status` (models.rs)
+        // reads this flag rather than inferring fixture-ness later by
+        // comparing hashes.
+        let state = InpainterState::default();
+        state.load_fixture(&inpaint_fixture()).unwrap();
+        assert!(state.with_inpainter(|i| i.is_some()).unwrap());
+        assert!(state.is_fixture());
+    }
+
+    #[test]
+    fn plain_load_never_marks_the_state_as_a_fixture() {
+        // Fixture-ness is a property of the CALL SITE, not the file: loading
+        // the same fixture file through the regular `load` (as
+        // `load_inpainter`/`download_inpaint_model` do) must not be
+        // mistaken for the dev autoload.
+        let state = InpainterState::default();
+        state.load(&inpaint_fixture()).unwrap();
+        assert!(!state.is_fixture());
+    }
+
+    #[test]
+    fn a_real_load_after_a_fixture_load_clears_the_fixture_flag() {
+        let state = InpainterState::default();
+        state.load_fixture(&inpaint_fixture()).unwrap();
+        assert!(state.is_fixture());
+        state.load(&inpaint_fixture()).unwrap();
+        assert!(!state.is_fixture());
+    }
+
+    #[test]
+    fn fresh_state_has_no_load_error() {
+        let state = InpainterState::default();
+        assert!(state.load_error().is_none());
+    }
+
+    #[test]
+    fn record_load_error_is_readable_back() {
+        let state = InpainterState::default();
+        state.record_load_error("corrupt onnx header".to_string());
+        assert_eq!(state.load_error().as_deref(), Some("corrupt onnx header"));
+    }
+
+    #[test]
+    fn a_later_successful_load_clears_a_recorded_load_error() {
+        let state = InpainterState::default();
+        state.record_load_error("corrupt onnx header".to_string());
+        state.load(&inpaint_fixture()).unwrap();
+        assert!(state.load_error().is_none());
     }
 }

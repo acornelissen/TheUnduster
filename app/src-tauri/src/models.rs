@@ -124,18 +124,53 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
+/// Pure decision table behind `inpainter_status`, split out so the four
+/// outcomes are directly testable without a `tauri::AppHandle` (which needs
+/// a running app context to construct). `loaded`/`fixture` come from one
+/// `InpainterState` observation each; `available` is the on-disk check.
+///
+/// `fixture` takes priority over `available`/`missing` whenever `loaded` is
+/// true: the debug autoload always tries real LaMa first and only falls
+/// back to the fixture when it is missing or failed to load, so "loaded as
+/// fixture" already implies "not really available" from the operator's
+/// point of view, regardless of what happens to be sitting on disk.
+fn status_str(loaded: bool, fixture: bool, available: bool) -> &'static str {
+    if loaded {
+        if fixture {
+            "fixture"
+        } else {
+            "loaded"
+        }
+    } else if available {
+        "available"
+    } else {
+        "missing"
+    }
+}
+
 #[tauri::command]
 pub fn inpainter_status(
     app: tauri::AppHandle,
     inpainter: State<'_, InpainterState>,
 ) -> Result<String, String> {
-    if inpainter.with_inpainter(|i| i.is_some())? {
-        return Ok("loaded".to_string());
-    }
-    if lama_path(&app)?.is_file() {
-        return Ok("available".to_string());
-    }
-    Ok("missing".to_string())
+    let loaded = inpainter.with_inpainter(|i| i.is_some())?;
+    let fixture = inpainter.is_fixture();
+    let available = lama_path(&app)?.is_file();
+    Ok(status_str(loaded, fixture, available).to_string())
+}
+
+/// The most recent real-LaMa load failure recorded against `inpainter`, if
+/// any -- e.g. a `lama.onnx` present on disk but corrupt or otherwise
+/// unloadable. Polled by the frontend alongside `inpainter_status` at mount
+/// (and whenever that status is re-fetched) so a startup load failure that
+/// used to be an eprintln-only dead end now reaches the operator. `None`
+/// covers both "no failure" and "never attempted"; a subsequent successful
+/// load clears it (see `InpainterState::load`).
+#[tauri::command]
+pub fn inpainter_load_error(
+    inpainter: State<'_, InpainterState>,
+) -> Result<Option<String>, String> {
+    Ok(inpainter.load_error())
 }
 
 /// Runs the fallible body of the download: streams `LAMA_URL` to a temp
@@ -237,5 +272,30 @@ mod tests {
         assert!(verify_sha256(&p, good).is_ok());
         let err = verify_sha256(&p, &good.replace('9', "a")).unwrap_err();
         assert!(err.contains("checksum"));
+    }
+
+    #[test]
+    fn status_str_reports_loaded_when_a_real_model_is_loaded() {
+        assert_eq!(status_str(true, false, false), "loaded");
+        assert_eq!(status_str(true, false, true), "loaded");
+    }
+
+    #[test]
+    fn status_str_reports_fixture_when_the_loaded_model_is_the_dev_stub() {
+        // Regardless of what happens to exist on disk: a fixture load means
+        // the debug autoload already tried and failed (or found nothing) to
+        // load real LaMa, so "available" would be misleading here.
+        assert_eq!(status_str(true, true, false), "fixture");
+        assert_eq!(status_str(true, true, true), "fixture");
+    }
+
+    #[test]
+    fn status_str_reports_available_when_unloaded_but_the_file_exists() {
+        assert_eq!(status_str(false, false, true), "available");
+    }
+
+    #[test]
+    fn status_str_reports_missing_when_nothing_is_loaded_or_on_disk() {
+        assert_eq!(status_str(false, false, false), "missing");
     }
 }

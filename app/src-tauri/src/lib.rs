@@ -2469,6 +2469,7 @@ pub fn run() {
             enqueue_exports,
             queue_snapshot,
             models::inpainter_status,
+            models::inpainter_load_error,
             models::download_inpaint_model
         ])
         .register_uri_scheme_protocol("tiles", |ctx, request| {
@@ -2499,18 +2500,30 @@ pub fn run() {
                 if lama.exists() {
                     match inpainter.load(&lama) {
                         Ok(()) => loaded = true,
-                        Err(e) => eprintln!("[models] lama load failed, falling back: {e}"),
+                        Err(e) => {
+                            eprintln!("[models] lama load failed, falling back: {e}");
+                            // eprintln alone is invisible to the operator (no
+                            // terminal in a packaged app); recording it here
+                            // lets `inpainter_load_error` surface it through
+                            // the same polled-status channel the frontend
+                            // already uses for `inpainter_status`.
+                            inpainter.record_load_error(e);
+                        }
                     }
                 }
             }
             // The fixture autoload makes dev builds report a loaded inpainter,
             // which hides the model-download UI entirely; the env var lets a
-            // dev session exercise the missing/download states.
+            // dev session exercise the missing/download states. `load_fixture`
+            // (not `load`) is the fixture-ness detection seam: this call site
+            // is the one place that KNOWS it is falling back to the mean-fill
+            // dev stub, so it records that fact explicitly rather than making
+            // `inpainter_status` guess later by comparing file hashes.
             #[cfg(debug_assertions)]
             if !loaded && std::env::var("UNDUSTER_NO_FIXTURE_INPAINT").is_err() {
                 let fixtures =
                     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../engine/fixtures");
-                let _ = inpainter.load(&fixtures.join("tiny-inpaint.onnx"));
+                let _ = inpainter.load_fixture(&fixtures.join("tiny-inpaint.onnx"));
             }
             #[cfg(not(debug_assertions))]
             let _ = loaded;
