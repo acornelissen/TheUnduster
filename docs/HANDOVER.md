@@ -1,33 +1,18 @@
 # TheUnduster — Handover
 
-Snapshot for a fresh Claude Code session. Written 2026-07-11.
+Snapshot for a fresh Claude Code session. Updated 2026-07-11 (58s fixed).
 
 ## Where things stand
 
-- Branch `main`, HEAD `0d61a34`. Working tree clean, everything pushed (`.beads/interactions.jsonl` may show as modified — it is a passive bd export, leave it).
+- Branch `main`, HEAD is the tip of `main` after the 58s fix (`git log --oneline -5` to see it: fixture-status commits fe46be6 / a82ab92 / 02c147c). Working tree clean, everything pushed (`.beads/interactions.jsonl` may show as modified — it is a passive bd export, leave it).
 - The app is a macOS Tauri 2 + Svelte 5 desktop tool over a Rust engine that removes dust/scratches from scanned film: scan a roll -> review -> detect (neural) -> adjust sensitivity -> brush corrections -> heal (LaMa inpainting) -> approve -> export.
 - Two halves of the product have very different maturity:
   - **Healing/brushing/export: real and solid.** LaMa inpainting, bit-exact outside the mask, grain re-synthesis. Tonality-agnostic (works on negatives and positives alike).
   - **Detection: a development FIXTURE, not a trained model.** In debug builds it fires on noise; release builds currently load no detector at all (bead 4wj). Everything about detection quality is blocked on the owner (Albert) capturing training data — see `training/DATA.md`.
 
-## URGENT: pick this up first
+## Suggested first task
 
-### TheUnduster-58s (P1) — export heals painted areas without LaMa
-
-**Diagnosed, fix NOT yet applied.** Root cause (verified with a scratch repro, numbers in `bd show 58s`):
-
-In debug builds, `app/src-tauri/src/lib.rs` (~2509-2513) silently autoloads `engine/fixtures/tiny-inpaint.onnx` into `InpainterState` when `lama.onnx` is missing OR fails to load. That fixture is a **mean-fill stub** (`training/scripts/make_engine_fixtures.py`: `image*(1-mask) + mean*mask`) — it paints every masked pixel one flat colour, producing flat grey disks on large brush strokes while small detections mean-fill plausibly. The load failure is `eprintln`-only (~2500-2503), and `models.rs` `inpainter_status` (~127-134) reports the fixture as `"loaded"`, so nothing in the UI reveals the swap. When the model hash changes, all heal-cache entries miss (provenance binds the inpainter hash), so exports re-heal through the stub.
-
-Ruled out with evidence: the mask composition, the heal-window-batching change (byte-identical checksums pre/post), and the u8-probs change. Not a real healing bug — the real LaMa was just not loaded.
-
-**Immediate operator workaround** (already told Albert): run the app with real LaMa loaded and re-export; caches miss and re-heal correctly.
-
-**Fix direction** (three parts, was about to be dispatched):
-1. `inpainter_status` gains a distinct `"fixture"` state (alongside loaded/available/missing/downloading). Debug autoload keeps working but reports honestly; frontend `modelStatus` union widens; the Model toolbar group + download button show for `"fixture"`, plus an unmissable "development stub" hint when healing. Detect fixture-ness at the honest seam (record it at autoload time, not a hash compare at status time).
-2. Surface the lama-load-failed path to the frontend (toast via the `pushError` funnel or an error-carrying status variant) instead of `eprintln`. Mind the startup race with webview readiness — status polling may be more reliable than an emit at setup.
-3. Do NOT special-case provenance — the inpainter-hash miss that invalidates stub-made caches is correct and wanted.
-
-Two P3 follow-ups already filed from the same diagnosis: **80i** (export summary flags which inpainter healed each frame) and **cm2** (`classical_fill` leaves cores of defects larger than ~22px unfilled — a real release-build gap when no model is present).
+No P1 open. The highest-value next piece of work is **TheUnduster-1jc (P2) — cancel queued/running jobs and exports**: the biggest remaining UX gap, since a wrong "Export approved" currently commits the operator to minutes of healing with no abort. `bd show 1jc` has the shape (queue-row removal for queued jobs; cooperative abort for the running job via the existing per-defect/per-tile progress callbacks; a job-cancelled event the frontend clears state from). Alternatively **4wj (release detector story)** if Albert is ready to decide bundle-vs-download and colour/bw variant selection — that one needs his input before planning. See the full backlog below.
 
 ## How work is done here (match this)
 
@@ -53,6 +38,7 @@ Two P3 follow-ups already filed from the same diagnosis: **80i** (export summary
 - **Bit-exactness outside the mask** is structural: `fd_heal::write_back` writes native-depth pixels only at mask-true positions.
 - **Component walks are memoized and off the main thread** (bead 89m fix): `components` and `set_frame_threshold` are async + `spawn_blocking`, probs stored as `Arc<Vec<u8>>` so the CCL runs lock-free, result memoized per quantized threshold in the registry, cleared by every probs writer. The mask loop lives in `fd-tiles` for opt-3 in dev. Don't reintroduce a sync walk under the `Images` lock (the one remaining is `run_detect`'s post-detect prime — bead u98).
 - **CoreML is detector-only.** The LaMa inpainter is CPU on purpose — measured 2026-07-10: CoreML fragments it into 621 partitions, runs ~3x slower, diverges up to ~44/255. The comment at the `Ep::Cpu` site records this; do not "upgrade" it without re-measuring.
+- **The dev fixture inpainter is a mean-fill stub, not LaMa.** In debug builds, if `lama.onnx` is absent or fails to load, `lib.rs` setup autoloads `engine/fixtures/tiny-inpaint.onnx` via `InpainterState::load_fixture` — a mean-fill stub that produces flat grey fills on large brush strokes. As of the 58s fix this is now reported honestly: `inpainter_status` returns `"fixture"`, the UI shows the download card + a "healing: development stub" hint + the Heal button title warns, and a real-LaMa load failure toasts (release too). But the underlying behaviour is unchanged — if you heal in a dev build without real LaMa, results are stub-quality by design. Download real LaMa to heal for real. Caches made by the stub correctly miss when LaMa arrives (provenance binds the model hash — do not special-case this).
 
 ## Landed but pending Albert's manual gate (likely fine, just unconfirmed)
 
@@ -61,7 +47,7 @@ Two P3 follow-ups already filed from the same diagnosis: **80i** (export summary
 
 ## Open backlog, prioritized
 
-- **P1**: 58s (above).
+- **P1**: none open.
 - **P2**: 1jc (cancel queued/running jobs + exports — the biggest UX gap: a wrong "Export approved" commits minutes with no abort), 4wj (release detector story — needs Albert's decisions: bundle vs download, colour/bw variant selection), jhk (re-export only what changed), 36w (model-download timeout/cancel), 3uz (benchmark CoreML vs CPU detection on the real model).
 - **P3**: 80i, cm2, u98 (nav-lag residual), ckv (sweep orphaned cache temps), dm2 (UI register/contrast nits), 1cy/2vf close-out, jb2 (IR channel — also near-free training labels), rcb (frontend component tests — real debt: App.svelte carries the whole state machine untested), plus perf/Windows/compare-mode items (jn3, vd5, obr, fag, fuj, csb, sol, 02y).
 
