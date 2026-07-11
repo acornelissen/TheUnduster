@@ -108,6 +108,12 @@ impl Default for InpainterState {
 
 impl InpainterState {
     pub fn load(&self, path: &Path) -> Result<(), String> {
+        // CPU on purpose, with measurements (2026-07-10 benchmark): LaMa's
+        // FFC/Fourier blocks are not CoreML-convertible -- the CoreML EP
+        // shatters the graph into 621 partitions (46% node coverage), runs
+        // ~3x SLOWER than CPU (4.0s vs 1.3s per 512px window), and diverges
+        // up to ~44/255 inside the healed region. Do not "upgrade" this to
+        // CoreML-first like the detector without re-measuring.
         let inp = fd_heal::Inpainter::load(path, fd_infer::Ep::Cpu).map_err(|e| e.to_string())?;
         let hash = crate::models::file_sha256(path)?;
         *self.0.lock().map_err(|e| e.to_string())? = Some(LoadedInpainter {
