@@ -183,8 +183,13 @@
 
   // Healing model lifecycle. Starts "loaded" (not "missing") so the header
   // button doesn't flash into existence before the mount-time
-  // `inpainter_status` fetch resolves.
-  let modelStatus: "loaded" | "available" | "missing" | "downloading" = $state("loaded");
+  // `inpainter_status` fetch resolves. "fixture" means a dev-only mean-fill
+  // stub is loaded in place of real LaMa (debug builds only) -- healing
+  // still runs, but produces flat grey fills on brushed areas instead of an
+  // actual inpaint, so the toolbar and status bar must make that
+  // unmissable (see `healingStubbed` below and the Model toolbar group).
+  type ModelStatus = "loaded" | "available" | "missing" | "downloading" | "fixture";
+  let modelStatus: ModelStatus = $state("loaded");
   let modelReceived = $state(0);
   let modelTotal: number | null = $state(null);
 
@@ -633,10 +638,26 @@
   $effect(() => {
     (async () => {
       try {
-        modelStatus = await invoke<"loaded" | "available" | "missing">("inpainter_status");
+        modelStatus = await invoke<"loaded" | "available" | "missing" | "fixture">(
+          "inpainter_status",
+        );
       } catch (e) {
         pushError(String(e));
         modelStatus = "missing";
+        return;
+      }
+      // A "fixture" status alone already tells the operator real LaMa isn't
+      // loaded; this fetches the WHY when it's a genuine load failure (a
+      // corrupt/incompatible lama.onnx on disk) rather than a plain missing
+      // file, so that surprising case reaches the error toast/log instead
+      // of staying an eprintln-only dead end on the backend.
+      if (modelStatus === "fixture") {
+        try {
+          const loadError = await invoke<string | null>("inpainter_load_error");
+          if (loadError) pushError(`healing model failed to load: ${loadError}`);
+        } catch (e) {
+          pushError(String(e));
+        }
       }
     })();
   });
@@ -669,7 +690,9 @@
       modelTotal = null;
       (async () => {
         try {
-          const s = await invoke<"loaded" | "available" | "missing">("inpainter_status");
+          const s = await invoke<"loaded" | "available" | "missing" | "fixture">(
+            "inpainter_status",
+          );
           // A retry click may have started a new download while this refetch
           // was in flight; never clobber the live downloading state.
           if (modelStatus !== "downloading") modelStatus = s;
@@ -1337,7 +1360,9 @@
       // event path at all.
       pushError(String(e));
       try {
-        const s = await invoke<"loaded" | "available" | "missing">("inpainter_status");
+        const s = await invoke<"loaded" | "available" | "missing" | "fixture">(
+          "inpainter_status",
+        );
         if (modelStatus !== "downloading") modelStatus = s;
       } catch (e2) {
         pushError(String(e2));
@@ -1441,6 +1466,10 @@
       totalCount: r ? r.frames.length : 0,
     });
   });
+  // Shared by the status bar and the Heal button titles below -- one
+  // definition of "is healing currently stubbed" so both surfaces can never
+  // disagree.
+  const healingStubbed = $derived.by(() => modelStatus === "fixture");
   const statusRight = $derived.by(() => {
     const r = roll;
     return composeRight({
@@ -1448,6 +1477,7 @@
       approvedCount: r ? r.frames.filter((f) => f.approved).length : 0,
       totalCount: r ? r.frames.length : 0,
       queuedJobCount,
+      healingStubbed,
     });
   });
 
@@ -1647,7 +1677,9 @@
         </button>
         <button
           class="btn btn-primary"
-          title="Heal (h)"
+          title={healingStubbed
+            ? "Heal (h) — development stub: no real healing model loaded"
+            : "Heal (h)"}
           onclick={requestHeal}
           disabled={loading !== null || isDetecting || isHealing || !info}
         >
@@ -1675,7 +1707,9 @@
         {/if}
         <button
           class="btn btn-primary"
-          title="Heal approved"
+          title={healingStubbed
+            ? "Heal approved — development stub: no real healing model loaded"
+            : "Heal approved"}
           onclick={healApproved}
           disabled={roll.frames.every((f) => !f.approved)}
         >
@@ -1719,6 +1753,8 @@
             Download healing model (207 MB)
           {:else if modelStatus === "available"}
             Repair healing model
+          {:else if modelStatus === "fixture"}
+            Download real healing model (207 MB)
           {:else if modelStatus === "downloading"}
             Downloading...
           {/if}

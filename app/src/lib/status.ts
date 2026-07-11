@@ -4,7 +4,7 @@
  * particular -- has direct test coverage without mounting Svelte. */
 
 export interface ActivityInput {
-  modelStatus: "loaded" | "available" | "missing" | "downloading";
+  modelStatus: "loaded" | "available" | "missing" | "downloading" | "fixture";
   modelProgressText: string;
   exporting: boolean;
   exportDetail: string | null;
@@ -109,12 +109,24 @@ export interface RightZoneInput {
   approvedCount: number;
   totalCount: number;
   queuedJobCount: number;
+  /** True when the loaded inpainter is the mean-fill dev fixture, not real
+   * LaMa -- i.e. every heal right now produces a flat grey fill on brushed
+   * areas instead of an actual inpaint. This has to be persistent and
+   * impossible to miss (unlike `composeActivity`'s single transient slot,
+   * which real activity like exporting or detecting would otherwise push
+   * this out of), so it lives in the always-visible right zone instead. */
+  healingStubbed: boolean;
 }
 
-/** Counts string for the right zone: roll approval progress and queued job
- * count. */
+/** Counts string for the right zone: the development-stub hint (when the
+ * inpainter is the dev fixture), roll approval progress, and queued job
+ * count -- in that order, so the stub hint is never the part truncated by
+ * the zone's overflow ellipsis. */
 export function composeRight(input: RightZoneInput): string {
   const parts: string[] = [];
+  if (input.healingStubbed) {
+    parts.push("healing: development stub");
+  }
   if (input.roll) {
     parts.push(`${input.approvedCount}/${input.totalCount} approved`);
   }

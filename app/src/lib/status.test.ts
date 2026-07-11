@@ -211,33 +211,57 @@ describe("composeLeft", () => {
 });
 
 describe("composeRight", () => {
+  const base = {
+    roll: false,
+    approvedCount: 0,
+    totalCount: 0,
+    queuedJobCount: 0,
+    healingStubbed: false,
+  };
+
   it("renders nothing when there is no roll and no queued jobs", () => {
-    expect(composeRight({ roll: false, approvedCount: 0, totalCount: 0, queuedJobCount: 0 })).toBe(
-      "",
-    );
+    expect(composeRight(base)).toBe("");
   });
 
   it("renders approved counts for a roll", () => {
-    expect(
-      composeRight({ roll: true, approvedCount: 2, totalCount: 4, queuedJobCount: 0 }),
-    ).toBe("2/4 approved");
+    expect(composeRight({ ...base, roll: true, approvedCount: 2, totalCount: 4 })).toBe(
+      "2/4 approved",
+    );
   });
 
   it("appends queued job count when jobs are queued", () => {
     expect(
-      composeRight({ roll: true, approvedCount: 2, totalCount: 4, queuedJobCount: 3 }),
+      composeRight({ ...base, roll: true, approvedCount: 2, totalCount: 4, queuedJobCount: 3 }),
     ).toBe("2/4 approved  3 jobs queued");
   });
 
   it("uses singular job wording for exactly one queued job", () => {
     expect(
-      composeRight({ roll: true, approvedCount: 0, totalCount: 4, queuedJobCount: 1 }),
+      composeRight({ ...base, roll: true, approvedCount: 0, totalCount: 4, queuedJobCount: 1 }),
     ).toBe("0/4 approved  1 job queued");
   });
 
   it("renders only the queued job count outside roll mode", () => {
+    expect(composeRight({ ...base, queuedJobCount: 2 })).toBe("2 jobs queued");
+  });
+
+  it("leads with the development-stub hint when the inpainter is the dev fixture", () => {
+    // Unmissable and persistent: this must show regardless of roll state or
+    // activity, and ahead of everything else in the zone so it never gets
+    // truncated by the zone's ellipsis overflow.
+    expect(composeRight({ ...base, healingStubbed: true })).toBe("healing: development stub");
+  });
+
+  it("keeps the stub hint ahead of roll and queue info", () => {
     expect(
-      composeRight({ roll: false, approvedCount: 0, totalCount: 0, queuedJobCount: 2 }),
-    ).toBe("2 jobs queued");
+      composeRight({
+        ...base,
+        roll: true,
+        approvedCount: 2,
+        totalCount: 4,
+        queuedJobCount: 1,
+        healingStubbed: true,
+      }),
+    ).toBe("healing: development stub  2/4 approved  1 job queued");
   });
 });
