@@ -13,7 +13,6 @@
   import ShortcutsPanel from "./lib/ShortcutsPanel.svelte";
   import { composeQueueEntries, type QueueProgress } from "./lib/queue";
   import { routeDrop, type PathKind } from "./lib/drop";
-  import { nextUnapprovedIndex } from "./lib/roll-nav";
   import type { Level } from "./lib/viewport";
   import { undoStroke, redoStroke, type StrokeData } from "./lib/brush";
   import { composeActivity, composeLeft, composeRight } from "./lib/status";
@@ -221,7 +220,7 @@
     Object.values(jobStates).some((j) => j.kind === "export" && j.state === "running"),
   );
   // The index of the frame actually on screen. `currentIndex` is set
-  // synchronously on navigation (stepFrame/selectFrame/approveAndAdvance)
+  // synchronously on navigation (stepFrame/selectFrame)
   // before `activate_frame` resolves, so during that window the OLD frame is
   // still displayed while `currentIndex` already points at the NEW one.
   // `displayedIndex` only advances once an activation actually lands (both
@@ -1019,7 +1018,9 @@
     void activateCurrentFrame();
   }
 
-  async function approveAndAdvance() {
+  // Approves in place. This used to auto-advance to the next unapproved
+  // frame; the operator asked for it back out -- moving on is , and .'s job.
+  async function approveCurrent() {
     if (!roll) return;
     const frame = roll.frames[currentIndex];
     frame.approved = true;
@@ -1027,24 +1028,10 @@
       await invoke("approve_frame", { index: currentIndex, approved: true });
     } catch (e) {
       pushError(String(e));
-      return;
-    }
-    // Wrapping search: an operator may approve out of order, and A should
-    // always land on remaining work anywhere in the roll until none is left.
-    const next = nextUnapprovedIndex(
-      roll.frames.map((f) => f.approved),
-      currentIndex,
-    );
-    if (next !== -1) {
-      currentIndex = next;
-      await activateCurrentFrame();
     }
   }
 
-  // Inverse of approveAndAdvance: un-marks the current frame without
-  // advancing. Un-approving is a correction, not a step forward through the
-  // roll -- the operator stays put on the frame they just changed their mind
-  // about.
+  // Inverse of approveCurrent: un-marks the current frame.
   async function unapproveCurrent() {
     if (!roll) return;
     const frame = roll.frames[currentIndex];
@@ -1477,7 +1464,7 @@
       if (e.shiftKey) {
         void unapproveCurrent();
       } else {
-        void approveAndAdvance();
+        void approveCurrent();
       }
     }
   }
@@ -1535,7 +1522,7 @@
             <Icon name="unapprove" /> Unapprove
           </button>
         {:else}
-          <button class="btn" title="Approve and advance (a)" onclick={approveAndAdvance}>
+          <button class="btn" title="Approve (a)" onclick={approveCurrent}>
             <Icon name="approve" /> Approve
           </button>
         {/if}

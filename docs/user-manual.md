@@ -52,7 +52,7 @@ Once a frame is healed, press `space` to flip between the original and the heale
 
 When you open a roll, a filmstrip of thumbnails appears along the bottom. Use `,` and `.` to move to the previous or next frame, or click a thumbnail directly.
 
-Press `a` to approve the current frame and jump to the next frame that hasn't been approved yet. Approving marks a frame as done and ready to export.
+Press `a` to approve the current frame — marking it done and ready to export. Move on with `,` and `.` when you're ready.
 
 Changed your mind? Press `shift-a`, or click the "Unapprove" button that replaces "Approve" on an approved frame, to un-approve it. This doesn't advance to another frame — you stay put.
 
@@ -115,7 +115,7 @@ Press `?` at any time to open the in-app shortcuts panel. It's the authoritative
 | Key | Action |
 | --- | --- |
 | `,` / `.` | Previous/next frame |
-| `a` | Approve and advance |
+| `a` | Approve the current frame |
 | `shift-a` | Unapprove |
 
 **Everywhere**
