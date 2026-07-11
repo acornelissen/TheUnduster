@@ -862,9 +862,16 @@
    * single-image reopen) without running a fresh detect. `components`
    * succeeds iff probabilities are cached; failure just means none exist yet
    * -- benign, the stored-bbox fallback stays in charge. On success this
-   * flips `detected` (re-arming the Viewer's slider-effect and switching
-   * markerSource to live detections) and refreshes the Viewer so rings and
-   * the live count populate immediately.
+   * hands the boxes straight to the Viewer (`setDetections`, no second
+   * invoke) and flips `detected` (re-arming the Viewer's slider-effect and
+   * switching markerSource to live detections) so rings and the live count
+   * populate immediately.
+   *
+   * This is the only CCL walk an activation triggers: `setDetections` records
+   * `overlay.threshold` as the Viewer's `lastFetchedThreshold`, so the
+   * `detected` flip below -- which reruns the Viewer's slider $effect --
+   * finds the threshold unchanged and skips its debounced refetch instead of
+   * re-invoking `components` with the identical id+threshold.
    *
    * The registry's own probs restore is a fire-and-forget background task on
    * the Rust side, so a probe taken right at activation can race it and miss.
@@ -884,10 +891,11 @@
         // Fill the Viewer's live detections BEFORE flipping `detected`:
         // markerSource switches sources on the flip, and the frame-switch
         // reset left `detections` empty, so flipping first would paint a
-        // rings-less frame if anything redraws mid-refetch. (refreshDetections
-        // also feeds liveDefectCount via onDetectionsChange.)
-        await viewer?.refreshDetections(overlay.threshold);
-        if (info?.id !== id) return true; // stale: frame changed during the refresh
+        // rings-less frame if anything redraws mid-refetch. (setDetections
+        // also feeds liveDefectCount via onDetectionsChange.) Synchronous --
+        // no invoke, so no stale-frame check needed between this and the
+        // flip below.
+        viewer?.setDetections(components, overlay.threshold);
         detected = true;
         liveDefectCount = components.length;
         return true;

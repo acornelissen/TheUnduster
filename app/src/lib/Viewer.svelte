@@ -68,6 +68,13 @@
   let detections: [number, number, number, number][] = $state([]);
   let current = -1;
   let showHealed = $state(false);
+  // The threshold `detections` was last populated for -- via a fresh
+  // `components` fetch (refreshDetections) or a caller-supplied result
+  // (setDetections). Lets the slider $effect below tell "the threshold
+  // actually changed" apart from "detected flipped true/false at the same
+  // threshold", so a probe-driven detected flip doesn't schedule a redundant
+  // refetch of data it was just handed.
+  let lastFetchedThreshold: number | null = null;
   // True from the moment a slider-driven refetch is (re)scheduled until
   // refreshDetections resolves; drives the dimmed defect-ring paint below so
   // the operator can see the rings are stale rather than trusting circles
@@ -104,6 +111,7 @@
     lastInfoId = info.id;
     detections = [];
     current = -1;
+    lastFetchedThreshold = null;
     showHealed = false;
     // Strokes themselves arrive per-frame via props and belong to App; only
     // the transient in-canvas brush mode resets here.
@@ -134,6 +142,7 @@
       detections = await invoke("components", { id: info.id, threshold });
       // Only on success: a failed fetch (no probabilities yet) must not
       // report a count, so the status bar's fallback copy stays in charge.
+      lastFetchedThreshold = threshold;
       onDetectionsChange?.(detections.length);
     } catch {
       // no detection run yet; leave detections empty until `detect` succeeds
@@ -145,6 +154,27 @@
     // Explicit redraw trigger: the overlay repaints once the component list
     // (used by z/Z cycling) is fetched. This replaces relying on a Viewer
     // remount to force a redraw.
+    requestFrame();
+  }
+
+  /** Feeds detections the caller already fetched (the activation probe's own
+   * `components` call) straight into the viewer, instead of App awaiting a
+   * second `refreshDetections` call that would re-invoke `components` with
+   * the identical id+threshold. Same net effect as `refreshDetections` on
+   * success -- detections replace, cycling resets, the live count updates,
+   * a redraw is requested -- minus the invoke. `threshold` records as
+   * `lastFetchedThreshold` so the slider $effect below recognizes these
+   * detections are already current for that threshold and, when the caller
+   * flips `detected` right after this call, does not schedule a redundant
+   * debounced refetch. */
+  export function setDetections(
+    boxes: [number, number, number, number][],
+    threshold: number,
+  ) {
+    detections = boxes;
+    current = -1;
+    lastFetchedThreshold = threshold;
+    onDetectionsChange?.(detections.length);
     requestFrame();
   }
 
@@ -193,11 +223,18 @@
     // mount: only invoke it when a detection actually exists, so a fresh
     // Viewer mount doesn't fire a doomed `components` call before `detect`
     // has ever run.
+    //
+    // This effect also reruns when `detected` flips true with the threshold
+    // unchanged (the activation probe's detected-flip): `setDetections`
+    // recorded that threshold as `lastFetchedThreshold`, so the refetch below
+    // is skipped -- the detections it would fetch are already in hand. A
+    // genuine threshold change never matches `lastFetchedThreshold` and still
+    // refetches, keeping the slider live.
     const threshold = overlay.threshold;
     void overlay.enabled;
     requestFrame();
     clearTimeout(refreshTimer);
-    if (detected) {
+    if (detected && threshold !== lastFetchedThreshold) {
       refreshPending = true;
       refreshTimer = setTimeout(() => {
         refreshDetections(threshold);
