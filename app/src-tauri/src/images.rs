@@ -73,6 +73,15 @@ struct Entry {
     /// until `detect` has run for this image. u8, not f32: a detected 168MP
     /// frame retains ~168MB instead of ~672MB.
     probs: Option<(Vec<u8>, ProbPyramid)>,
+    /// Memoized [`Images::components`] result for the most recently queried
+    /// threshold, keyed by its quantized value ([`quantize_prob`] -- the same
+    /// rule `threshold_mask_from_probs` compares against, so the memo key
+    /// matches membership exactly). One entry, not a map: the activation
+    /// probe and the sensitivity slider both repeat "the current threshold",
+    /// which a single last-threshold memo already captures; anything more
+    /// would be unbounded growth for no observed repeat pattern. Cleared by
+    /// every probs writer (`set_probs_built`; `close` drops the whole entry).
+    components_memo: Option<(u8, Vec<[u32; 4]>)>,
     healed: Option<HealedData>,
 }
 
@@ -180,6 +189,7 @@ impl Images {
                 image: prepared.image,
                 pyramid: prepared.pyramid,
                 probs: None,
+                components_memo: None,
                 healed: None,
             },
         );
@@ -392,6 +402,9 @@ impl Images {
             }
         }
         entry.probs = Some((probs, pyramid));
+        // Fresh probabilities invalidate any memoized component walk -- it
+        // was computed against the probs this call just replaced.
+        entry.components_memo = None;
         true
     }
 
@@ -413,11 +426,25 @@ impl Images {
     /// probability map, capped at [`MAX_COMPONENTS`]: a pathological mask
     /// (bad model or threshold) can otherwise produce hundreds of thousands
     /// of boxes that are useless for navigation and expensive to serialize.
-    pub fn components(&self, id: u64, threshold: f32) -> Option<Vec<[u32; 4]>> {
-        let entry = self.entries.get(&id)?;
+    ///
+    /// Memoized per entry against the quantized threshold (see
+    /// [`Entry::components_memo`]): a repeat call at the same threshold --
+    /// the activation probe re-deriving what a frame switch just fetched, or
+    /// a slider settling back where it started -- returns the cached boxes
+    /// instead of re-running the CCL walk.
+    pub fn components(&mut self, id: u64, threshold: f32) -> Option<Vec<[u32; 4]>> {
+        let qt = quantize_prob(threshold);
+        let entry = self.entries.get_mut(&id)?;
+        if let Some((memo_qt, boxes)) = &entry.components_memo {
+            if *memo_qt == qt {
+                return Some(boxes.clone());
+            }
+        }
         let (probs, _) = entry.probs.as_ref()?;
         let (w, h) = (entry.image.width, entry.image.height);
-        Some(components_from_probs(probs, w, h, threshold))
+        let boxes = components_from_probs(probs, w, h, threshold);
+        entry.components_memo = Some((qt, boxes.clone()));
+        Some(boxes)
     }
 
     pub fn close(&mut self, id: u64) {
@@ -535,6 +562,81 @@ mod tests {
         assert_eq!((b[0], b[1], b[2], b[3]), (200, 100, 205, 104));
         assert!(images.prob_tile(999, 0, 0, 0).is_none());
         assert!(images.components(info.id, 0.9).unwrap().is_empty());
+    }
+
+    #[test]
+    fn components_memoizes_same_threshold_and_recomputes_on_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_png(&dir, 600, 400);
+        let mut images = Images::default();
+        let info = images.open(&path).unwrap();
+        let mut probs = vec![0u8; 600 * 400];
+        probs[100 * 600 + 200] = quantize_prob(0.8);
+        assert!(images.set_probs(info.id, probs));
+
+        let first = images.components(info.id, 0.5).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            images.entries.get(&info.id).unwrap().components_memo,
+            Some((quantize_prob(0.5), first.clone()))
+        );
+
+        // Mutate the stored probs directly, bypassing `set_probs` -- the
+        // memo is NOT invalidated by this. A genuine recompute at the same
+        // threshold would see the added component; a memoized result won't.
+        images
+            .entries
+            .get_mut(&info.id)
+            .unwrap()
+            .probs
+            .as_mut()
+            .unwrap()
+            .0[300 * 600 + 400] = quantize_prob(0.9);
+
+        let memoized = images.components(info.id, 0.5).unwrap();
+        assert_eq!(memoized.len(), 1, "same-threshold call must not recompute");
+
+        let recomputed = images.components(info.id, 0.51).unwrap();
+        assert_eq!(recomputed.len(), 2, "threshold change must recompute");
+        assert_eq!(
+            images.entries.get(&info.id).unwrap().components_memo,
+            Some((quantize_prob(0.51), recomputed))
+        );
+    }
+
+    #[test]
+    fn set_probs_clears_the_memo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_png(&dir, 600, 400);
+        let mut images = Images::default();
+        let info = images.open(&path).unwrap();
+        let mut probs = vec![0u8; 600 * 400];
+        probs[100 * 600 + 200] = quantize_prob(0.8);
+        assert!(images.set_probs(info.id, probs));
+        assert_eq!(images.components(info.id, 0.5).unwrap().len(), 1);
+        assert!(images
+            .entries
+            .get(&info.id)
+            .unwrap()
+            .components_memo
+            .is_some());
+
+        let mut fresh = vec![0u8; 600 * 400];
+        fresh[300 * 600 + 400] = quantize_prob(0.9);
+        assert!(images.set_probs(info.id, fresh));
+        assert!(
+            images
+                .entries
+                .get(&info.id)
+                .unwrap()
+                .components_memo
+                .is_none(),
+            "set_probs must clear the memo"
+        );
+
+        // A same-threshold call after set_probs must reflect the new probs,
+        // not a stale memoized count.
+        assert_eq!(images.components(info.id, 0.5).unwrap().len(), 1);
     }
 
     #[test]

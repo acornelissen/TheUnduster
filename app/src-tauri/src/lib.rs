@@ -407,7 +407,7 @@ fn components(
     id: u64,
     threshold: f32,
 ) -> Result<Vec<[u32; 4]>, String> {
-    let images = images.lock().map_err(|e| e.to_string())?;
+    let mut images = images.lock().map_err(|e| e.to_string())?;
     images
         .components(id, threshold)
         .ok_or_else(|| format!("no detection for image {id}"))
@@ -896,7 +896,7 @@ fn set_frame_threshold(
 ) -> Result<Option<usize>, String> {
     let (count, bboxes) = match roll.image_id(index)? {
         Some(id) => {
-            let images = images.lock().map_err(|e| e.to_string())?;
+            let mut images = images.lock().map_err(|e| e.to_string())?;
             match images.components(id, threshold) {
                 Some(bboxes) => (Some(bboxes.len()), Some(bboxes)),
                 None => (None, None),
