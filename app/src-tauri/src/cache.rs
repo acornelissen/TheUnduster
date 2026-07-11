@@ -409,6 +409,85 @@ pub fn write_heal(
     atomic_write(path, &header)
 }
 
+/// The fixed-size fields of a heal cache header, parsed once and shared by
+/// every reader (`read_heal`'s full reconstruction and `heal_cache_matches`'s
+/// header-only probe) so the byte layout is defined in exactly one place.
+struct HealHeader {
+    width: u32,
+    height: u32,
+    channels: u8,
+    depth: u8,
+    provenance: [u8; 32],
+}
+
+/// Parses magic + version + width + height + channels + depth + provenance
+/// from the first `HEAL_HEADER_LEN` bytes of a heal cache file. `None` means
+/// structurally invalid -- too short, wrong magic, or an unknown version --
+/// exactly the class `read_heal` treats as corrupt (delete on sight). A
+/// `Some` result says only "these fields parsed"; the stored dims/channels/
+/// depth/provenance may still mismatch what the caller expected (a miss, not
+/// corruption) -- callers compare them and decide.
+fn parse_heal_header(bytes: &[u8]) -> Option<HealHeader> {
+    if bytes.len() < HEAL_HEADER_LEN {
+        return None;
+    }
+    if &bytes[0..8] != HEAL_MAGIC {
+        return None;
+    }
+    let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    if version != 1 {
+        return None;
+    }
+    let width = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    let height = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+    let channels = bytes[20];
+    let depth = bytes[21];
+    let mut provenance = [0u8; 32];
+    provenance.copy_from_slice(&bytes[22..54]);
+    Some(HealHeader {
+        width,
+        height,
+        channels,
+        depth,
+        provenance,
+    })
+}
+
+/// Checks whether the heal-cache entry at `path` matches `provenance`,
+/// reading only the fixed-size header (`HEAL_HEADER_LEN` bytes: magic,
+/// version, dims/channels/depth, provenance) and never touching the mask or
+/// values payload. Used by the healed-cached probe (`heal_cached` /
+/// `healed_cached_all` in lib.rs): the probe answers "would reactivating
+/// this frame replay an existing heal" without paying for the zstd decode a
+/// full `read_heal` costs, and without decoding the source image at all --
+/// the probe has no `original` `ImageBuf` to compare dims against, but the
+/// provenance hash already binds the source stamp (see `heal_provenance`),
+/// so a provenance match alone is sufficient: it can only be produced by a
+/// heal computed against the same source, threshold, strokes, and model
+/// hashes as right now.
+///
+/// Absent file, truncated file, bad magic/version, or a provenance mismatch
+/// are all treated the same: not a match, no error. Unlike `read_heal`, a
+/// malformed file is NOT deleted here -- this may run once per frame across
+/// a whole roll at open time, and a read-only probe must have no filesystem
+/// side effect merely from being asked a question; `read_heal`'s real read
+/// (triggered by an actual heal) still purges malformed files on sight.
+pub fn heal_cache_matches(path: &Path, provenance: &[u8; 32]) -> bool {
+    use std::io::Read;
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false, // absent file is not a match, not an error
+    };
+    let mut header = [0u8; HEAL_HEADER_LEN];
+    if file.read_exact(&mut header).is_err() {
+        return false; // truncated file
+    }
+    match parse_heal_header(&header) {
+        Some(h) => h.provenance == *provenance,
+        None => false,
+    }
+}
+
 /// Reconstructs the healed image (original + patch) IF the cache entry
 /// matches the requested provenance and the original's dimensions/depth.
 /// Returns the healed copy and the mask. None on any mismatch; malformed
@@ -428,35 +507,15 @@ pub fn read_heal(
         None
     };
 
-    if bytes.len() < HEAL_HEADER_LEN {
+    let Some(header) = parse_heal_header(&bytes) else {
         return corrupt();
-    }
-
-    let mut offset = 0;
-
-    if &bytes[offset..offset + 8] != HEAL_MAGIC {
-        return corrupt();
-    }
-    offset += 8;
-
-    let version = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-    offset += 4;
-    if version != 1 {
-        return corrupt();
-    }
-
-    let stored_width = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-    offset += 4;
-    let stored_height = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-    offset += 4;
-
-    let stored_channels = bytes[offset];
-    offset += 1;
-    let stored_depth = bytes[offset];
-    offset += 1;
-
-    let stored_provenance: &[u8] = &bytes[offset..offset + 32];
-    offset += 32;
+    };
+    let mut offset = HEAL_HEADER_LEN - 8; // header ends right after provenance; mask_comp_len follows
+    let stored_width = header.width;
+    let stored_height = header.height;
+    let stored_channels = header.channels;
+    let stored_depth = header.depth;
+    let stored_provenance = &header.provenance[..];
 
     // Structural bounds (magic/version/lengths) are corruption when wrong.
     // Well-formed-but-mismatched dims/depth/channels/provenance is a miss:
@@ -1324,6 +1383,94 @@ mod tests {
         assert!(
             !p.exists(),
             "oversized values decompression is treated as corruption"
+        );
+    }
+
+    #[test]
+    fn heal_cache_matches_true_on_a_matching_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.heal");
+        let original = noisy16(16, 16);
+        let healed = original.clone();
+        let mask = vec![false; 256];
+        let prov = heal_provenance(0.5, 2, &[], &[3u8; 32], &[4u8; 32], &stamp());
+        write_heal(&p, &original, &healed, &mask, &prov).unwrap();
+
+        assert!(heal_cache_matches(&p, &prov));
+    }
+
+    #[test]
+    fn heal_cache_matches_false_on_provenance_drift_or_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.heal");
+        let original = noisy16(16, 16);
+        let healed = original.clone();
+        let mask = vec![false; 256];
+        let prov = heal_provenance(0.5, 2, &[], &[3u8; 32], &[4u8; 32], &stamp());
+        write_heal(&p, &original, &healed, &mask, &prov).unwrap();
+
+        let drifted = heal_provenance(0.51, 2, &[], &[3u8; 32], &[4u8; 32], &stamp());
+        assert!(!heal_cache_matches(&p, &drifted));
+
+        // Absent file: no cache entry at all is simply not a match, not an
+        // error -- mirrors every other cache probe's absent-is-a-miss rule.
+        let absent = dir.path().join("nope.heal");
+        assert!(!heal_cache_matches(&absent, &prov));
+    }
+
+    #[test]
+    fn heal_cache_matches_never_reads_the_payload() {
+        // The whole point of a header-only probe is that it must not pay for
+        // (or be fooled or crashed by) a corrupt/bomb payload -- only the
+        // fixed-size header, which the provenance hash alone lives in, is
+        // read. Corrupt the mask+values payload bytes after a valid write and
+        // confirm the match still succeeds (proving the payload was never
+        // touched) and the file is left alone (a read-only probe must have no
+        // filesystem side effects).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.heal");
+        let original = noisy16(16, 16);
+        let healed = original.clone();
+        let mask = vec![false; 256];
+        let prov = heal_provenance(0.5, 2, &[], &[3u8; 32], &[4u8; 32], &stamp());
+        write_heal(&p, &original, &healed, &mask, &prov).unwrap();
+
+        let mut bytes = std::fs::read(&p).unwrap();
+        let payload_start = HEAL_HEADER_LEN;
+        for b in &mut bytes[payload_start..] {
+            *b ^= 0xff;
+        }
+        std::fs::write(&p, &bytes).unwrap();
+
+        assert!(
+            heal_cache_matches(&p, &prov),
+            "a header-only probe must match on provenance alone, \
+             regardless of a corrupt payload"
+        );
+        assert!(p.exists(), "a read-only probe must never delete the file");
+    }
+
+    #[test]
+    fn heal_cache_matches_rejects_truncated_or_wrong_magic_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let prov = heal_provenance(0.5, 2, &[], &[3u8; 32], &[4u8; 32], &stamp());
+
+        let short = dir.path().join("short.heal");
+        std::fs::write(&short, vec![0u8; HEAL_HEADER_LEN - 1]).unwrap();
+        assert!(!heal_cache_matches(&short, &prov));
+        assert!(
+            short.exists(),
+            "a read-only probe must never delete the file"
+        );
+
+        let wrong_magic = dir.path().join("wrong.heal");
+        let mut bytes = vec![0u8; HEAL_HEADER_LEN];
+        bytes[0..8].copy_from_slice(b"NOTHEAL!");
+        std::fs::write(&wrong_magic, bytes).unwrap();
+        assert!(!heal_cache_matches(&wrong_magic, &prov));
+        assert!(
+            wrong_magic.exists(),
+            "a read-only probe must never delete the file"
         );
     }
 

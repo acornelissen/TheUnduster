@@ -288,6 +288,11 @@ impl Roll {
     }
 }
 
+/// `(file_name, threshold, strokes)` -- the subset of a frame's fields the
+/// healed-cache batch probe needs, returned by `RollState::frames_meta_snapshot`.
+/// Named to keep that function's signature clippy-clean (`type_complexity`).
+pub type FrameMeta = (String, f32, Vec<crate::masks::Stroke>);
+
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct FrameInfo {
     pub index: usize,
@@ -768,6 +773,25 @@ impl RollState {
         Ok((indices, self.generation.load(Ordering::SeqCst)))
     }
 
+    /// Every frame's `(file_name, threshold, strokes)` plus the roll's own
+    /// directory, read under one lock acquisition -- the healed-cache batch
+    /// probe (`healed_cached_all` in lib.rs) needs exactly these fields for
+    /// every frame to compute each one's heal provenance, and grabbing them
+    /// one frame at a time (N separate `roll.lock()` round-trips for an
+    /// N-frame roll) buys nothing: nothing else mutates frame state between
+    /// them that the probe needs to observe consistently, unlike
+    /// `approved_snapshot`'s indices+generation pairing.
+    pub fn frames_meta_snapshot(&self) -> Result<(PathBuf, Vec<FrameMeta>), String> {
+        let guard = self.roll.lock().map_err(|e| e.to_string())?;
+        let roll = guard.as_ref().ok_or("no roll open")?;
+        let frames = roll
+            .frames
+            .iter()
+            .map(|f| (f.file_name.clone(), f.threshold, f.strokes.clone()))
+            .collect();
+        Ok((roll.dir.clone(), frames))
+    }
+
     /// A single frame's `image_id` presence AND the roll generation, read
     /// under one lock acquisition. `enqueue_job`'s validation shape used to
     /// be `roll.image_id(index)?` (bounds/roll-open check, discarding the
@@ -1183,6 +1207,45 @@ mod state_tests {
     fn approved_snapshot_errors_when_no_roll_open() {
         let state = RollState::default();
         assert!(state.approved_snapshot().unwrap_err().contains("no roll"));
+    }
+
+    #[test]
+    fn frames_meta_snapshot_returns_dir_and_every_frames_threshold_and_strokes() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in ["a.png", "b.png"] {
+            std::fs::write(dir.path().join(n), b"x").unwrap();
+        }
+        let state = RollState::default();
+        state.open(dir.path()).unwrap();
+        state
+            .set_threshold_and_components(state.generation(), 1, 0.75, None, None)
+            .unwrap();
+        let stroke = crate::masks::Stroke {
+            erase: false,
+            radius: 5.0,
+            points: vec![[1.0, 2.0]],
+        };
+        state
+            .set_strokes(1, vec![stroke.clone()], Vec::new())
+            .unwrap();
+
+        let (returned_dir, frames) = state.frames_meta_snapshot().unwrap();
+        assert_eq!(returned_dir, dir.path());
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            frames[0],
+            ("a.png".to_string(), default_threshold(), vec![])
+        );
+        assert_eq!(frames[1], ("b.png".to_string(), 0.75, vec![stroke]));
+    }
+
+    #[test]
+    fn frames_meta_snapshot_errors_when_no_roll_open() {
+        let state = RollState::default();
+        assert!(state
+            .frames_meta_snapshot()
+            .unwrap_err()
+            .contains("no roll"));
     }
 
     #[test]

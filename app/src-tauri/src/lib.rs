@@ -401,6 +401,112 @@ fn load_inpainter(state: State<'_, detect::InpainterState>, path: String) -> Res
     state.load(std::path::Path::new(&path))
 }
 
+/// Probes whether frame `index`'s on-disk heal cache matches its CURRENT
+/// persisted inputs (threshold, strokes) plus the live detector/inpainter
+/// hashes and source stamp -- i.e. whether reactivating this frame would
+/// replay an existing heal instantly, even if the frame was evicted or the
+/// app restarted since. This is the single-frame counterpart to
+/// `healed_cached_all`; both share the exact provenance recipe `run_heal`
+/// uses (see that function's `with_inpainter_hashed` comment) so a probe can
+/// never disagree with what a real heal would actually hit or miss.
+///
+/// A plain sync command, not async: unlike `heal_frame`, there is no image
+/// decode or zstd payload decompression on this path -- just a roll-lock
+/// read, a source stat, and `cache::heal_cache_matches`'s header-only file
+/// read (tens of bytes), the same cost class as `path_kind`/`approve_frame`.
+///
+/// `Ok(false)` (not `Err`) on a source stat failure: a vanished or
+/// permission-denied source file is a benign "can't tell, so no" for a probe,
+/// mirroring `stamp_or_skip`'s cache-interaction-skip rule everywhere else.
+/// Errors are reserved for a genuinely bad `index` or no roll open.
+#[tauri::command]
+fn heal_cached(
+    roll: State<'_, roll::RollState>,
+    detector: State<'_, detect::DetectorState>,
+    inpainter: State<'_, detect::InpainterState>,
+    index: usize,
+) -> Result<bool, String> {
+    let (path, file_name, threshold, strokes) = roll.export_frame_meta(index)?;
+    let Some(stamp) = stamp_or_skip(&path) else {
+        return Ok(false);
+    };
+    let Some(dir) = path.parent() else {
+        return Ok(false);
+    };
+    let detector_hash = detector.hash().unwrap_or([0u8; 32]);
+    // Same single-lock discipline as `run_heal`: the inpainter hash used for
+    // provenance must be the SAME observation as "is a model loaded at all",
+    // or a model download completing mid-probe could race the zeros
+    // sentinel into the wrong side of the comparison.
+    let inpainter_hash =
+        inpainter.with_inpainter_hashed(|pair| pair.map(|(_, h)| h).unwrap_or([0u8; 32]))?;
+    let cache_path = roll::heal_cache_path(dir, &file_name);
+    let provenance = cache::heal_provenance(
+        threshold,
+        HEAL_DILATE_RADIUS,
+        &strokes,
+        &detector_hash,
+        &inpainter_hash,
+        &stamp,
+    );
+    Ok(cache::heal_cache_matches(&cache_path, &provenance))
+}
+
+/// Batch counterpart to `heal_cached`: probes every frame in the currently
+/// open roll once, for the filmstrip's healed badges at roll-open time --
+/// without this, a frame healed in a PREVIOUS session shows no indication
+/// until the operator happens to revisit it (which re-probes on activation
+/// via `heal_cached`).
+///
+/// The inpainter hash is read ONCE, under a single `with_inpainter_hashed`
+/// lock, for the whole batch -- not once per frame. This is a deliberate,
+/// documented race: a model load completing mid-batch could leave some
+/// frames probed against a hash that's already stale by the time the batch
+/// finishes, producing a badge that's wrong until the next probe (the next
+/// activation, or the next roll-open). Locking per-frame would close that
+/// window, but nothing in this app triggers a model load except an explicit
+/// operator action (`download_inpaint_model`/`load_inpainter`), so the
+/// window is narrow and self-correcting; paying for N mutex acquisitions on
+/// every roll-open to close a race that in practice never happens is not
+/// worth it. The per-frame stat and header read still run off the async
+/// runtime, in `spawn_blocking`, since a large roll means real (if cheap:
+/// header reads are ~100 bytes each) filesystem work.
+#[tauri::command]
+async fn healed_cached_all(
+    roll: State<'_, roll::RollState>,
+    detector: State<'_, detect::DetectorState>,
+    inpainter: State<'_, detect::InpainterState>,
+) -> Result<Vec<bool>, String> {
+    let (dir, frames) = roll.frames_meta_snapshot()?;
+    let detector_hash = detector.hash().unwrap_or([0u8; 32]);
+    let inpainter_hash =
+        inpainter.with_inpainter_hashed(|pair| pair.map(|(_, h)| h).unwrap_or([0u8; 32]))?;
+    let results = tauri::async_runtime::spawn_blocking(move || {
+        frames
+            .into_iter()
+            .map(|(file_name, threshold, strokes)| {
+                let source_path = dir.join(&file_name);
+                let Some(stamp) = stamp_or_skip(&source_path) else {
+                    return false;
+                };
+                let cache_path = roll::heal_cache_path(&dir, &file_name);
+                let provenance = cache::heal_provenance(
+                    threshold,
+                    HEAL_DILATE_RADIUS,
+                    &strokes,
+                    &detector_hash,
+                    &inpainter_hash,
+                    &stamp,
+                );
+                cache::heal_cache_matches(&cache_path, &provenance)
+            })
+            .collect::<Vec<bool>>()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(results)
+}
+
 /// Runs the connected-component walk for `(id, threshold)` for a caller that
 /// wants it OFF the registry lock: a memo hit returns without ever touching
 /// the probs, and a miss clones the probs `Arc` under a brief lock, walks
@@ -2346,6 +2452,8 @@ pub fn run() {
             detect,
             load_inpainter,
             heal_frame,
+            heal_cached,
+            healed_cached_all,
             components,
             open_roll,
             close_roll,
