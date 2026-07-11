@@ -1,7 +1,7 @@
 use fd_io::{ImageBuf, PixelData};
 
 use crate::{
-    add_grain, classical_fill, components, group_defects, Defect, Group, HealError, Inpainter,
+    add_grain, classical_fill, components, group_defects, Bbox, Defect, Group, HealError, Inpainter,
 };
 
 pub const TINY_MAX_DIM: u32 = 5;
@@ -290,9 +290,11 @@ pub fn heal_with_progress(
     let window_n = inpainter.as_deref_mut().and_then(|inp| inp.window_size());
     let groups: Vec<Group> = match window_n {
         Some(n) => {
-            let tier_defects: Vec<Defect> =
-                inpaint_tier.iter().map(|&i| defects[i].clone()).collect();
-            group_defects(&tier_defects, n as u32 / 8)
+            // Bboxes only: group_defects reads bbox geometry alone, so
+            // handing it the defects' (potentially large) pixel Vecs would
+            // just be a wasted clone. See group.rs's doc comment.
+            let tier_bboxes: Vec<Bbox> = inpaint_tier.iter().map(|&i| defects[i].bbox).collect();
+            group_defects(&tier_bboxes, n as u32 / 8)
                 .into_iter()
                 .map(|g| Group {
                     members: g.members.iter().map(|&local| inpaint_tier[local]).collect(),

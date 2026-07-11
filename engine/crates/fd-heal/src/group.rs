@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::components::{Bbox, Defect};
+use crate::components::Bbox;
 
 /// A batch of defect indices healed through shared windows. `bbox` is the
 /// union of the members' bboxes (exclusive upper bounds, like Bbox).
@@ -19,8 +19,14 @@ pub struct Group {
 /// Singleton results are the degenerate case and carry one member each.
 /// Deterministic: members ascend within a group; groups order by their
 /// first member.
-pub fn group_defects(defects: &[Defect], gap: u32) -> Vec<Group> {
-    let n = defects.len();
+///
+/// Takes bboxes rather than `&[Defect]`: grouping only ever reads bbox
+/// geometry, and callers that hold full `Defect`s (with their per-pixel
+/// `Vec`) would otherwise have to clone every defect just to hand this
+/// function something to borrow. `Group::members` indexes into `bboxes`,
+/// same as it indexed into the caller's defect slice before.
+pub fn group_defects(bboxes: &[Bbox], gap: u32) -> Vec<Group> {
+    let n = bboxes.len();
     let mut parent: Vec<usize> = (0..n).collect();
 
     // O(k^2) pairwise pass: k is the defect count per frame, dozens at
@@ -28,7 +34,7 @@ pub fn group_defects(defects: &[Defect], gap: u32) -> Vec<Group> {
     // it exists to reduce.
     for i in 0..n {
         for j in (i + 1)..n {
-            if touches(defects[i].bbox, defects[j].bbox, gap) {
+            if touches(bboxes[i], bboxes[j], gap) {
                 union(&mut parent, i, j);
             }
         }
@@ -49,16 +55,16 @@ pub fn group_defects(defects: &[Defect], gap: u32) -> Vec<Group> {
     by_root
         .into_values()
         .map(|members| {
-            let bbox = union_bbox(defects, &members);
+            let bbox = union_bbox(bboxes, &members);
             Group { members, bbox }
         })
         .collect()
 }
 
-fn union_bbox(defects: &[Defect], members: &[usize]) -> Bbox {
-    let mut acc = defects[members[0]].bbox;
+fn union_bbox(bboxes: &[Bbox], members: &[usize]) -> Bbox {
+    let mut acc = bboxes[members[0]];
     for &idx in &members[1..] {
-        let b = defects[idx].bbox;
+        let b = bboxes[idx];
         acc = Bbox {
             x0: acc.x0.min(b.x0),
             y0: acc.y0.min(b.y0),
@@ -141,6 +147,7 @@ fn union(parent: &mut [usize], a: usize, b: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::Defect;
 
     fn defect(x0: u32, y0: u32, x1: u32, y1: u32) -> Defect {
         Defect {
@@ -149,10 +156,18 @@ mod tests {
         }
     }
 
+    // Test bodies build `Defect`s (bbox + pixels) because that mirrors how
+    // real callers assemble them; `group_defects` itself only takes bboxes,
+    // so every call site maps the fixture defects down to their bboxes
+    // right before calling, same as the production call site in heal.rs.
+    fn bboxes(defects: &[Defect]) -> Vec<Bbox> {
+        defects.iter().map(|d| d.bbox).collect()
+    }
+
     #[test]
     fn merges_specks_3px_apart_when_gap_is_8() {
         let defects = vec![defect(0, 0, 1, 1), defect(4, 0, 5, 1)];
-        let groups = group_defects(&defects, 8);
+        let groups = group_defects(&bboxes(&defects), 8);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].members, vec![0, 1]);
         let b = groups[0].bbox;
@@ -162,7 +177,7 @@ mod tests {
     #[test]
     fn keeps_specks_3px_apart_separate_when_gap_is_1() {
         let defects = vec![defect(0, 0, 1, 1), defect(4, 0, 5, 1)];
-        let groups = group_defects(&defects, 1);
+        let groups = group_defects(&bboxes(&defects), 1);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].members, vec![0]);
         assert_eq!(groups[1].members, vec![1]);
@@ -203,7 +218,7 @@ mod tests {
             "A and C must not touch directly"
         );
 
-        let groups = group_defects(&defects, 2);
+        let groups = group_defects(&bboxes(&defects), 2);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].members, vec![0, 1, 2]);
         let bb = groups[0].bbox;
@@ -218,7 +233,7 @@ mod tests {
         // single-side expansion (effective radius gap, not 2*gap) misses
         // exactly this band and would leave two groups.
         let defects = vec![defect(0, 0, 1, 1), defect(10, 0, 11, 1)];
-        let groups = group_defects(&defects, 5);
+        let groups = group_defects(&bboxes(&defects), 5);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].members, vec![0, 1]);
         let b = groups[0].bbox;
@@ -232,7 +247,7 @@ mod tests {
         // edge. Exclusive bounds + strict < means edge contact is not
         // intersection: two groups.
         let defects = vec![defect(0, 0, 1, 1), defect(5, 0, 6, 1)];
-        let groups = group_defects(&defects, 2);
+        let groups = group_defects(&bboxes(&defects), 2);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].members, vec![0]);
         assert_eq!(groups[1].members, vec![1]);
@@ -241,7 +256,7 @@ mod tests {
     #[test]
     fn lone_defect_is_a_singleton_with_its_own_bbox() {
         let defects = vec![defect(7, 9, 12, 20)];
-        let groups = group_defects(&defects, 8);
+        let groups = group_defects(&bboxes(&defects), 8);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].members, vec![0]);
         let b = groups[0].bbox;
@@ -260,7 +275,7 @@ mod tests {
         ];
         let gap = 3;
 
-        let baseline = group_defects(&defects, gap);
+        let baseline = group_defects(&bboxes(&defects), gap);
         let mut baseline_sets: Vec<Vec<usize>> = baseline
             .iter()
             .map(|g| {
@@ -274,7 +289,7 @@ mod tests {
         // Fixed permutation (no RNG): shuffled[k] = defects[perm[k]].
         let perm = [3usize, 0, 4, 2, 1];
         let shuffled: Vec<Defect> = perm.iter().map(|&i| defects[i].clone()).collect();
-        let shuffled_groups = group_defects(&shuffled, gap);
+        let shuffled_groups = group_defects(&bboxes(&shuffled), gap);
 
         let mut mapped_sets: Vec<Vec<usize>> = shuffled_groups
             .iter()
@@ -294,7 +309,7 @@ mod tests {
         let defects = vec![defect(0, 0, 2, 2), defect(9, 0, 11, 2)];
         // Must not panic (saturating_sub of 0 - u32::MAX would underflow
         // if implemented with plain subtraction).
-        let groups = group_defects(&defects, u32::MAX);
+        let groups = group_defects(&bboxes(&defects), u32::MAX);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].members, vec![0, 1]);
         let b = groups[0].bbox;
