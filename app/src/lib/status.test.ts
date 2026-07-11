@@ -117,6 +117,7 @@ describe("composeLeft", () => {
     defectCount: null as number | null,
     threshold: 0.5,
     healed: false,
+    healedCached: false,
     healStale: false,
     brushStatus: null as string | null,
   };
@@ -153,6 +154,28 @@ describe("composeLeft", () => {
     );
   });
 
+  it("shows a bare healed indicator (no space-compare hint) when only the on-disk cache is healed", () => {
+    // healed=false, healedCached=true: the registry has no live healed
+    // tiles to compare against (an evicted or reopened frame with a
+    // matching heal cache) -- SPACE has nothing to toggle yet, so the hint
+    // must not be offered.
+    expect(composeLeft({ ...base, defectCount: 3, healedCached: true })).toBe(
+      "raw0002.jpg  3 defects at 0.50  healed",
+    );
+  });
+
+  it("prefers the live space-compare hint when both the registry and the cache are healed", () => {
+    expect(
+      composeLeft({ ...base, defectCount: 3, healed: true, healedCached: true }),
+    ).toBe("raw0002.jpg  3 defects at 0.50  healed (space compares)");
+  });
+
+  it("shows no healed indicator when neither the registry nor the cache is healed", () => {
+    expect(composeLeft({ ...base, defectCount: 3 })).toBe(
+      "raw0002.jpg  3 defects at 0.50",
+    );
+  });
+
   it("appends the stale-heal hint to the left zone when the frame's heal is stale", () => {
     expect(composeLeft({ ...base, defectCount: 3, healStale: true })).toBe(
       "raw0002.jpg  3 defects at 0.50  heal stale (h re-heals)",
@@ -173,6 +196,7 @@ describe("composeLeft", () => {
         defectCount: 11,
         threshold: 0.5,
         healed: true,
+        healedCached: true,
         healStale: true,
         brushStatus: "erase 12px",
       }),

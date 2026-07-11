@@ -49,7 +49,17 @@ export interface LeftZoneInput {
   position: { index: number; total: number } | null;
   defectCount: number | null;
   threshold: number;
+  /** The registry holds live healed tiles for this frame right now -- SPACE
+   * has something to toggle. */
   healed: boolean;
+  /** The on-disk heal cache has an entry matching this frame's CURRENT
+   * inputs (an evicted or reopened frame's heal would replay instantly),
+   * independent of whether the registry happens to hold live tiles too.
+   * `healed` implies this is also true in practice, but the two are passed
+   * separately rather than pre-ORed by the caller: the fragment they
+   * produce differs (see below), so composeLeft needs both to pick the
+   * right one, not just "is there any heal indication at all". */
+  healedCached: boolean;
   healStale: boolean;
   brushStatus: string | null;
 }
@@ -60,7 +70,14 @@ export interface LeftZoneInput {
  * not activity -- stale-heal only ever occurs on already-healed frames, so
  * it follows directly after), and the live brush status (frame-interaction
  * state, e.g. "brush 24px"). The single-export note lives as a toast (see
- * lib/toasts.ts), not here. */
+ * lib/toasts.ts), not here.
+ *
+ * The healed indicator is two-state: `healed` (registry has live tiles)
+ * gets the full "healed (space compares)" hint, since SPACE genuinely has
+ * something to toggle. `healedCached` alone (cache matches, but nothing
+ * live -- an evicted or reopened frame) gets the bare "healed" word: the
+ * hint would be a lie until the frame is reactivated and the cache actually
+ * replays. */
 export function composeLeft(input: LeftZoneInput): string {
   if (!input.fileName) return "";
   const parts = [input.fileName];
@@ -75,6 +92,8 @@ export function composeLeft(input: LeftZoneInput): string {
   }
   if (input.healed) {
     parts.push("healed (space compares)");
+  } else if (input.healedCached) {
+    parts.push("healed");
   }
   if (input.healStale) {
     parts.push("heal stale (h re-heals)");

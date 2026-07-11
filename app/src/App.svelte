@@ -251,6 +251,16 @@
   // session-scoped and tiny (one entry per frame ever healed), so there is
   // nothing worth the complexity of cleaning up.
   let healInputs: Record<string, { threshold: number; strokeCount: number }> = $state({});
+  // Roll-mode only: frame index -> whether the on-disk heal cache matches
+  // that frame's CURRENT inputs, i.e. whether reactivating it would replay
+  // an existing heal instantly. Distinct from `info.healed` (live registry
+  // state, cleared the moment a frame is evicted) -- this is what lets the
+  // filmstrip badge and the current-frame status fragment keep showing
+  // "healed" for a frame the operator merely navigated away from. Filled by
+  // fire-and-forget probes (`probeHealedCached`/`probeHealedCachedAll`);
+  // absent entries read as false (never probed, or probed and missed) --
+  // see those functions for exactly when each probe fires.
+  let healedCached: Record<number, boolean> = $state({});
   // Monotonically increasing activation sequence number. Rapid ,/. presses
   // can fire overlapping `activate_frame` invokes whose resolutions race;
   // each call captures its own `seq` and drops its result if a newer
@@ -309,6 +319,12 @@
   $effect(() => {
     const un = listen("roll-done", () => {
       scanDone = true;
+      // Queue-idle re-probe: catches any heal caches that came to exist
+      // (e.g. from a previous session, or an operator-triggered heal that
+      // raced the open-time batch probe) without waiting for the operator
+      // to revisit every frame individually. `probeHealedCachedAll` no-ops
+      // if the roll has since closed.
+      void probeHealedCachedAll();
     });
     return () => {
       un.then((f) => f());
@@ -390,6 +406,14 @@
         if (!(e.payload.index in jobStates)) return;
         delete jobStates[e.payload.index];
         queueProgress = null;
+        if (e.payload.kind === "heal") {
+          // Unconditional on index, unlike the current-frame block below:
+          // `healApproved` queues a heal for every approved frame in the
+          // roll, and each one's own filmstrip badge must reflect its own
+          // completion -- the registry says this frame's cache now matches,
+          // full stop, whether or not it's the frame on screen.
+          healedCached[e.payload.index] = true;
+        }
         // Index-guarded on purpose: only refresh detections / mark healed when
         // the completed job belongs to the frame still on screen. Activity
         // flags themselves are derived (see `rollDetecting`/`rollHealing`), so
@@ -721,6 +745,11 @@
       // Same reason for the export narration: it described the closed
       // roll's export, and nothing in single-image mode will clear it.
       exportDetail = null;
+      // The filmstrip is gone in single-image mode so this is invisible
+      // either way, but a fresh roll opened later reuses index space -- stale
+      // entries from the closed roll must not paint a healed badge on an
+      // unrelated frame of the next one before its own probes land.
+      healedCached = {};
     }
     try {
       info = await invoke<ImageInfo>("open_image", { path });
@@ -792,10 +821,19 @@
     // Likewise the export narration: a stale line from the previous roll's
     // export would otherwise linger until this roll's first export event.
     exportDetail = null;
+    // Same reason: the previous roll's healed badges must not paint over
+    // this one's frames before its own probes (below, plus per-frame probes
+    // on activation) land.
+    healedCached = {};
     currentIndex = 0;
     if (roll.frames.length > 0) {
       await activateCurrentFrame();
     }
+    // Frames healed in a PREVIOUS session must show their badge without the
+    // operator having to revisit each one (activation is the only other
+    // place healedCached gets filled in) -- one batch probe covers the
+    // whole roll right away.
+    void probeHealedCachedAll();
     try {
       await invoke("scan_roll");
     } catch (e) {
@@ -923,6 +961,63 @@
     })();
   }
 
+  /** Probes whether roll frame `index`'s on-disk heal cache matches its
+   * CURRENT persisted inputs (threshold, strokes, detector/inpainter
+   * hashes, source stamp), populating `healedCached[index]`. Fire-and-
+   * forget, generation-guarded like every other roll-scoped async result in
+   * this file (mirrors the job-event listeners' `generation !==
+   * rollGeneration` check): a roll swap while the invoke is in flight must
+   * never paint an old roll's answer into the new roll's map. A failed
+   * probe (e.g. a transient stat error) is silent and simply leaves
+   * whatever `healedCached[index]` already held -- benign, mirroring
+   * `probeDetected`'s own silent-miss contract. */
+  function probeHealedCached(index: number) {
+    if (!roll || rollGeneration === null) return;
+    const gen = rollGeneration;
+    invoke<boolean>("heal_cached", { index })
+      .then((cached) => {
+        if (rollGeneration !== gen) return; // stale: roll swapped mid-probe
+        healedCached[index] = cached;
+      })
+      .catch(() => {
+        // benign: see doc comment above
+      });
+  }
+
+  /** Batch counterpart to `probeHealedCached`, run once when a roll opens
+   * (see `openRollPath`) and again once the initial scan queue goes idle
+   * (see the `roll-done` listener): covers every frame in one round trip so
+   * frames healed in a PREVIOUS session show their badge without the
+   * operator having to revisit each one first. Same generation-guard
+   * discipline as `probeHealedCached`; a failed batch just leaves whatever
+   * per-frame probes have already populated.
+   *
+   * Wholesale-replaces the map rather than merging: a heal job-done event
+   * (or a per-frame probe) that lands for some OTHER frame in the narrow
+   * window between this snapshot being taken on the backend and this
+   * `.then` running would get overwritten back to this snapshot's answer.
+   * Accepted, same shape as the backend's own documented inpainter-hash
+   * race: the badge self-corrects at the next probe (that frame's own
+   * job-done, activation, stroke commit, or threshold save all re-probe or
+   * set it directly), and merging to avoid it would need per-index
+   * timestamps for a flicker that in practice never lasts past the next
+   * operator action. */
+  async function probeHealedCachedAll() {
+    if (!roll || rollGeneration === null) return;
+    const gen = rollGeneration;
+    try {
+      const results = await invoke<boolean[]>("healed_cached_all");
+      if (rollGeneration !== gen) return; // stale: roll swapped mid-probe
+      const next: Record<number, boolean> = {};
+      results.forEach((cached, i) => {
+        if (cached) next[i] = true;
+      });
+      healedCached = next;
+    } catch {
+      // benign: see doc comment above
+    }
+  }
+
   async function activateCurrentFrame() {
     if (!roll || rollGeneration === null) return;
     // Repeat presses of the same index are already filtered out by the
@@ -1001,6 +1096,12 @@
     // Detect; `probeDetected` no-ops (leaves the stored-bbox fallback) when
     // none exist.
     probeDetected(result.id);
+    // Same reasoning as the probs probe above, for the heal cache: an
+    // evicted-then-reactivated frame's registry `healed` flag was reset by
+    // the eviction, but its on-disk heal cache (if any) still matches --
+    // this is what lets the badge/status fragment keep showing "healed"
+    // across a re-activation, not just within one continuous view.
+    probeHealedCached(index);
     prefetchNeighbors(index);
   }
 
@@ -1081,11 +1182,26 @@
           // Mirror-back guard, same shape as the job-event generation checks
           // above: a stale generation means the roll was swapped while this
           // sat debounced, so `roll.frames[index]` -- if it even exists --
-          // belongs to a different roll and must not be touched.
-          if (count === null || !roll || generation !== rollGeneration) return;
+          // belongs to a different roll and must not be touched. Checked
+          // BEFORE the `count === null` branch below (unlike the old shape):
+          // `count === null` is ambiguous on its own -- it means either "the
+          // write was discarded" (stale generation) or "the write landed but
+          // the frame has no resident probabilities to recompute a count
+          // from" -- and only the generation check actually distinguishes
+          // them. `generation === rollGeneration` here proves the backend
+          // did not see a mismatch either (only this client's own roll swaps
+          // ever bump either side), so a null count under a matching
+          // generation is provably the second case: the threshold WAS
+          // persisted, just with nothing to recompute.
+          if (!roll || generation !== rollGeneration) return;
           const frame = roll.frames[index];
           if (frame === undefined) return;
-          frame.defect_count = count;
+          if (count !== null) frame.defect_count = count;
+          // The persisted threshold is exactly what `heal_cached` reads for
+          // provenance -- same reasoning as the stroke-commit re-probe in
+          // `onStrokesChange`: this is the drift `healStale` already tracks
+          // for the live heal on screen, applied to the on-disk cache badge.
+          probeHealedCached(index);
         })
         .catch((e) => {
           pushError(String(e));
@@ -1295,6 +1411,10 @@
             : null,
       threshold: overlay.threshold,
       healed: info?.healed ?? false,
+      // Roll-only (single-image mode has no heal-cache probe -- `info.healed`
+      // already covers it there). Absent entry reads as false, same as
+      // `healedCached`'s own "never probed" default.
+      healedCached: r ? (healedCached[currentIndex] ?? false) : false,
       healStale,
       // Live call, not a snapshot: brushStatus() reads the Viewer's $state
       // (brushMode/brushRadius), so this derived re-evaluates whenever the
@@ -1361,11 +1481,21 @@
       // `displayedIndex`, matching `strokeKey()` above: persist to the
       // sidecar entry for the frame actually on screen, not whichever frame
       // navigation may already be mid-switch towards.
-      invoke("set_frame_strokes", { index: displayedIndex, strokes, redoStrokes: redo }).catch(
-        (e) => {
+      const index = displayedIndex;
+      invoke("set_frame_strokes", { index, strokes, redoStrokes: redo })
+        .then(() => {
+          // Re-probe AFTER the persist lands: `heal_cached` reads the
+          // frame's SIDECAR-persisted strokes, not the live edit, so probing
+          // any earlier would answer against the stroke list this commit is
+          // replacing. A stroke edit is exactly the provenance drift
+          // `healStale` already tracks for the live heal on screen; this is
+          // the same drift, applied to the on-disk cache's badge instead of
+          // recomputing a second comparison in JS.
+          probeHealedCached(index);
+        })
+        .catch((e) => {
           pushError(String(e));
-        },
-      );
+        });
     }
   }
 
@@ -1654,7 +1784,14 @@
     {/if}
   </section>
   {#if roll}
-    <Filmstrip frames={roll.frames} {currentIndex} {thumbVersions} {jobStates} onSelect={selectFrame} />
+    <Filmstrip
+      frames={roll.frames}
+      {currentIndex}
+      {thumbVersions}
+      {jobStates}
+      {healedCached}
+      onSelect={selectFrame}
+    />
   {/if}
   {#if info}
     <StatusBar

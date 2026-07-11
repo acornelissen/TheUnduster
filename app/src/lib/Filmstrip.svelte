@@ -14,6 +14,7 @@
     currentIndex,
     thumbVersions = {},
     jobStates = {},
+    healedCached = {},
     onSelect,
   }: {
     frames: FrameInfo[];
@@ -23,6 +24,11 @@
       number,
       { state: "queued" | "running"; kind: "detect" | "heal" | "export" | "prefetch" }
     >;
+    /** Frame index -> true when the on-disk heal cache matches this frame's
+     * current inputs (see App.svelte's `healedCached`). Absent/false entries
+     * render no pip -- the common case (never healed, or the registry
+     * doesn't hold live tiles and no cache probe has confirmed one). */
+    healedCached?: Record<number, boolean>;
     onSelect: (index: number) => void;
   } = $props();
 
@@ -95,7 +101,15 @@
         {#if frame.defect_count === null}
           <span class="spinner" aria-hidden="true"></span>
         {:else}
-          <span class="badge defect-chip" title="Defect count">{frame.defect_count}</span>
+          <span
+            class="badge defect-chip"
+            title={healedCached[frame.index] ? "Defect count · Healed" : "Defect count"}
+          >
+            {#if healedCached[frame.index]}
+              <span class="healed-pip" aria-hidden="true">+</span>
+            {/if}
+            {frame.defect_count}
+          </span>
         {/if}
         {#if frame.approved}
           <span class="badge approved-badge" title="Approved" aria-hidden="true">&#10003;</span>
@@ -217,8 +231,21 @@
     position: absolute;
     bottom: 2px;
     right: 2px;
+    display: flex;
+    align-items: center;
+    gap: 2px;
     background: rgba(39, 39, 39, 0.85); /* --bg-2 @ 85% */
     color: var(--text-1);
+  }
+  /* Paired with the defect chip rather than a fifth corner (all four are
+     already spoken for: approved, exported, job dot, defect count) -- a
+     small "+" glyph inside the same pill, in --ok green like the approved
+     checkmark, so "this frame's heal cache would replay instantly" reads
+     as an addition to the defect count it sits beside. */
+  .healed-pip {
+    color: var(--ok);
+    font-weight: 700;
+    line-height: 1;
   }
   .job-marker {
     position: absolute;
