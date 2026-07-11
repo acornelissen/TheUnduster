@@ -13,6 +13,7 @@
     MAX_STROKES,
     type StrokeData,
   } from "./brush";
+  import { eraseStrokeForBbox, nextCurrentAfterRemoval } from "./detections";
 
   interface ImageInfo {
     id: number;
@@ -275,6 +276,17 @@
    * count past the backend's cap, only as many as fit are committed and the
    * excess is surfaced via `onBrushLimit`. */
   function commitStroke(points: [number, number][]) {
+    commitStrokeAs(points, brushMode === "erase", brushRadius);
+  }
+
+  /** Core of commitStroke, parameterized on erase/radius instead of reading
+   * them off brush state. The active-detection delete flow below needs to
+   * commit a single-point erase stroke without actually turning brush mode
+   * on -- flipping brushMode/brushRadius to fake it would flash the palette
+   * buttons and the cursor ring for an action the operator didn't ask for.
+   * This is the smallest change that lets it reuse the same chunking/cap/
+   * undo-redo pipeline as a real brush stroke. */
+  function commitStrokeAs(points: [number, number][], erase: boolean, radius: number) {
     if (points.length === 0) return;
     const chunks = chunkPoints(points, MAX_POINTS_PER_STROKE);
     let curStrokes = strokes;
@@ -282,7 +294,7 @@
     let committed = 0;
     for (const chunk of chunks) {
       if (curStrokes.length >= MAX_STROKES) break;
-      const s: StrokeData = { erase: brushMode === "erase", radius: brushRadius, points: chunk };
+      const s: StrokeData = { erase, radius, points: chunk };
       const result = pushStroke(curStrokes, curRedo, s);
       curStrokes = result.strokes;
       curRedo = result.redo;
@@ -294,6 +306,41 @@
     if (committed < chunks.length) {
       onBrushLimit?.("stroke limit reached for this frame; undo or heal to continue");
     }
+  }
+
+  /** Deletes the actively-cycled detection ring (Delete/Backspace while
+   * `current >= 0`): paints a single-point erase stroke covering its bbox,
+   * riding the existing stroke pipeline for undo/redo, persistence, and
+   * heal-mask subtraction for free.
+   *
+   * An erase stroke only subtracts from the heal mask -- detections are a
+   * separate layer that renders independently of strokes, so without more
+   * the ring would keep drawing right where it was, reading as "delete
+   * didn't work". So this also drops the box from the local `detections`
+   * array so the ring itself disappears immediately. That array is
+   * display-only: a later refetch or re-detect can restore the box, which
+   * is fine, because the erase stroke has already made the heal mask
+   * correct regardless of whether this box reappears in a later pass.
+   *
+   * Only handles the `detected` (post-Detect) source: pre-Detect cycling
+   * over the roll queue's `bboxes` prop has no locally-owned array to trim,
+   * so deleting there still commits the erase stroke (the mask work is real
+   * and worth keeping) but can't make the ring disappear, and deselects
+   * rather than guessing at a "remaining" count it can't observe. */
+  function deleteActiveDetection() {
+    const source = markerSource();
+    if (current < 0 || current >= source.length) return;
+    const { cx, cy, radius } = eraseStrokeForBbox(source[current]);
+    commitStrokeAs([[cx, cy]], true, radius);
+    if (detected) {
+      const removed = current;
+      detections = detections.filter((_, i) => i !== removed);
+      onDetectionsChange?.(detections.length);
+      current = nextCurrentAfterRemoval(removed, detections.length);
+    } else {
+      current = -1;
+    }
+    requestFrame();
   }
 
   /** Image-space stroke -> screen-space capsule segments for drawStrokes(). */
@@ -550,6 +597,14 @@
       e.preventDefault();
       cycleDetection(e.key === "z" ? 1 : -1);
       return;
+    // Only while a ring is actually selected, and never while brushing --
+    // Delete/Backspace has no brush-mode meaning of its own, but silently
+    // deleting a detection out from under an in-progress paint/erase stroke
+    // would surprise the operator more than doing nothing.
+    } else if ((e.key === "Delete" || e.key === "Backspace") && current >= 0 && brushMode === "off") {
+      e.preventDefault();
+      deleteActiveDetection();
+      return;
     } else if (e.key === "h") {
       e.preventDefault();
       onRequestHeal();
@@ -658,7 +713,7 @@
   <canvas
     bind:this={canvas}
     role="application"
-    aria-label="Scan viewer: arrows pan, plus and minus zoom, 0 fits, 1 is 100%, d detects, m toggles overlay, z and shift-z cycle defects, h heals, space toggles before and after, b paints, e erases, bracket keys size the brush, arrows nudge it and enter stamps while brushing, cmd-z undoes, escape exits, shift-cmd-z redoes"
+    aria-label="Scan viewer: arrows pan, plus and minus zoom, 0 fits, 1 is 100%, d detects, m toggles overlay, z and shift-z cycle defects, delete or backspace removes the selected defect, h heals, space toggles before and after, b paints, e erases, bracket keys size the brush, arrows nudge it and enter stamps while brushing, cmd-z undoes, escape exits, shift-cmd-z redoes"
     tabindex="0"
     class:brushing={brushMode !== "off" && !showHealed}
     onwheel={onWheel}

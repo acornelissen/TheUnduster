@@ -41,6 +41,7 @@
         <li><kbd class="kbd">space</kbd> before/after (healed)</li>
         <li><kbd class="kbd">m</kbd> overlay</li>
         <li><kbd class="kbd">z</kbd> / <kbd class="kbd">shift-z</kbd> cycle defects</li>
+        <li><kbd class="kbd">delete</kbd> / <kbd class="kbd">backspace</kbd> delete selected defect</li>
         <li><kbd class="kbd">+</kbd> <kbd class="kbd">-</kbd> zoom</li>
         <li><kbd class="kbd">0</kbd> fit</li>
         <li><kbd class="kbd">1</kbd> 100%</li>

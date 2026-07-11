@@ -26,7 +26,7 @@ The sensitivity slider controls how much gets flagged. Drag it and the circles a
 
 After a frame is detected, the Detect button greys out to "Detected" — there's nothing to re-run; the slider works on the saved results.
 
-Press `m` to toggle the red tint and circles on or off without losing your detection results. Press `z` or `shift-z` to jump the view from one flagged defect to the next.
+Press `m` to toggle the red tint and circles on or off without losing your detection results. Press `z` or `shift-z` to jump the view from one flagged defect to the next; the circle you're on turns amber so you can tell which one is selected. Press `delete` or `backspace` to remove it — this paints an erase stroke over the spot (undoable like any other stroke) and drops the circle from view.
 
 ## Fixing by hand
 
@@ -94,6 +94,7 @@ Press `?` at any time to open the in-app shortcuts panel. It's the authoritative
 | `space` | Before/after (healed) |
 | `m` | Toggle overlay |
 | `z` / `shift-z` | Cycle through defects |
+| `delete` / `backspace` | Delete the selected defect (paints an erase stroke) |
 | `+` / `-` | Zoom in/out |
 | `0` | Fit to window |
 | `1` | 100% zoom |
