@@ -4,6 +4,7 @@ mod classical;
 mod components;
 mod dilate;
 mod grain;
+mod group;
 mod heal;
 mod inpaint;
 
@@ -11,6 +12,7 @@ pub use classical::classical_fill;
 pub use components::{components, Bbox, Defect};
 pub use dilate::dilate;
 pub use grain::add_grain;
+pub use group::{group_defects, Group};
 pub use heal::{heal, heal_with_progress, HealReport, TINY_MAX_DIM};
 pub use inpaint::Inpainter;
 
