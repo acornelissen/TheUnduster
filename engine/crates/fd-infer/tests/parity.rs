@@ -69,6 +69,48 @@ fn mask_thresholds_probabilities() {
 }
 
 #[test]
+fn progress_callback_fires_once_per_tile_with_monotonic_done() {
+    // 600x600 against TILE=512/OVERLAP=64 (stride 448) tiles into a 2x2 grid
+    // -- small enough to run fast on the CPU EP while still exercising more
+    // than one tile in each axis.
+    let img = ImageBuf {
+        width: 600,
+        height: 600,
+        channels: 1,
+        data: PixelData::U8(vec![128; 600 * 600]),
+        icc: None,
+        exif: None,
+    };
+    let mut det = Detector::load(&fixtures().join("tiny-detector.onnx"), Ep::Cpu).unwrap();
+    let mut calls: Vec<(usize, usize)> = Vec::new();
+    let probs = det
+        .probabilities_with_progress(&img, &mut |done, total| calls.push((done, total)))
+        .unwrap();
+    assert_eq!(probs.len(), 600 * 600);
+
+    assert_eq!(calls.len(), 4, "2x2 tile grid should fire exactly 4 times");
+    let total = calls[0].1;
+    for (i, &(done, t)) in calls.iter().enumerate() {
+        assert_eq!(done, i + 1, "done must be monotonic starting at 1");
+        assert_eq!(t, total, "total must stay constant across calls");
+    }
+    assert_eq!(total, calls.len(), "total must equal the number of calls");
+}
+
+#[test]
+fn probabilities_without_progress_matches_the_progress_variant() {
+    // The no-op-callback wrapper (`probabilities`) must produce bit-identical
+    // output to the progress-tracking variant it delegates to.
+    let (img, ..) = load_parity_input();
+    let mut det = Detector::load(&fixtures().join("tiny-detector.onnx"), Ep::Cpu).unwrap();
+    let via_wrapper = det.probabilities(&img).unwrap();
+    let via_progress = det
+        .probabilities_with_progress(&img, &mut |_, _| {})
+        .unwrap();
+    assert_eq!(via_wrapper, via_progress);
+}
+
+#[test]
 fn rgb_input_to_gray_model_is_adapted() {
     // 3-channel image against the 1-channel tiny detector must not error
     let img = ImageBuf {

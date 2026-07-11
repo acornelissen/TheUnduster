@@ -152,11 +152,16 @@ async fn run_detect(
         (cache_path, source_path)
     });
     let detector = detector.inner().clone(); // DetectorState is Clone over an Arc
+    let app_for_progress = app.clone();
     let (probs, pyramid) = tauri::async_runtime::spawn_blocking(move || {
-        // detect_hashed pairs the output with the hash of the model that
-        // produced it under one lock -- see its doc comment -- so the cache
-        // write below can never record a different model's hash.
-        let (probs, hash) = detector.detect_hashed(&img)?;
+        // detect_hashed_with_progress pairs the output with the hash of the
+        // model that produced it under one lock -- see detect_hashed's doc
+        // comment -- so the cache write below can never record a different
+        // model's hash. Progress narrates tile by tile, mirroring
+        // run_heal's per-defect heal-progress emit.
+        let (probs, hash) = detector.detect_hashed_with_progress(&img, &mut |done, total| {
+            let _ = app_for_progress.emit("detect-progress", DetectProgress { id, done, total });
+        })?;
         // Quantize once at the fresh-detect boundary; the registry, the
         // disk cache, and the display pyramid all share these u8 bytes.
         let probs: Vec<u8> = probs.iter().map(|&p| quantize_prob(p)).collect();
@@ -207,6 +212,17 @@ const HEAL_DILATE_RADIUS: u32 = 2;
 
 #[derive(serde::Serialize, Clone)]
 struct HealProgress {
+    id: u64,
+    done: usize,
+    total: usize,
+}
+
+/// Mirrors `HealProgress`'s shape exactly: a 168MP frame tiles into ~870
+/// 512px windows, so a fresh detect emits this once per tile instead of
+/// leaving the frontend behind one frozen "detecting" stage for the whole
+/// ~9s run.
+#[derive(serde::Serialize, Clone)]
+struct DetectProgress {
     id: u64,
     done: usize,
     total: usize,
@@ -1421,6 +1437,12 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                 }
                 None => None,
             };
+            // Captured before `resident` is consumed below: progress
+            // narration keys off the id resident at job start, mirroring the
+            // Heal arm's `resident_id` -- a frame that goes
+            // non-resident-to-resident mid-job (late activation) simply gets
+            // no detect-progress narration, the same trade-off heal makes.
+            let resident_id = resident.as_ref().map(|(id, _, _)| *id);
             // The early resident id only gated the pin (already applied above
             // via `image_id`) and the has-probs short-circuit; the write
             // target below is resolved fresh after compute (see I3's comment
@@ -1444,6 +1466,7 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
             let detector_hash = detector_state.hash();
             let cache_path = roll::probs_cache_path(&roll_dir, &file_name);
             let source_path = path.clone();
+            let app_for_progress = app.clone();
             let (probs, pyramid, bboxes) = tauri::async_runtime::spawn_blocking(move || {
                 // A stat failure skips the cache interaction entirely (both
                 // the lookup below and the write on a miss).
@@ -1460,11 +1483,22 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                 let probs = match cached {
                     Some(probs) => probs,
                     None => {
-                        // detect_hashed pairs the output with the hash of the
-                        // model that produced it under one lock -- see its
-                        // doc comment -- so the cache write below can never
-                        // record a different model's hash.
-                        let (probs, hash) = detector.detect_hashed(&image)?;
+                        // detect_hashed_with_progress pairs the output with
+                        // the hash of the model that produced it under one
+                        // lock -- see detect_hashed's doc comment -- so the
+                        // cache write below can never record a different
+                        // model's hash. Progress narration only for a
+                        // resident frame, mirroring the Heal arm's identical
+                        // resident_id gate.
+                        let (probs, hash) =
+                            detector.detect_hashed_with_progress(&image, &mut |done, total| {
+                                if let Some(id) = resident_id {
+                                    let _ = app_for_progress.emit(
+                                        "detect-progress",
+                                        DetectProgress { id, done, total },
+                                    );
+                                }
+                            })?;
                         // Quantize once at the fresh-detect boundary (the
                         // cache-hit arm above is already u8 from disk).
                         let probs: Vec<u8> = probs.iter().map(|&p| quantize_prob(p)).collect();

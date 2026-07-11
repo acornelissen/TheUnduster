@@ -87,6 +87,23 @@ fn planes_for(img: &ImageBuf, in_ch: usize) -> Vec<Vec<f32>> {
     }
 }
 
+/// Number of tile starts a single axis of length `len` visits under
+/// `probabilities`'s tiling loop, given `stride = TILE - OVERLAP`. Written
+/// as the same do-while shape as that loop's own `x0`/`y0` advance-and-break
+/// arithmetic (start at 0, process, then break or advance by `stride`) so
+/// the two can never drift apart -- this just counts iterations instead of
+/// running them.
+fn tile_start_count(len: usize, stride: usize) -> usize {
+    let limit = len.saturating_sub(OVERLAP).max(1);
+    let mut pos = 0usize;
+    let mut n = 1usize;
+    while pos + stride < limit {
+        pos += stride;
+        n += 1;
+    }
+    n
+}
+
 impl Detector {
     pub fn load(path: &Path, ep: Ep) -> Result<Detector, InferError> {
         let mk_err = |reason: String| InferError::Load {
@@ -142,11 +159,31 @@ impl Detector {
     }
 
     pub fn probabilities(&mut self, img: &ImageBuf) -> Result<Vec<f32>, InferError> {
+        self.probabilities_with_progress(img, &mut |_, _| {})
+    }
+
+    /// `probabilities` with a per-tile progress callback `(done, total)`,
+    /// called once per completed tile -- mirrors `fd_heal::heal_with_progress`'s
+    /// shape exactly. A 168MP frame tiles into ~870 512px windows; on the
+    /// CoreML EP the whole detect still takes several seconds, so the
+    /// callback lets the app show motion instead of a frozen "Detecting..."
+    /// label.
+    pub fn probabilities_with_progress(
+        &mut self,
+        img: &ImageBuf,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<Vec<f32>, InferError> {
         let planes = planes_for(img, self.in_ch);
         let (w, h) = (img.width as usize, img.height as usize);
         let stride = TILE - OVERLAP;
         let mut acc = vec![0f32; w * h];
         let mut weight = vec![0f32; w * h];
+
+        // Counted with the identical start/break arithmetic as the tiling
+        // loop below (isomorphic, not reimplemented from scratch), so this
+        // can never drift from the actual number of tiles the loop visits.
+        let total = tile_start_count(h, stride) * tile_start_count(w, stride);
+        let mut done = 0usize;
 
         let mut y0 = 0usize;
         loop {
@@ -185,6 +222,8 @@ impl Detector {
                         weight[idx] += 1.0;
                     }
                 }
+                done += 1;
+                progress(done, total);
                 if x0 + stride >= w.saturating_sub(OVERLAP).max(1) {
                     break;
                 }

@@ -44,11 +44,26 @@ impl DetectorState {
     }
 
     pub fn detect(&self, img: &ImageBuf) -> Result<Vec<f32>, String> {
+        self.detect_with_progress(img, &mut |_, _| {})
+    }
+
+    /// `detect` with a per-tile progress callback `(done, total)`, threaded
+    /// straight through to `fd_infer::Detector::probabilities_with_progress`.
+    /// Mirrors the crate-level split (`detect` is the no-op-callback
+    /// wrapper): no production caller needs this today (single-image mode
+    /// and the roll job's Detect arm both go through `detect_hashed_with_progress`
+    /// instead, to keep the cache-provenance hash paired with the same lock
+    /// acquisition), kept for API symmetry and direct testing.
+    pub fn detect_with_progress(
+        &self,
+        img: &ImageBuf,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<Vec<f32>, String> {
         let mut guard = self.0.lock().map_err(|e| e.to_string())?;
         match guard.as_mut() {
             Some(loaded) => loaded
                 .detector
-                .probabilities(img)
+                .probabilities_with_progress(img, progress)
                 .map_err(|e| e.to_string()),
             None => Err("no detector loaded".to_string()),
         }
@@ -64,12 +79,25 @@ impl DetectorState {
     /// detected" the same observation, closing that race. Errors exactly
     /// like `detect()` when no detector is loaded.
     pub fn detect_hashed(&self, img: &ImageBuf) -> Result<(Vec<f32>, [u8; 32]), String> {
+        self.detect_hashed_with_progress(img, &mut |_, _| {})
+    }
+
+    /// `detect_hashed` with a per-tile progress callback `(done, total)`.
+    /// Used by the single-image detect command and the roll job's Detect
+    /// arm to narrate a long detect tile by tile; the hash pairing guarantee
+    /// documented on `detect_hashed` holds identically here (same lock, same
+    /// closure).
+    pub fn detect_hashed_with_progress(
+        &self,
+        img: &ImageBuf,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<(Vec<f32>, [u8; 32]), String> {
         let mut guard = self.0.lock().map_err(|e| e.to_string())?;
         match guard.as_mut() {
             Some(loaded) => {
                 let probs = loaded
                     .detector
-                    .probabilities(img)
+                    .probabilities_with_progress(img, progress)
                     .map_err(|e| e.to_string())?;
                 Ok((probs, loaded.hash))
             }
@@ -187,6 +215,27 @@ mod tests {
     }
 
     #[test]
+    fn detect_with_progress_fires_the_callback() {
+        let state = DetectorState::default();
+        state.load(&fixture()).unwrap();
+        let img = ImageBuf {
+            width: 64,
+            height: 48,
+            channels: 1,
+            data: PixelData::U8(vec![128; 64 * 48]),
+            icc: None,
+            exif: None,
+        };
+        let mut calls: Vec<(usize, usize)> = Vec::new();
+        let probs = state
+            .detect_with_progress(&img, &mut |done, total| calls.push((done, total)))
+            .unwrap();
+        assert_eq!(probs.len(), 64 * 48);
+        assert!(!calls.is_empty());
+        assert_eq!(calls.last().unwrap().0, calls.last().unwrap().1);
+    }
+
+    #[test]
     fn loads_fixture_and_detects() {
         let state = DetectorState::default();
         state.load(&fixture()).unwrap();
@@ -201,6 +250,53 @@ mod tests {
         let probs = state.detect(&img).unwrap();
         assert_eq!(probs.len(), 64 * 48);
         assert!(probs.iter().all(|p| (0.0..=1.0).contains(p)));
+    }
+
+    #[test]
+    fn detect_hashed_with_progress_fires_the_callback_and_pairs_the_hash() {
+        let state = DetectorState::default();
+        state.load(&fixture()).unwrap();
+        let expected_hash = state.hash().unwrap();
+        let img = ImageBuf {
+            width: 64,
+            height: 48,
+            channels: 1,
+            data: PixelData::U8(vec![128; 64 * 48]),
+            icc: None,
+            exif: None,
+        };
+        let mut calls: Vec<(usize, usize)> = Vec::new();
+        let (probs, hash) = state
+            .detect_hashed_with_progress(&img, &mut |done, total| calls.push((done, total)))
+            .unwrap();
+        assert_eq!(probs.len(), 64 * 48);
+        assert_eq!(hash, expected_hash);
+        assert!(
+            !calls.is_empty(),
+            "at least one tile should fire the callback"
+        );
+        let total = calls[0].1;
+        for (i, &(done, t)) in calls.iter().enumerate() {
+            assert_eq!(done, i + 1);
+            assert_eq!(t, total);
+        }
+    }
+
+    #[test]
+    fn detect_hashed_with_progress_errors_without_a_model_like_detect_hashed() {
+        let state = DetectorState::default();
+        let img = ImageBuf {
+            width: 8,
+            height: 8,
+            channels: 1,
+            data: PixelData::U8(vec![0; 64]),
+            icc: None,
+            exif: None,
+        };
+        assert!(state
+            .detect_hashed_with_progress(&img, &mut |_, _| {})
+            .unwrap_err()
+            .contains("no detector"));
     }
 
     #[test]
