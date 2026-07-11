@@ -210,3 +210,69 @@ fn far_apart_clusters_get_separate_calls() {
         }
     }
 }
+
+/// Pins the Task 2 batching win as a regression test: 8 well-separated
+/// clusters of 5 specks each (40 defects total) must heal through roughly
+/// one inpainter call per cluster, not one call per defect.
+///
+/// Per-defect healing (grouping disabled) would cost >= 40 calls: each of
+/// the 40 defects sits comfortably inside a single 48px window interior on
+/// its own, so an ungrouped heal makes exactly one call per defect (the
+/// same shape `far_apart_clusters_get_separate_calls` above shows for two
+/// isolated clusters, scaled up). This was confirmed locally by setting
+/// the grouping gap to 0 (`n as u32 / 8` -> `0` in heal.rs, so `touches`'s
+/// `span < 2*gap` is never true and every defect is its own singleton
+/// group): `inp.calls()` came back 40 and the `<= 12` assertion below
+/// failed loudly. Reverted after confirming; see the Task 3 report for the
+/// full before/after output.
+///
+/// Batched healing collapses each cluster (union bbox 32x32, comfortably
+/// inside the 48px interior) to a single shared window, so the expected
+/// shape is 8 clusters x 1-2 windows each -- asserted here as a <= 12
+/// bound with headroom, not an exact count, so the test does not become
+/// brittle to incidental window-boundary shifts.
+///
+/// Geometry: a 4x2 grid of clusters on a 200px pitch in both axes. Each
+/// cluster's own footprint is 32x32 (`five_clustered_specks`'s doc
+/// comment), so neighbouring clusters sit 200 - 32 = 168px apart --
+/// ten times the 16px merge threshold (2 * margin, margin = 64 / 8 = 8),
+/// so no two clusters can merge even diagonally. The spec's starting
+/// point was a 2000x2000 image; the call-count ratio this test pins does
+/// not depend on image size once clusters clear the merge threshold, so
+/// the image is sized down to 742x342 (just enough to fit the grid plus
+/// slack) to keep the test fast -- disclosed here rather than silently
+/// shrunk.
+#[test]
+fn eight_clusters_share_windows_not_per_defect_calls() {
+    let (width, height) = (742u32, 342u32);
+    let mut img = noisy_image(width, height);
+    let original = img.clone();
+    let mut mask = vec![false; (width * height) as usize];
+    for row in 0..2u32 {
+        for col in 0..4u32 {
+            five_clustered_specks(&mut mask, width, col * 200, row * 200);
+        }
+    }
+
+    let mut inp = fixed_inpainter();
+    let report = heal(&mut img, &mask, Some(&mut inp)).unwrap();
+
+    assert_eq!(report.inpainted, 40);
+    assert!(
+        inp.calls() <= 12,
+        "expected <= 12 batched calls for 8 clusters of 5 specks each, got {} \
+         (per-defect healing of the same 40 defects would cost >= 40)",
+        inp.calls()
+    );
+
+    let (PixelData::U16(a), PixelData::U16(b)) = (&original.data, &img.data) else {
+        panic!("depth changed");
+    };
+    for i in 0..(width * height) as usize {
+        if !mask[i] {
+            for c in 0..3 {
+                assert_eq!(a[i * 3 + c], b[i * 3 + c], "pixel {i} changed outside mask");
+            }
+        }
+    }
+}
