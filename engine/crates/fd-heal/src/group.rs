@@ -86,20 +86,31 @@ fn intersects(a: Bbox, b: Bbox) -> bool {
     a.x0 < b.x1 && b.x0 < a.x1 && a.y0 < b.y1 && b.y0 < a.y1
 }
 
-/// True when expanding `a` by `gap` (saturating at 0) makes it intersect
-/// `b`. Expanding only one side of the pair is enough: for the x axis,
-/// `intersects` reduces to `expand(a).x0 < b.x1 && b.x0 < expand(a).x1`,
-/// i.e. `a.x0.saturating_sub(gap) < b.x1  &&  b.x0 < a.x1 + gap`. The first
-/// clause is trivially true whenever the subtraction actually saturates
-/// (`a.x0 < gap` implies `b.x1 >= 1` for any non-empty bbox, hence `0 <
-/// b.x1`), and reduces to `a.x0 < b.x1 + gap` otherwise -- the same
-/// inequality expanding `b` instead of `a` would produce. So expanding
-/// either defect's bbox and testing against the other's unexpanded bbox
-/// gives an identical, symmetric result; this is exactly the effect of
-/// expanding "each" bbox by `gap` that the doc comment on `group_defects`
-/// describes.
+/// True when expanding EACH of `a` and `b` by `gap` (saturating at 0)
+/// makes them intersect -- both boxes expand, so two defects merge when
+/// the empty span between them is under `2*gap` (each expanded box
+/// reaches `gap` toward the other and together they cover the span).
+///
+/// Derivation, x axis (y is identical). Substituting `expand` into
+/// `intersects` gives
+///
+///   a.x0.saturating_sub(gap) < b.x1.saturating_add(gap)
+///   && b.x0.saturating_sub(gap) < a.x1.saturating_add(gap)
+///
+/// In unsaturated integer arithmetic each clause is `a.x0 < b.x1 + 2*gap`
+/// (move `gap` across from both sides), i.e. for `a` left of `b` the pair
+/// merges iff the pixel span between them, `b.x0 - a.x1`, is strictly
+/// less than `2*gap`; a span of exactly `2*gap` leaves the expanded boxes
+/// sharing only an edge, which the strict `<` of exclusive bounds
+/// correctly rejects. Saturation cannot flip the comparison: when
+/// `saturating_sub` clamps to 0 the clause it appears in only becomes
+/// easier to satisfy, and the unsaturated form was already true
+/// (`a.x0 < gap <= b.x1 + 2*gap` for any non-empty `b`); when
+/// `saturating_add` clamps to `u32::MAX` the true bound is even larger,
+/// and any in-image `x0` is strictly below `u32::MAX`, so the clause
+/// again agrees with the unsaturated form.
 fn touches(a: Bbox, b: Bbox, gap: u32) -> bool {
-    intersects(expand(a, gap), b)
+    intersects(expand(a, gap), expand(b, gap))
 }
 
 fn find(parent: &mut [usize], x: usize) -> usize {
@@ -177,24 +188,54 @@ mod tests {
 
     #[test]
     fn transitive_chain_merges_into_one_group() {
-        // A-B separation 4px, B-C separation 4px, A-C separation 9px.
-        // gap=5 touches A-B and B-C directly but not A-C -- only the
-        // union-find's transitivity via B pulls A and C into one group.
+        // gap=2, so pairs merge when the span between them is < 2*gap = 4.
+        // A=[0,1), B=[4,5), C=[8,9): spans A-B and B-C are 4-1=3 and
+        // 8-5=3 (both < 4, direct touches), but A-C is 8-1=7 (>= 4, no
+        // direct touch -- asserted below against the real `touches`).
+        // Only union-find's transitivity via B pulls A and C together.
         let a = defect(0, 0, 1, 1);
-        let b = defect(5, 0, 6, 1);
-        let c = defect(10, 0, 11, 1);
+        let b = defect(4, 0, 5, 1);
+        let c = defect(8, 0, 9, 1);
         let defects = vec![a, b, c];
 
         assert!(
-            !touches(defects[0].bbox, defects[2].bbox, 5),
+            !touches(defects[0].bbox, defects[2].bbox, 2),
             "A and C must not touch directly"
         );
 
-        let groups = group_defects(&defects, 5);
+        let groups = group_defects(&defects, 2);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].members, vec![0, 1, 2]);
         let bb = groups[0].bbox;
-        assert_eq!((bb.x0, bb.y0, bb.x1, bb.y1), (0, 0, 11, 1));
+        assert_eq!((bb.x0, bb.y0, bb.x1, bb.y1), (0, 0, 9, 1));
+    }
+
+    #[test]
+    fn specks_in_the_gap_to_double_gap_band_merge() {
+        // 9px apart with gap=5: each expanded box reaches 5px toward the
+        // other, together covering the 9px span (9 < 2*gap = 10), so the
+        // expanded boxes overlap by 1px and the pair must merge. A
+        // single-side expansion (effective radius gap, not 2*gap) misses
+        // exactly this band and would leave two groups.
+        let defects = vec![defect(0, 0, 1, 1), defect(10, 0, 11, 1)];
+        let groups = group_defects(&defects, 5);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].members, vec![0, 1]);
+        let b = groups[0].bbox;
+        assert_eq!((b.x0, b.y0, b.x1, b.y1), (0, 0, 11, 1));
+    }
+
+    #[test]
+    fn expanded_boxes_sharing_only_an_edge_do_not_merge() {
+        // 4px apart with gap=2: separation equals 2*gap exactly, so the
+        // expanded boxes are [0,3) and [3,8) -- they share only the x=3
+        // edge. Exclusive bounds + strict < means edge contact is not
+        // intersection: two groups.
+        let defects = vec![defect(0, 0, 1, 1), defect(5, 0, 6, 1)];
+        let groups = group_defects(&defects, 2);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].members, vec![0]);
+        assert_eq!(groups[1].members, vec![1]);
     }
 
     #[test]
