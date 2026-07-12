@@ -18,12 +18,11 @@ Snapshot for a fresh Claude Code session. Updated 2026-07-12 (cancellation + bac
 
 ## Suggested first task
 
-No P1 open. Everything doable without Albert's input or the trained model has been swept; what remains needs one of those:
+No P1 open. Everything doable without Albert's input or the trained model has been swept. Albert's decisions from 2026-07-12 are recorded on the beads: 4wj ships download-on-first-run with auto colour/bw variant selection (blocked on the trained model); vem shipped (Reset/Delete roll data menu items); fuj shipped (wipe compare); obr closed (superseded by CoreML + 1jc cancellation). What remains:
 
-- **Needs Albert's decisions**: 4wj (release detector: bundle vs download, colour/bw variant selection), obr (detection in a separate worker process — architectural), fuj (split/wipe compare modes — UX direction), vem (menu action to clear the .unduster sidecar — destructive-action design).
-- **Needs a fresh focused session**: rcb (frontend component tests — App.svelte's whole state machine is untested; requires test infra: mocking @tauri-apps/api invoke/listen).
+- **Blocked on the trained model**: 4wj (release detector: reuse the model-download infra for a second model, auto-variant from the scan), 3uz (CoreML-vs-CPU benchmark), jb2 (IR channel).
+- **Deferred pending a decision to invest**: rcb — its PURE state-machine decisions are now extracted and tested (lib/jobstate.ts, lib/heal.ts, healingEngineFor in status.ts); the remaining async-sequencing items (activation guard, loader clearing, mode-switch, ring gating) need a component harness (happy-dom + @testing-library/svelte + mocked @tauri-apps/api). Deferred 2026-07-12 — see the bead note.
 - **Needs the running app / hardware**: jn3 (profile the tile protocol under pan/zoom), fag (Windows port).
-- **Awaiting Albert's manual gate**: 1cy, 2vf (implemented and reviewed; close after an app session confirms).
 
 ## How work is done here (match this)
 
@@ -62,9 +61,9 @@ No P1 open. Everything doable without Albert's input or the trained model has be
 ## Open backlog, prioritized
 
 - **P1**: none open.
-- **P2**: 4wj (release detector story — needs Albert's decisions: bundle vs download, colour/bw variant selection), 3uz (benchmark CoreML vs CPU detection on the real model — blocked on the model existing).
-- **P3**: rcb (frontend component tests — the biggest remaining debt), obr (detection worker process), fuj (split/wipe compare modes), vem (clear-sidecar menu action), jn3 (tile-protocol profiling), fag (Windows port), jb2 (IR channel), 1cy/2vf close-out.
-- Closed in the 07-11/12 sweep: 1jc, np6, 36w, jhk, ckv, 80i, cm2, u98, sol, 02y, dm2, csb, vd5.
+- **P2**: 4wj (release detector — decisions made, blocked on the model), 3uz (CoreML-vs-CPU benchmark — blocked on the model).
+- **P3**: rcb (deferred — pure decisions tested, harness pending; see above), jn3 (tile-protocol profiling), fag (Windows port), jb2 (IR channel).
+- Closed in the 07-11/12 sweep: 1jc, np6, 36w, jhk, ckv, 80i, cm2, u98, sol, 02y, dm2, csb, vd5, vem, fuj, obr, 1cy, 2vf.
 
 ## The critical path
 
