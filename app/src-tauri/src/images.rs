@@ -120,9 +120,12 @@ pub fn components_from_probs(
     threshold: f32,
 ) -> Vec<[u32; 4]> {
     let mask = threshold_mask_from_probs(probs, threshold);
-    fd_heal::components(&mask, width, height)
+    // components_up_to caps the WALK itself, not just the returned list: on
+    // a pathological mask the old full-walk-then-take paid for hundreds of
+    // thousands of specks it was about to throw away (TheUnduster-csb). The
+    // prefix is identical either way (row-major scan order).
+    fd_heal::components_up_to(&mask, width, height, MAX_COMPONENTS)
         .into_iter()
-        .take(MAX_COMPONENTS)
         .map(|d| [d.bbox.x0, d.bbox.y0, d.bbox.x1, d.bbox.y1])
         .collect()
 }

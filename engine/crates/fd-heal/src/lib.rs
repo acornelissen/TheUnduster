@@ -9,7 +9,7 @@ mod heal;
 mod inpaint;
 
 pub use classical::classical_fill;
-pub use components::{components, Bbox, Defect};
+pub use components::{components, components_up_to, Bbox, Defect};
 pub use dilate::dilate;
 pub use grain::add_grain;
 pub use group::{group_defects, Group};

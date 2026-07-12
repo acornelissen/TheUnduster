@@ -21,10 +21,25 @@ impl Defect {
 /// Connected components over a boolean mask, 4-connectivity (matches
 /// scipy.ndimage.label's default used by the training metrics).
 pub fn components(mask: &[bool], width: u32, height: u32) -> Vec<Defect> {
+    components_up_to(mask, width, height, usize::MAX)
+}
+
+/// `components`, but the WALK stops once `limit` components have been
+/// collected -- not just the returned list truncated after a full pass. The
+/// prefix is identical to `components`' first `limit` entries (both are
+/// row-major scan order); the difference is cost on a pathological mask (a
+/// bad model or threshold producing hundreds of thousands of specks), where
+/// the capped bbox-listing path used to pay for the whole walk and then
+/// throw the tail away. Healing keeps using the uncapped `components`: every
+/// defect must actually heal.
+pub fn components_up_to(mask: &[bool], width: u32, height: u32, limit: usize) -> Vec<Defect> {
     let (w, h) = (width as usize, height as usize);
     let mut seen = vec![false; w * h];
     let mut out = Vec::new();
     for start in 0..w * h {
+        if out.len() >= limit {
+            break;
+        }
         if !mask[start] || seen[start] {
             continue;
         }

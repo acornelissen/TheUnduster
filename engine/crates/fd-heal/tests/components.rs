@@ -43,3 +43,22 @@ fn empty_mask_no_components() {
     let (m, w, h) = mask_from(&["....", "...."]);
     assert!(components(&m, w, h).is_empty());
 }
+
+#[test]
+fn components_up_to_stops_at_the_limit_with_the_same_scan_order_prefix() {
+    // Five separate specks; a limit of 3 must return exactly the first
+    // three the full walk would have found (row-major scan order), so
+    // capping the WALK is behavior-identical to capping the returned list
+    // -- it just stops paying for a pathological mask's tail.
+    let (m, w, h) = mask_from(&["#.#.#", ".....", "#.#.."]);
+    let full = fd_heal::components(&m, w, h);
+    assert_eq!(full.len(), 5);
+    let capped = fd_heal::components_up_to(&m, w, h, 3);
+    assert_eq!(capped.len(), 3);
+    for (a, b) in capped.iter().zip(full.iter()) {
+        assert_eq!(a.pixels, b.pixels);
+    }
+    // Zero cap: nothing, immediately. Limit above the count: everything.
+    assert!(fd_heal::components_up_to(&m, w, h, 0).is_empty());
+    assert_eq!(fd_heal::components_up_to(&m, w, h, 99).len(), 5);
+}
