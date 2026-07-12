@@ -12,6 +12,8 @@
   import QueuePanel from "./lib/QueuePanel.svelte";
   import ShortcutsPanel from "./lib/ShortcutsPanel.svelte";
   import { composeQueueEntries, type QueueEntry, type QueueProgress } from "./lib/queue";
+  import { countQueuedJobs, isExportRunning, runningKindAt } from "./lib/jobstate";
+  import { isHealStale } from "./lib/heal";
   import { routeDrop, type PathKind } from "./lib/drop";
   import type { Level } from "./lib/viewport";
   import { undoStroke, redoStroke, type StrokeData } from "./lib/brush";
@@ -132,8 +134,8 @@
   // job-queued/job-started/job-done/job-error/queue-idle. Single-image mode
   // never touches this (it invokes detect/heal directly and awaits them).
   // Deliberately NOT the source of a tracked "is the current frame busy"
-  // flag -- that is derived below (`currentJob`/`rollDetecting`/
-  // `rollHealing`) so it self-corrects when the operator navigates to a
+  // flag -- that is derived below (`rollDetecting`/`rollHealing` via
+  // `runningKindAt`) so it self-corrects when the operator navigates to a
   // different frame mid-job instead of latching on the index that happened
   // to be current when the job started.
   let jobStates: Record<
@@ -220,31 +222,25 @@
   // `jobStates[currentIndex]` live, so navigating to a different frame while
   // a job is in flight immediately (and correctly) reports "not busy" here
   // without any listener needing to know the operator moved on.
-  const currentJob = $derived(roll ? jobStates[currentIndex] : undefined);
-  const rollDetecting = $derived(currentJob?.state === "running" && currentJob.kind === "detect");
-  const rollHealing = $derived(currentJob?.state === "running" && currentJob.kind === "heal");
+  // Roll-job status for the current frame. Pure derivations live in
+  // lib/jobstate.ts (tested there); these read the live map. `runningKindAt`
+  // returns null once the operator navigates away, since the map is keyed by
+  // index -- see its doc comment.
+  const rollDetecting = $derived(runningKindAt(jobStates, currentIndex, roll !== null) === "detect");
+  const rollHealing = $derived(runningKindAt(jobStates, currentIndex, roll !== null) === "heal");
   // Combined single-image + roll activity, for template/guard use so callers
   // don't need to know which mode is active.
   const isDetecting = $derived(detecting || rollDetecting);
   const isHealing = $derived(healing || rollHealing);
-  // Count of queued jobs (all states, all frames) for the status line.
-  // Prefetch is excluded: routine neighbor warm-ups fire on every roll
-  // navigation, and counting them keeps the status line churning while the
-  // operator is just browsing. The filmstrip dots and the queue panel still
-  // show prefetch jobs.
-  const queuedJobCount = $derived(
-    Object.values(jobStates).filter((j) => j.kind !== "prefetch").length,
-  );
-  // True only while an export job is actually running (not merely queued).
-  // Feeds the status-activity slot so a live heal narrates itself during a
-  // mixed batch instead of the slot showing bare "exporting" for an export
-  // that hasn't started yet. Deliberately NOT used to disable the Export
-  // button: re-clicking while exports are queued is allowed -- the backend
-  // coalesces per-frame, so already-queued frames are skipped and only
-  // newly approved work is added.
-  const exportRunning = $derived(
-    Object.values(jobStates).some((j) => j.kind === "export" && j.state === "running"),
-  );
+  // Count of queued jobs for the status line (prefetch excluded -- see
+  // countQueuedJobs). The filmstrip dots and queue panel still show prefetch.
+  const queuedJobCount = $derived(countQueuedJobs(jobStates));
+  // True only while an export job is actually running (not merely queued),
+  // for the status-activity slot. Deliberately NOT used to disable the
+  // Export button: re-clicking while exports are queued is allowed -- the
+  // backend coalesces per-frame, so already-queued frames are skipped and
+  // only newly approved work is added.
+  const exportRunning = $derived(isExportRunning(jobStates));
   // The index of the frame actually on screen. `currentIndex` is set
   // synchronously on navigation (stepFrame/selectFrame)
   // before `activate_frame` resolves, so during that window the OLD frame is
@@ -1632,12 +1628,9 @@
   const healStale = $derived.by(() => {
     const key = strokeKey();
     if (!key) return false;
-    const captured = healInputs[key];
-    if (!captured) return false;
-    const currentStrokeCount = strokeStore[key]?.strokes.length ?? 0;
-    return (
-      overlay.threshold !== captured.threshold || currentStrokeCount !== captured.strokeCount
-    );
+    // Comparison lives in lib/heal.ts (tested there); this resolves the
+    // frame key and reads the live stroke store, then defers the decision.
+    return isHealStale(healInputs[key], overlay.threshold, strokeStore[key]?.strokes.length ?? 0);
   });
 
   // Three-zone status bar strings. Pure composition lives in lib/status.ts
