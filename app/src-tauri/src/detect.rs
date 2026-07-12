@@ -249,11 +249,12 @@ impl InpainterState {
             .map(|loaded| (&mut loaded.inpainter, loaded.hash))))
     }
 
-    // No production caller: heal-cache provenance always reads the inpainter's
-    // hash through with_inpainter_hashed (one lock, paired with the model
-    // that actually heals -- see that method's doc comment). Kept for tests
-    // and any future non-racy caller.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Heal-cache provenance must NOT use this: it reads the hash through
+    /// with_inpainter_hashed (one lock, paired with the model that actually
+    /// heals -- see that method's doc comment). This standalone read is for
+    /// callers where a racing model swap is harmless, like the export skip
+    /// decision (`export_provenance_hex`), where a mismatch only causes a
+    /// spare re-export.
     pub fn hash(&self) -> Option<[u8; 32]> {
         let guard = self.inner.lock().ok()?;
         guard.as_ref().map(|loaded| loaded.hash)

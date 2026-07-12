@@ -1957,6 +1957,11 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                 .export_dest()?
                 .ok_or("no export destination set")?;
             let dest = dest_dir.join(&file_name);
+            // Captured BEFORE the export runs: if a model swap lands
+            // mid-job, the recorded provenance no longer matches the new
+            // model, so the next "Export approved" re-exports -- the safe
+            // direction (see export_provenance_hex).
+            let provenance_hex = export_provenance_hex(app, &path, threshold, &strokes);
 
             // Prefer already-healed registry data (the operator reviewed it).
             // Pin before reading the Arcs so eviction cannot pull the entry
@@ -2140,9 +2145,9 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
             // persisted state, and a badge for an exported-but-not-recorded
             // frame would vanish on relaunch. The exported file itself is
             // fine either way.
-            if let Err(_e) = app
-                .state::<roll::RollState>()
-                .set_exported(generation, index)
+            if let Err(_e) =
+                app.state::<roll::RollState>()
+                    .set_exported(generation, index, provenance_hex)
             {
                 #[cfg(debug_assertions)]
                 eprintln!("[export] exported flag not recorded for frame {index}: {_e}");
@@ -2266,6 +2271,68 @@ fn queue_snapshot(queue: State<'_, jobs::JobQueue>) -> Result<Vec<jobs::Job>, St
     queue.snapshot()
 }
 
+/// The current heal provenance of one frame, hex-encoded for sidecar
+/// storage and comparison -- the "would exporting this frame today produce
+/// the same file as last time" key. Model hashes are read as two separate
+/// observations rather than under `with_inpainter_hashed`'s pairing lock:
+/// this hash keys a SKIP decision, not cache contents, and a model swap
+/// racing it only ever produces a mismatch, i.e. a harmless re-export.
+/// None when the source cannot be statted -- no stamp means no proof of
+/// anything, so the caller must not skip.
+fn export_provenance_hex(
+    app: &tauri::AppHandle,
+    path: &std::path::Path,
+    threshold: f32,
+    strokes: &[masks::Stroke],
+) -> Option<String> {
+    let stamp = stamp_or_skip(path)?;
+    let detector_hash = app
+        .state::<detect::DetectorState>()
+        .hash()
+        .unwrap_or([0u8; 32]);
+    let inpainter_hash = app
+        .state::<detect::InpainterState>()
+        .hash()
+        .unwrap_or([0u8; 32]);
+    let digest = cache::heal_provenance(
+        threshold,
+        HEAL_DILATE_RADIUS,
+        strokes,
+        &detector_hash,
+        &inpainter_hash,
+        &stamp,
+    );
+    Some(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// The export skip decision, pure so every axis is directly testable:
+/// skip only when the frame was exported before, BOTH provenances are known
+/// and equal, the exported file is still at the destination, and the
+/// operator did not force a full re-export. Anything unprovable exports
+/// again -- a wasted re-export costs minutes, a wrongly skipped frame
+/// silently ships stale pixels.
+fn should_skip_export(
+    force: bool,
+    exported: bool,
+    stored: Option<&str>,
+    current: Option<&str>,
+    dest_exists: bool,
+) -> bool {
+    if force || !exported || !dest_exists {
+        return false;
+    }
+    matches!((stored, current), (Some(s), Some(c)) if s == c)
+}
+
+/// What one "Export approved" click decided: how many frames were queued
+/// and how many were skipped as already up to date. The frontend narrates
+/// both so a skip never reads as a silently dropped frame.
+#[derive(serde::Serialize)]
+struct ExportEnqueueSummary {
+    queued: usize,
+    skipped: usize,
+}
+
 /// Cancels one job: removed outright if it is still queued (job-cancelled
 /// emitted immediately), or flagged for cooperative abort if it is the one
 /// running (the worker emits job-cancelled once the job actually stops --
@@ -2331,21 +2398,43 @@ fn enqueue_exports(
     roll: State<'_, roll::RollState>,
     queue: State<'_, jobs::JobQueue>,
     dest_dir: String,
-) -> Result<(), String> {
-    // Validation before anything lands in the queue: errors when no roll
-    // is open. approved_snapshot already includes previously exported
-    // frames -- re-export is deliberate, predictable overwrite. Indices and
-    // generation come from one lock acquisition rather than two separate
-    // calls, so a roll swap landing between them can never tag the OLD
-    // roll's indices with the NEW generation -- see that method's doc
-    // comment.
-    let (indices, generation) = roll.approved_snapshot()?;
-    roll.set_export_dest(std::path::PathBuf::from(dest_dir))?;
-    for index in indices {
+    force: bool,
+) -> Result<ExportEnqueueSummary, String> {
+    // Validation before anything lands in the queue: errors when no roll is
+    // open. Candidates and generation come from one lock acquisition rather
+    // than two separate calls, so a roll swap landing between them can
+    // never tag the OLD roll's indices with the NEW generation -- see that
+    // method's doc comment. Frames whose recorded export provenance still
+    // matches their current inputs are skipped (unless `force`, the
+    // deliberate full re-export): approving two more frames must not re-run
+    // minutes of healing on the frames that already shipped.
+    let (roll_dir, candidates, generation) = roll.approved_export_snapshot()?;
+    let dest_root = std::path::PathBuf::from(&dest_dir);
+    roll.set_export_dest(dest_root.clone())?;
+    let mut queued = 0usize;
+    let mut skipped = 0usize;
+    for candidate in candidates {
+        let current = export_provenance_hex(
+            &app,
+            &roll_dir.join(&candidate.file_name),
+            candidate.threshold,
+            &candidate.strokes,
+        );
+        if should_skip_export(
+            force,
+            candidate.exported,
+            candidate.export_provenance.as_deref(),
+            current.as_deref(),
+            dest_root.join(&candidate.file_name).is_file(),
+        ) {
+            skipped += 1;
+            continue;
+        }
+        queued += 1;
         let newly_queued = queue.enqueue(
             jobs::Job {
                 kind: jobs::JobKind::Export,
-                index,
+                index: candidate.index,
                 generation,
             },
             false, // back of queue: never jumps ahead of queued heals
@@ -2354,7 +2443,7 @@ fn enqueue_exports(
             let _ = app.emit(
                 "job-queued",
                 JobEvent {
-                    index,
+                    index: candidate.index,
                     kind: jobs::JobKind::Export,
                     generation,
                 },
@@ -2362,7 +2451,7 @@ fn enqueue_exports(
         }
     }
     spawn_worker_if_idle(&app, generation);
-    Ok(())
+    Ok(ExportEnqueueSummary { queued, skipped })
 }
 
 /// Claims the worker flag and spawns the drain loop if no worker is
@@ -2683,6 +2772,55 @@ mod roll_queue_tests {
     fn fixture_detector() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../engine/fixtures/tiny-detector.onnx")
+    }
+
+    #[test]
+    fn export_skip_requires_proof_on_every_axis() {
+        // The only skippable shape: previously exported, both provenances
+        // known and equal, destination file still there, no force.
+        assert!(should_skip_export(
+            false,
+            true,
+            Some("abc"),
+            Some("abc"),
+            true
+        ));
+        // force overrides everything -- the deliberate full re-export.
+        assert!(!should_skip_export(
+            true,
+            true,
+            Some("abc"),
+            Some("abc"),
+            true
+        ));
+        // Never exported: nothing recorded to be up to date against.
+        assert!(!should_skip_export(
+            false,
+            false,
+            Some("abc"),
+            Some("abc"),
+            true
+        ));
+        // Inputs changed since the recorded export.
+        assert!(!should_skip_export(
+            false,
+            true,
+            Some("abc"),
+            Some("def"),
+            true
+        ));
+        // Unknown provenance on either side proves nothing.
+        assert!(!should_skip_export(false, true, None, Some("abc"), true));
+        assert!(!should_skip_export(false, true, Some("abc"), None, true));
+        assert!(!should_skip_export(false, true, None, None, true));
+        // The exported file was deleted from the destination: re-export.
+        assert!(!should_skip_export(
+            false,
+            true,
+            Some("abc"),
+            Some("abc"),
+            false
+        ));
     }
 
     #[test]

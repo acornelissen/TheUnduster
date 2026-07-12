@@ -973,12 +973,26 @@
     }
   }
 
-  async function exportApproved() {
+  // Shift-click forces the old full re-export; a plain click skips frames
+  // whose recorded export provenance still matches their current inputs.
+  // The summary toast narrates the skips so an unchanged frame never reads
+  // as silently dropped.
+  async function exportApproved(event?: MouseEvent) {
     if (!roll) return;
     const dir = await open({ directory: true });
     if (typeof dir !== "string") return;
     try {
-      await invoke("enqueue_exports", { destDir: dir });
+      const summary = await invoke<{ queued: number; skipped: number }>("enqueue_exports", {
+        destDir: dir,
+        force: event?.shiftKey ?? false,
+      });
+      if (summary.skipped > 0) {
+        const noun = summary.skipped === 1 ? "frame" : "frames";
+        const tail = summary.queued === 0 ? "; nothing to export" : "";
+        pushInfo(
+          `${summary.skipped} ${noun} already up to date, skipped (shift-click exports everything)${tail}`,
+        );
+      }
     } catch (e) {
       pushError(String(e));
     }
@@ -1870,7 +1884,7 @@
         </button>
         <button
           class="btn"
-          title="Export approved"
+          title="Export approved — skips frames unchanged since their last export; shift-click re-exports everything"
           onclick={exportApproved}
           disabled={roll.frames.every((f) => !f.approved)}
         >

@@ -29,6 +29,14 @@ pub struct Frame {
     pub strokes: Vec<crate::masks::Stroke>,
     #[serde(default)]
     pub redo_strokes: Vec<crate::masks::Stroke>,
+    /// Hex heal-provenance recorded when this frame last exported
+    /// successfully -- the memory behind "Export approved" skipping frames
+    /// whose inputs (threshold, strokes, model hashes, source stamp) have
+    /// not changed since. None when never exported, or when the exporting
+    /// job could not compute provenance (unstattable source): both mean
+    /// "cannot prove it is up to date", so the frame exports again.
+    #[serde(default)]
+    pub export_provenance: Option<String>,
     /// Registry id while the frame's pixels are activated. Runtime-only:
     /// a fresh process has no registry entries, so persisting this would
     /// point at nothing after restart.
@@ -51,6 +59,7 @@ impl Frame {
             bboxes: None,
             strokes: Vec::new(),
             redo_strokes: Vec::new(),
+            export_provenance: None,
             image_id: None,
         }
     }
@@ -292,6 +301,21 @@ impl Roll {
 /// healed-cache batch probe needs, returned by `RollState::frames_meta_snapshot`.
 /// Named to keep that function's signature clippy-clean (`type_complexity`).
 pub type FrameMeta = (String, f32, Vec<crate::masks::Stroke>);
+
+/// One approved frame's export-decision inputs, returned by
+/// `RollState::approved_export_snapshot`: everything `enqueue_exports`
+/// needs to compute the frame's current heal provenance (threshold,
+/// strokes, file name for the stamp) and compare it against what the last
+/// successful export recorded (exported + export_provenance).
+#[derive(Clone, Debug)]
+pub struct ExportCandidate {
+    pub index: usize,
+    pub file_name: String,
+    pub threshold: f32,
+    pub strokes: Vec<crate::masks::Stroke>,
+    pub exported: bool,
+    pub export_provenance: Option<String>,
+}
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct FrameInfo {
@@ -748,29 +772,37 @@ impl RollState {
             .collect())
     }
 
-    /// Approved frame indices (in order, exported frames INCLUDED --
-    /// pressing "Export approved" again re-exports all approved work,
-    /// predictably overwriting whatever landed before) AND the roll
-    /// generation, read under one lock acquisition. `enqueue_exports` used
-    /// to call a `frames_to_export()`-shaped indices-only accessor then
-    /// `generation()` as two separate locks; a roll swap landing between
-    /// them would tag the OLD roll's indices with the NEW generation, and
-    /// the worker's per-job generation check -- which trusts the tag, not
-    /// the indices' actual origin -- would then wave those jobs through
-    /// against the wrong roll. Snapshotting both together closes that
-    /// window: the generation returned here is provably the one that
-    /// produced these exact indices.
-    pub fn approved_snapshot(&self) -> Result<(Vec<usize>, u64), String> {
+    /// Approved frames (in order, exported frames INCLUDED -- whether an
+    /// exported frame runs again is `enqueue_exports`' provenance decision,
+    /// not this accessor's), the roll dir, AND the roll generation, all read
+    /// under one lock acquisition. The single-acquisition shape matters for
+    /// the same reason as `frame_snapshot`: a roll swap between separate
+    /// indices/generation reads would tag the OLD roll's indices with the
+    /// NEW generation, and the worker's per-job generation check -- which
+    /// trusts the tag, not the indices' actual origin -- would wave those
+    /// jobs through against the wrong roll.
+    pub fn approved_export_snapshot(&self) -> Result<(PathBuf, Vec<ExportCandidate>, u64), String> {
         let guard = self.roll.lock().map_err(|e| e.to_string())?;
         let roll = guard.as_ref().ok_or("no roll open")?;
-        let indices = roll
+        let candidates = roll
             .frames
             .iter()
             .enumerate()
             .filter(|(_, f)| f.approved)
-            .map(|(i, _)| i)
+            .map(|(index, f)| ExportCandidate {
+                index,
+                file_name: f.file_name.clone(),
+                threshold: f.threshold,
+                strokes: f.strokes.clone(),
+                exported: f.exported,
+                export_provenance: f.export_provenance.clone(),
+            })
             .collect();
-        Ok((indices, self.generation.load(Ordering::SeqCst)))
+        Ok((
+            roll.dir.clone(),
+            candidates,
+            self.generation.load(Ordering::SeqCst),
+        ))
     }
 
     /// Every frame's `(file_name, threshold, strokes)` plus the roll's own
@@ -837,11 +869,19 @@ impl RollState {
         roll.save()
     }
 
-    /// Records that a frame was exported, but only if the roll the export
-    /// started against is still the live one: mirrors `record_scan_result`'s
-    /// generation re-check under the same lock that guards the write, so a
-    /// frame exported against roll A never marks roll B's sidecar done.
-    pub fn set_exported(&self, generation: u64, index: usize) -> Result<(), String> {
+    /// Records that a frame was exported -- flag plus the heal provenance
+    /// the export ran under (see `Frame::export_provenance`) -- but only if
+    /// the roll the export started against is still the live one: mirrors
+    /// `record_scan_result`'s generation re-check under the same lock that
+    /// guards the write, so a frame exported against roll A never marks
+    /// roll B's sidecar done. A `None` provenance overwrites any previous
+    /// value: keeping a stale one would wrongly skip the frame next run.
+    pub fn set_exported(
+        &self,
+        generation: u64,
+        index: usize,
+        provenance: Option<String>,
+    ) -> Result<(), String> {
         let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
         if self.generation.load(Ordering::SeqCst) != generation {
             return Err("roll changed during export; result discarded".to_string());
@@ -852,6 +892,7 @@ impl RollState {
             .get_mut(index)
             .ok_or_else(|| format!("no frame {index}"))?;
         frame.exported = true;
+        frame.export_provenance = provenance;
         roll.save()
     }
 
@@ -1184,11 +1225,11 @@ mod state_tests {
     }
 
     #[test]
-    fn approved_snapshot_returns_the_same_generation_the_state_reports_and_only_approved_indices() {
-        // Pins the bead-caw contract: indices and generation must come from
-        // ONE lock acquisition, so a roll swap between reading them (the
-        // old two-call shape) can never tag old-roll indices with the new
-        // generation.
+    fn approved_export_snapshot_returns_only_approved_frames_with_the_live_generation() {
+        // Pins the bead-caw contract: candidates and generation must come
+        // from ONE lock acquisition, so a roll swap between reading them
+        // (the old two-call shape) can never tag old-roll indices with the
+        // new generation.
         let dir = tempfile::tempdir().unwrap();
         for n in ["a.png", "b.png", "c.png", "d.png"] {
             std::fs::write(dir.path().join(n), b"x").unwrap();
@@ -1197,16 +1238,31 @@ mod state_tests {
         state.open(dir.path()).unwrap();
         state.set_approved(1, true).unwrap();
         state.set_approved(3, true).unwrap();
-        state.set_exported(state.generation(), 1).unwrap(); // exported frames stay included
-        let (indices, generation) = state.approved_snapshot().unwrap();
-        assert_eq!(indices, vec![1, 3]);
+        // exported frames stay included -- the skip decision is the
+        // caller's, made against the provenance
+        state
+            .set_exported(state.generation(), 1, Some("abc123".to_string()))
+            .unwrap();
+        let (returned_dir, candidates, generation) = state.approved_export_snapshot().unwrap();
+        assert_eq!(returned_dir, dir.path());
         assert_eq!(generation, state.generation());
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].index, 1);
+        assert_eq!(candidates[0].file_name, "b.png");
+        assert!(candidates[0].exported);
+        assert_eq!(candidates[0].export_provenance.as_deref(), Some("abc123"));
+        assert_eq!(candidates[1].index, 3);
+        assert!(!candidates[1].exported);
+        assert_eq!(candidates[1].export_provenance, None);
     }
 
     #[test]
-    fn approved_snapshot_errors_when_no_roll_open() {
+    fn approved_export_snapshot_errors_when_no_roll_open() {
         let state = RollState::default();
-        assert!(state.approved_snapshot().unwrap_err().contains("no roll"));
+        assert!(state
+            .approved_export_snapshot()
+            .unwrap_err()
+            .contains("no roll"));
     }
 
     #[test]
@@ -1281,15 +1337,41 @@ mod state_tests {
         let state = RollState::default();
         state.open(dir.path()).unwrap();
         let stale = state.generation();
-        state.set_exported(state.generation(), 0).unwrap();
+        state
+            .set_exported(state.generation(), 0, Some("cafe01".to_string()))
+            .unwrap();
         state.open(dir.path()).unwrap(); // bumps generation, reloads sidecar
         assert!(state
-            .set_exported(stale, 0)
+            .set_exported(stale, 0, None)
             .unwrap_err()
             .contains("roll changed"));
-        // persisted across the reopen:
-        let info = state.open(dir.path()).unwrap().0;
-        assert!(info.frames[0].exported);
+        // Flag AND provenance persisted across a reopen (the sidecar is the
+        // skip decision's memory between sessions).
+        state.open(dir.path()).unwrap();
+        let (_, candidates, _) = {
+            state.set_approved(0, true).unwrap();
+            state.approved_export_snapshot().unwrap()
+        };
+        assert!(candidates[0].exported);
+        assert_eq!(candidates[0].export_provenance.as_deref(), Some("cafe01"));
+    }
+
+    #[test]
+    fn set_exported_without_provenance_clears_a_stale_one() {
+        // An export that could not compute provenance (unstattable source)
+        // must not leave the previous export's provenance behind: a stale
+        // match would wrongly skip the frame on the next run.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"x").unwrap();
+        let state = RollState::default();
+        state.open(dir.path()).unwrap();
+        state.set_approved(0, true).unwrap();
+        state
+            .set_exported(state.generation(), 0, Some("cafe01".to_string()))
+            .unwrap();
+        state.set_exported(state.generation(), 0, None).unwrap();
+        let (_, candidates, _) = state.approved_export_snapshot().unwrap();
+        assert_eq!(candidates[0].export_provenance, None);
     }
 
     #[test]
