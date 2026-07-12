@@ -1506,6 +1506,24 @@ struct ExportHealProgress {
 struct ExportProgress {
     index: usize,
     generation: u64,
+    /// Which healing engine was loaded when this frame's export completed:
+    /// "lama", "placeholder" (the dev fixture), or "classical" (no
+    /// inpainting model). Read at export time, not heal time -- for the
+    /// transient path they are the same job, and for the registry path the
+    /// reviewed heal ran in this same session -- so this is the honest
+    /// best-effort answer to "what healed the file that just shipped"
+    /// (TheUnduster-80i).
+    engine: &'static str,
+}
+
+/// The `ExportProgress::engine` value for the currently loaded inpainter.
+fn healing_engine(app: &tauri::AppHandle) -> &'static str {
+    let inpainter = app.state::<detect::InpainterState>();
+    match inpainter.with_inpainter(|i| i.is_some()) {
+        Ok(true) if inpainter.is_fixture() => "placeholder",
+        Ok(true) => "lama",
+        _ => "classical",
+    }
 }
 
 /// Clears the job-worker running flag when dropped, including on unwind, so
@@ -2152,7 +2170,14 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                 #[cfg(debug_assertions)]
                 eprintln!("[export] exported flag not recorded for frame {index}: {_e}");
             } else {
-                let _ = app.emit("export-progress", ExportProgress { index, generation });
+                let _ = app.emit(
+                    "export-progress",
+                    ExportProgress {
+                        index,
+                        generation,
+                        engine: healing_engine(app),
+                    },
+                );
             }
             Ok(())
         }

@@ -154,6 +154,10 @@
   // synchronously. Cleared when any terminal event (cancelled/done/error)
   // arrives for that job, on queue-idle, and on roll swap/close.
   let cancellingKey: string | null = $state(null);
+  // One placeholder-engine export warning per batch (reset when the queue
+  // idles or the roll changes), not one per frame -- see the
+  // export-progress listener.
+  let placeholderExportWarned = $state(false);
   // The generation the currently-open roll was opened under (from
   // `open_roll`'s response). Primary guard for the job-* listeners below:
   // every job event now carries the generation it was enqueued/run against,
@@ -537,6 +541,7 @@
       if (queueOpen) void refreshQueueSnapshot();
       queueProgress = null; // the worker stopped, so nothing is running now
       cancellingKey = null; // ...so there is nothing left to be cancelling
+      placeholderExportWarned = false; // next export batch warns afresh
       // Grace-period cleanup instead of a blanket wipe: a same-generation
       // idle can race an enqueue whose job a fresh worker is about to run
       // (the worker's emit happens after its empty-check releases the lock).
@@ -566,7 +571,11 @@
   });
 
   $effect(() => {
-    const un = listen<{ index: number; generation: number }>("export-progress", (e) => {
+    const un = listen<{
+      index: number;
+      generation: number;
+      engine: "lama" | "placeholder" | "classical";
+    }>("export-progress", (e) => {
       if (!roll) return;
       // Same guard shape as the job-* listeners: generation is the primary
       // check (a swap mid-export must not badge the new roll's same-index
@@ -576,6 +585,29 @@
       if (e.payload.index < 0 || e.payload.index >= roll.frames.length) return;
       roll.frames[e.payload.index].exported = true;
       exportDetail = null; // this frame is done; the next one narrates itself
+      // Per-frame receipt of what healed the shipped file (TheUnduster-80i):
+      // a quiet log line each, plus ONE toast per export batch when the
+      // engine is the placeholder -- shipping stub-quality fills is worth a
+      // toast, but not thirty of them.
+      const engineName = { lama: "LaMa", placeholder: "placeholder model", classical: "classical only" }[
+        e.payload.engine
+      ];
+      activityLog = pushLog(
+        activityLog,
+        {
+          id: nextLogId++,
+          time: new Date().toLocaleTimeString(),
+          level: "info",
+          message: `Exported ${roll.frames[e.payload.index].file_name} (healing: ${engineName})`,
+        },
+        100,
+      );
+      if (e.payload.engine === "placeholder" && !placeholderExportWarned) {
+        placeholderExportWarned = true;
+        pushError(
+          "Exporting with the placeholder healing model — download the real one and re-export",
+        );
+      }
     });
     return () => {
       un.then((f) => f());
@@ -873,6 +905,7 @@
       // job-started/job-done/job-error listeners below.
       jobStates = {};
       cancellingKey = null;
+      placeholderExportWarned = false;
       // Same reason for the export narration: it described the closed
       // roll's export, and nothing in single-image mode will clear it.
       exportDetail = null;
@@ -950,6 +983,7 @@
     // be mistaken for this roll's own in-flight work by the job listeners.
     jobStates = {};
     cancellingKey = null;
+    placeholderExportWarned = false;
     // Likewise the export narration: a stale line from the previous roll's
     // export would otherwise linger until this roll's first export event.
     exportDetail = null;
