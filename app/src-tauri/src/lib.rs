@@ -35,8 +35,12 @@ async fn open_image(
             stage: "decoding",
         },
     );
-    let image = tauri::async_runtime::spawn_blocking(move || {
-        Images::decode_stage(std::path::Path::new(&path))
+    let (image, stamp) = tauri::async_runtime::spawn_blocking(move || {
+        let path = std::path::Path::new(&path);
+        // Stamp BEFORE decoding, same as Images::prepare: the entry's stamp
+        // must describe the pixels actually decoded (TheUnduster-02y).
+        let stamp = stamp_or_skip(path);
+        Ok::<_, String>((Images::decode_stage(path)?, stamp))
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -53,7 +57,11 @@ async fn open_image(
             .await
             .map_err(|e| e.to_string())?
     };
-    let prepared = Prepared { image, pyramid };
+    let prepared = Prepared {
+        image,
+        pyramid,
+        stamp,
+    };
     let info = {
         let mut images = state.lock().map_err(|e| e.to_string())?;
         images.insert(prepared)
@@ -123,9 +131,14 @@ async fn run_detect(
     detector: &State<'_, detect::DetectorState>,
     id: u64,
 ) -> Result<DetectReport, String> {
-    let img = {
+    let (img, activation_stamp) = {
         let images = images.lock().map_err(|e| e.to_string())?;
-        images.image(id).ok_or_else(|| format!("no image {id}"))?
+        let img = images.image(id).ok_or_else(|| format!("no image {id}"))?;
+        // The stamp captured when these registry pixels were decoded -- the
+        // cache write below must pair the probs with the source THEY came
+        // from, not a fresh stat that could describe an overwritten file
+        // (TheUnduster-02y).
+        (img, images.source_stamp(id))
     }; // lock released; inference runs on the Arc clone
     let _ = app.emit(
         "app-progress",
@@ -143,13 +156,14 @@ async fn run_detect(
     // Resolved before spawn_blocking so the closure can write the probs
     // cache from the borrowed slice, before handing the Vec's ownership to
     // set_probs_built -- avoids cloning a 168MB vector for a 168MP frame.
-    // The cache path and the source path (dir/file_name) both come from the
-    // same frame mapping: the source path is what the write is stamped
-    // against.
-    let cache_source = roll.frame_for_image(id)?.map(|(roll_dir, file_name)| {
-        let source_path = roll_dir.join(&file_name);
-        let cache_path = roll::probs_cache_path(&roll_dir, &file_name);
-        (cache_path, source_path)
+    // The write is stamped with the ACTIVATION-time stamp fetched above,
+    // never a fresh stat; a None stamp (stat failed at decode) skips the
+    // write, per stamp_or_skip's rule.
+    let cache_source = roll.frame_for_image(id)?.and_then(|(roll_dir, file_name)| {
+        Some((
+            roll::probs_cache_path(&roll_dir, &file_name),
+            activation_stamp?,
+        ))
     });
     let detector = detector.inner().clone(); // DetectorState is Clone over an Arc
     let app_for_progress = app.clone();
@@ -166,14 +180,10 @@ async fn run_detect(
         // Quantize once at the fresh-detect boundary; the registry, the
         // disk cache, and the display pyramid all share these u8 bytes.
         let probs: Vec<u8> = probs.iter().map(|&p| quantize_prob(p)).collect();
-        if let Some((path, source_path)) = &cache_source {
-            if let Some(stamp) = stamp_or_skip(source_path) {
-                if let Err(_e) =
-                    cache::write_probs(path, &probs, img.width, img.height, &hash, &stamp)
-                {
-                    #[cfg(debug_assertions)]
-                    eprintln!("[cache] probs write failed for image {id}: {_e}");
-                }
+        if let Some((path, stamp)) = &cache_source {
+            if let Err(_e) = cache::write_probs(path, &probs, img.width, img.height, &hash, stamp) {
+                #[cfg(debug_assertions)]
+                eprintln!("[cache] probs write failed for image {id}: {_e}");
             }
         }
         let pyramid = build_prob_pyramid_u8(&probs, &level_dims);
@@ -272,23 +282,27 @@ async fn run_heal(
         return Err(format!("threshold {threshold} out of range"));
     }
     masks::validate_strokes(&strokes)?;
-    let (image, mask) = {
+    let (image, mask, activation_stamp) = {
         let images = images.lock().map_err(|e| e.to_string())?;
         let image = images.image(id).ok_or_else(|| format!("no image {id}"))?;
         let mask = images
             .threshold_mask(id, threshold)
             .ok_or_else(|| format!("no detection for image {id}"))?;
-        (image, mask)
+        // Activation-time stamp, same rationale as run_detect: the heal
+        // cache write must be stamped against the source these registry
+        // pixels came from, not a fresh stat (TheUnduster-02y).
+        (image, mask, images.source_stamp(id))
     };
     // Resolved before spawn_blocking (owned values into the closure), mirroring
     // run_detect's cache_path resolution. `None` when the frame doesn't map to
-    // a roll (single-image mode): the heal cache is roll-only. A stat failure
-    // on the source also collapses to `None` here -- skip the cache
-    // interaction entirely rather than fail the heal.
+    // a roll (single-image mode): the heal cache is roll-only. A missing
+    // activation stamp (stat failed at decode) also collapses to `None` --
+    // skip the cache interaction entirely rather than fail the heal.
     let cache_path = roll.frame_for_image(id)?.and_then(|(roll_dir, file_name)| {
-        let source_path = roll_dir.join(&file_name);
-        let stamp = stamp_or_skip(&source_path)?;
-        Some((roll::heal_cache_path(&roll_dir, &file_name), stamp))
+        Some((
+            roll::heal_cache_path(&roll_dir, &file_name),
+            activation_stamp?,
+        ))
     });
     // The CURRENT detector's hash: the thresholded probs in the registry came
     // from it. Zeros when none loaded -- that race (detector swapped between
@@ -754,7 +768,7 @@ async fn decode_and_insert(
     // flag plus everything the fire-and-forget write needs, so the caller
     // never re-derives the cache path or re-stats the source.
     type FreshWrite = Option<(std::path::PathBuf, cache::SourceStamp)>;
-    let (image, pyramid, fresh_write): (_, _, FreshWrite) =
+    let (image, pyramid, fresh_write, stamp): (_, _, FreshWrite, _) =
         tauri::async_runtime::spawn_blocking(move || {
             let cache_path = path.parent().map(|dir| {
                 let file_name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -785,7 +799,10 @@ async fn decode_and_insert(
                     // single cheap syscall on a file we just proved we can
                     // read, not worth a second background hop.
                     touch_pyramid_cache_file(cache_path);
-                    return Ok((image, pyramid, None));
+                    // `stamp` is the if-let's shadowed &SourceStamp here;
+                    // deref-copy it back into the Option shape the caller's
+                    // registry insert takes.
+                    return Ok((image, pyramid, None, Some(*stamp)));
                 }
             }
 
@@ -794,7 +811,10 @@ async fn decode_and_insert(
                 (Some(cache_path), Some(stamp)) => Some((cache_path, stamp)),
                 _ => None,
             };
-            Ok::<_, String>((image, pyramid, fresh_write))
+            // `stamp` rides out to the registry entry (SourceStamp is Copy,
+            // so fresh_write holding one too costs nothing) -- cache writes
+            // made later from these registry pixels reuse it.
+            Ok::<_, String>((image, pyramid, fresh_write, stamp))
         })
         .await
         .map_err(|e| e.to_string())??;
@@ -824,7 +844,11 @@ async fn decode_and_insert(
         });
     }
 
-    let prepared = Prepared { image, pyramid };
+    let prepared = Prepared {
+        image,
+        pyramid,
+        stamp,
+    };
     let mut images = images.lock().map_err(|e| e.to_string())?;
     Ok(images.insert(prepared))
 }
@@ -1615,7 +1639,7 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                             let level_dims = images
                                 .level_dims(id)
                                 .ok_or_else(|| format!("no image {id}"))?;
-                            Some((id, img, level_dims))
+                            Some((id, img, level_dims, images.source_stamp(id)))
                         }
                         None => None, // stale id: fall through to a fresh decode
                     }
@@ -1627,20 +1651,26 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
             // Heal arm's `resident_id` -- a frame that goes
             // non-resident-to-resident mid-job (late activation) simply gets
             // no detect-progress narration, the same trade-off heal makes.
-            let resident_id = resident.as_ref().map(|(id, _, _)| *id);
+            let resident_id = resident.as_ref().map(|(id, _, _, _)| *id);
             // The early resident id only gated the pin (already applied above
             // via `image_id`) and the has-probs short-circuit; the write
             // target below is resolved fresh after compute (see I3's comment
             // at the write site), so it is not carried out of this match.
-            let (image, level_dims) = match resident {
-                Some((_id, img, dims)) => (img, Some(dims)),
+            // The stamp travels WITH the image it describes: the resident
+            // branch reuses the activation-time stamp, the fresh branch
+            // stamps before its own decode -- never a stat at cache-write
+            // time paired with pixels from an earlier read (TheUnduster-02y).
+            let (image, level_dims, stamp) = match resident {
+                Some((_id, img, dims, stamp)) => (img, Some(dims), stamp),
                 None => {
                     let path = path.clone();
-                    let img =
-                        tauri::async_runtime::spawn_blocking(move || Images::decode_stage(&path))
-                            .await
-                            .map_err(|e| e.to_string())??;
-                    (img, None)
+                    let (img, stamp) = tauri::async_runtime::spawn_blocking(move || {
+                        let stamp = stamp_or_skip(&path);
+                        Ok::<_, String>((Images::decode_stage(&path)?, stamp))
+                    })
+                    .await
+                    .map_err(|e| e.to_string())??;
+                    (img, None, stamp)
                 }
             };
             let detector_state = app.state::<detect::DetectorState>();
@@ -1650,12 +1680,12 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
             // correctly-paired detect below via detect_hashed).
             let detector_hash = detector_state.hash();
             let cache_path = roll::probs_cache_path(&roll_dir, &file_name);
-            let source_path = path.clone();
             let app_for_progress = app.clone();
             let (probs, pyramid, bboxes) = tauri::async_runtime::spawn_blocking(move || {
-                // A stat failure skips the cache interaction entirely (both
-                // the lookup below and the write on a miss).
-                let stamp = stamp_or_skip(&source_path);
+                // `stamp` was captured alongside the pixels above (activation
+                // time for a resident frame, pre-decode for a fresh one); a
+                // None (stat failed) skips the cache interaction entirely,
+                // both the lookup below and the write on a miss.
                 // A valid cache entry for the current detector replaces the
                 // (seconds-long) model run: a detect job means detection is
                 // wanted, not necessarily recomputed.
@@ -1790,7 +1820,7 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
             let images_state = app.state::<Mutex<Images>>();
             // Pin before reading registry Arcs; see the detect arm.
             let mut _pin_guard = None;
-            let (resident_id, registry_image, registry_mask) = match image_id {
+            let (resident_id, registry_image, registry_mask, registry_stamp) = match image_id {
                 Some(id) => {
                     app.state::<jobs::JobQueue>().pin(Some(id))?;
                     _pin_guard = Some(PinGuard(app.clone()));
@@ -1801,20 +1831,26 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
                             // below then falls back to the probs cache or a
                             // fresh model run.
                             let mask = images.threshold_mask(id, threshold);
-                            (Some(id), Some(img), mask)
+                            (Some(id), Some(img), mask, images.source_stamp(id))
                         }
-                        None => (None, None, None), // stale id: fresh decode
+                        None => (None, None, None, None), // stale id: fresh decode
                     }
                 }
-                None => (None, None, None),
+                None => (None, None, None, None),
             };
-            let image = match registry_image {
-                Some(img) => img,
+            // The stamp travels WITH the image it describes -- activation
+            // time for a resident frame, pre-decode for a fresh one -- same
+            // rationale as the Detect arm (TheUnduster-02y).
+            let (image, stamp) = match registry_image {
+                Some(img) => (img, registry_stamp),
                 None => {
                     let path = path.clone();
-                    tauri::async_runtime::spawn_blocking(move || Images::decode_stage(&path))
-                        .await
-                        .map_err(|e| e.to_string())??
+                    tauri::async_runtime::spawn_blocking(move || {
+                        let stamp = stamp_or_skip(&path);
+                        Ok::<_, String>((Images::decode_stage(&path)?, stamp))
+                    })
+                    .await
+                    .map_err(|e| e.to_string())??
                 }
             };
             let detector_state = app.state::<detect::DetectorState>();
@@ -1829,13 +1865,12 @@ async fn run_job(app: &tauri::AppHandle, generation: u64, job: jobs::Job) -> Res
             let inpainter = app.state::<detect::InpainterState>().inner().clone();
             let heal_cache_path = roll::heal_cache_path(&roll_dir, &file_name);
             let probs_cache_path = roll::probs_cache_path(&roll_dir, &file_name);
-            let source_path = path.clone();
             let app_for_progress = app.clone();
             let (healed, pyramid, mask) = tauri::async_runtime::spawn_blocking(move || {
-                // A stat failure skips every cache interaction below (heal
+                // `stamp` was captured alongside the pixels above; a None
+                // (stat failed) skips every cache interaction below (heal
                 // read/write and probs read/write alike) -- never fails the
                 // job.
-                let stamp = stamp_or_skip(&source_path);
 
                 // Everything provenance-dependent happens inside the one
                 // with_inpainter_hashed lock, exactly as in run_heal and the

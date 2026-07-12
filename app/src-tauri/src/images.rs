@@ -89,12 +89,22 @@ struct Entry {
     /// every probs writer (`set_probs_built`; `close` drops the whole entry).
     components_memo: Option<(u8, Vec<[u32; 4]>)>,
     healed: Option<HealedData>,
+    /// Source stamp captured immediately BEFORE this entry's pixels were
+    /// decoded (activation/open time). Cache writes made later from these
+    /// registry pixels must use THIS stamp, not a fresh stat at operation
+    /// time: a source overwritten in between would otherwise pair a fresh
+    /// stamp with stale pixels, persisting stale detections/heals across
+    /// relaunch (TheUnduster-02y). None when the stat failed at decode time
+    /// -- callers then skip the cache interaction, per stamp_or_skip's rule.
+    stamp: Option<crate::cache::SourceStamp>,
 }
 
 /// Heavy half of open: decoded image plus its built pyramid, no registry access yet.
 pub struct Prepared {
     pub(crate) image: Arc<fd_io::ImageBuf>,
     pub(crate) pyramid: Pyramid,
+    /// Stamp taken BEFORE the decode -- see [`Entry`]'s field doc.
+    pub(crate) stamp: Option<crate::cache::SourceStamp>,
 }
 
 /// Connected-component bounding boxes from a thresholded probability map,
@@ -168,9 +178,18 @@ impl Images {
 
     /// Heavy half of open: decode + pyramid, no registry access. Blocking.
     pub fn prepare(path: &Path) -> Result<Prepared, String> {
+        // Stamp BEFORE decoding (fail-safe direction): a source that changes
+        // after this stat mismatches on the next cache read instead of
+        // pairing a fresh stamp with stale pixels. A stat failure means no
+        // stamp, which downstream treats as "skip the cache interaction".
+        let stamp = crate::cache::source_stamp(path).ok();
         let image = Self::decode_stage(path)?;
         let pyramid = Self::pyramid_stage(&image);
-        Ok(Prepared { image, pyramid })
+        Ok(Prepared {
+            image,
+            pyramid,
+            stamp,
+        })
     }
 
     /// Cheap half: registry insert under the caller's lock.
@@ -201,9 +220,17 @@ impl Images {
                 probs: None,
                 components_memo: None,
                 healed: None,
+                stamp: prepared.stamp,
             },
         );
         info
+    }
+
+    /// The source stamp captured when this entry's pixels were decoded, for
+    /// cache writes made from registry pixels -- see [`Entry`]'s field doc.
+    /// None for an unknown id or a failed stat at decode time.
+    pub fn source_stamp(&self, id: u64) -> Option<crate::cache::SourceStamp> {
+        self.entries.get(&id).and_then(|e| e.stamp)
     }
 
     // Exercised by the 3a test suite; the command path now goes through
@@ -538,6 +565,27 @@ mod tests {
         };
         encode(&path, &img).unwrap();
         path
+    }
+
+    #[test]
+    fn prepare_captures_the_source_stamp_at_decode_time() {
+        // The activation-time stamp rides with the registry entry so cache
+        // writes made later from registry pixels pair the stamp with the
+        // pixels it actually describes (TheUnduster-02y) -- a source
+        // overwritten between activation and the write then mismatches on
+        // the next read instead of resurrecting stale detections.
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_png(&dir, 64, 48);
+        let expected = crate::cache::source_stamp(&path).unwrap();
+
+        let prepared = Images::prepare(&path).unwrap();
+        assert_eq!(prepared.stamp, Some(expected));
+
+        let mut images = Images::default();
+        let info = images.insert(prepared);
+        assert_eq!(images.source_stamp(info.id), Some(expected));
+        // Unknown id: no stamp.
+        assert_eq!(images.source_stamp(999), None);
     }
 
     #[test]
