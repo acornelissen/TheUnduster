@@ -181,15 +181,25 @@ async fn run_detect(
     })
     .await
     .map_err(|e| e.to_string())??;
-    let mut images = images.lock().map_err(|e| e.to_string())?;
-    if !images.set_probs_built(id, probs, pyramid) {
-        return Err(format!(
-            "image {id} closed during detection or detector output size mismatch"
-        ));
+    {
+        let mut images = images.lock().map_err(|e| e.to_string())?;
+        if !images.set_probs_built(id, probs, pyramid) {
+            return Err(format!(
+                "image {id} closed during detection or detector output size mismatch"
+            ));
+        }
     }
+    // Post-detect component count via the same off-lock spawn_blocking shape
+    // as the components/set_frame_threshold commands: this was the last sync
+    // CCL under the Images lock (TheUnduster-u98). Still primes the memo for
+    // the threshold slider's first render.
+    let components_at_half = compute_components(images, id, 0.5)
+        .await?
+        .unwrap_or_default()
+        .len();
     Ok(DetectReport {
         id,
-        components_at_half: images.components(id, 0.5).unwrap_or_default().len(),
+        components_at_half,
     })
 }
 

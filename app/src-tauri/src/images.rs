@@ -444,11 +444,14 @@ impl Images {
     /// instead of re-running the CCL walk.
     ///
     /// Runs the walk under the registry lock (the caller already holds
-    /// `&mut self`); callers that want the walk OFF the lock -- the
-    /// `components` and `set_frame_threshold` commands, which would
-    /// otherwise starve tile serving behind a ~785ms walk on the wry main
-    /// thread -- use [`Self::components_memo_hit`] plus
-    /// [`Self::probs_snapshot`] instead, see lib.rs's `compute_components`.
+    /// `&mut self`). No production caller remains -- every path (the
+    /// `components`/`set_frame_threshold` commands and, since
+    /// TheUnduster-u98, `run_detect`'s post-detect prime) goes through
+    /// lib.rs's off-lock `compute_components` instead, via
+    /// [`Self::components_memo_hit`] plus [`Self::probs_snapshot`]. Kept as
+    /// the reference implementation the parity tests compare
+    /// `components_from_probs` against.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn components(&mut self, id: u64, threshold: f32) -> Option<Vec<[u32; 4]>> {
         if let Some(hit) = self.components_memo_hit(id, threshold) {
             return Some(hit);
