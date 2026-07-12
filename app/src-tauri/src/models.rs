@@ -227,7 +227,10 @@ pub fn inpainter_status(
     app: tauri::AppHandle,
     inpainter: State<'_, InpainterState>,
 ) -> Result<String, String> {
-    let loaded = inpainter.with_inpainter(|i| i.is_some())?;
+    // `is_loaded` reads the hash mirror, not `inner`: this is a sync
+    // main-thread command the frontend polls, and a running heal holds
+    // `inner` for its whole run, which would freeze the poll (TheUnduster-2jv).
+    let loaded = inpainter.is_loaded();
     let fixture = inpainter.is_fixture();
     let available = lama_path(&app)?.is_file();
     Ok(status_str(loaded, fixture, available).to_string())

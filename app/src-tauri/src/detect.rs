@@ -256,6 +256,9 @@ impl InpainterState {
     }
 
     /// Runs `f` with mutable access to the loaded inpainter (or None).
+    /// Production "is a model loaded" checks now go through `is_loaded` (the
+    /// cheap hash mirror); this stays for the tests that assert the two agree.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_inpainter<R>(
         &self,
         f: impl FnOnce(Option<&mut fd_heal::Inpainter>) -> R,
@@ -295,6 +298,17 @@ impl InpainterState {
     /// command, so locking `inner` here froze the app (TheUnduster-2jv).
     pub fn hash(&self) -> Option<[u8; 32]> {
         *self.hash.lock().ok()?
+    }
+
+    /// True when a model is loaded, decided WITHOUT touching `inner`. The hash
+    /// mirror is written at load and never cleared (no unload path), so
+    /// `hash.is_some()` is exactly `with_inpainter(|i| i.is_some())` -- but it
+    /// never waits on a running heal that holds `inner`. Sync commands on the
+    /// main thread (`inpainter_status`, `heal_cached`, `healing_engine`) must
+    /// use this rather than `with_inpainter`, or a running heal freezes the
+    /// UI (TheUnduster-2jv).
+    pub fn is_loaded(&self) -> bool {
+        self.hash.lock().map(|h| h.is_some()).unwrap_or(false)
     }
 }
 
@@ -476,6 +490,63 @@ mod tests {
         // stable across loads of the same file
         state.load(&fixture()).unwrap();
         assert_eq!(state.hash().unwrap(), h);
+    }
+
+    #[test]
+    fn is_loaded_matches_a_loaded_model_and_never_touches_inner() {
+        let state = InpainterState::default();
+        assert!(!state.is_loaded());
+        assert_eq!(
+            state.is_loaded(),
+            state.with_inpainter(|i| i.is_some()).unwrap()
+        );
+        state.load(&inpaint_fixture()).unwrap();
+        assert!(state.is_loaded());
+        assert_eq!(
+            state.is_loaded(),
+            state.with_inpainter(|i| i.is_some()).unwrap()
+        );
+    }
+
+    #[test]
+    fn is_loaded_does_not_block_while_a_heal_holds_the_inpainter() {
+        // Same freeze class as the hash() test: heal_cached/inpainter_status
+        // call this from the main thread while a heal holds `inner` for
+        // minutes. See TheUnduster-2jv.
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let state = InpainterState::default();
+        state.load(&inpaint_fixture()).unwrap();
+
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let heal_state = state.clone();
+        let heal = std::thread::spawn(move || {
+            heal_state
+                .with_inpainter_hashed(|_pair| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .unwrap();
+        });
+
+        entered_rx.recv().unwrap();
+
+        let probe_state = state.clone();
+        let (loaded_tx, loaded_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = loaded_tx.send(probe_state.is_loaded());
+        });
+        let answered = loaded_rx.recv_timeout(Duration::from_secs(2));
+
+        release_tx.send(()).unwrap();
+        heal.join().unwrap();
+
+        assert!(
+            matches!(answered, Ok(true)),
+            "is_loaded() blocked on the inpainter lock held by a running heal"
+        );
     }
 
     #[test]

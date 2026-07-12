@@ -460,12 +460,15 @@ fn heal_cached(
         return Ok(false);
     };
     let detector_hash = detector.hash().unwrap_or([0u8; 32]);
-    // Same single-lock discipline as `run_heal`: the inpainter hash used for
-    // provenance must be the SAME observation as "is a model loaded at all",
-    // or a model download completing mid-probe could race the zeros
-    // sentinel into the wrong side of the comparison.
-    let inpainter_hash =
-        inpainter.with_inpainter_hashed(|pair| pair.map(|(_, h)| h).unwrap_or([0u8; 32]))?;
+    // Read the hash off the cheap mirror, NOT through `with_inpainter_hashed`.
+    // This is a main-thread sync command that fires on every frame
+    // activation; taking `inner` here froze the UI whenever a heal was
+    // running, since the heal holds it for its whole run (TheUnduster-2jv).
+    // The mirror is Some exactly when a model is loaded, so this is the same
+    // "loaded -> hash, else zeros" observation the provenance needs, and a
+    // model load racing this probe only misflags a badge until the next probe
+    // corrects it -- the same benign race documented on `hash()`.
+    let inpainter_hash = inpainter.hash().unwrap_or([0u8; 32]);
     let cache_path = roll::heal_cache_path(dir, &file_name);
     let provenance = cache::heal_provenance(
         threshold,
@@ -505,8 +508,11 @@ async fn healed_cached_all(
 ) -> Result<Vec<bool>, String> {
     let (dir, frames) = roll.frames_meta_snapshot()?;
     let detector_hash = detector.hash().unwrap_or([0u8; 32]);
-    let inpainter_hash =
-        inpainter.with_inpainter_hashed(|pair| pair.map(|(_, h)| h).unwrap_or([0u8; 32]))?;
+    // Cheap mirror, not `inner`: a running heal holds `inner` for its whole
+    // run, and waiting on it here would stall this probe (and its runtime
+    // thread) for minutes. Same benign load-race as `heal_cached`
+    // (TheUnduster-2jv).
+    let inpainter_hash = inpainter.hash().unwrap_or([0u8; 32]);
     let results = tauri::async_runtime::spawn_blocking(move || {
         frames
             .into_iter()
@@ -1611,10 +1617,18 @@ struct ExportProgress {
 /// The `ExportProgress::engine` value for the currently loaded inpainter.
 fn healing_engine(app: &tauri::AppHandle) -> &'static str {
     let inpainter = app.state::<detect::InpainterState>();
-    match inpainter.with_inpainter(|i| i.is_some()) {
-        Ok(true) if inpainter.is_fixture() => "placeholder",
-        Ok(true) => "lama",
-        _ => "classical",
+    // "is a model loaded" needs only the hash mirror, not `inner`. This
+    // caller runs on the worker thread after the export's lock is released,
+    // so it never contended, but reading the mirror keeps every "is loaded"
+    // check off the heavy lock uniformly (TheUnduster-2jv).
+    if inpainter.is_loaded() {
+        if inpainter.is_fixture() {
+            "placeholder"
+        } else {
+            "lama"
+        }
+    } else {
+        "classical"
     }
 }
 
