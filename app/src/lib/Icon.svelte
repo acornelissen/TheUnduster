@@ -10,7 +10,8 @@
     | "download"
     | "paint"
     | "erase"
-    | "overlay";
+    | "overlay"
+    | "compare";
 
   const paths: Record<IconName, string> = {
     scan: "M4 5h16v14H4z M4 9h16",
@@ -26,6 +27,9 @@
     overlay: "M12 6c-4 0-7 3-8 6 1 3 4 6 8 6s7-3 8-6c-1-3-4-6-8-6 M12 10a2 2 0 1 0 0 4 a2 2 0 0 0 0-4",
     paint: "M14 4l6 6-9 9H5v-6z M12 6l6 6",
     erase: "M9 19h11 M6 14l7-7 5 5-7 7H8z",
+    // A framed image split down the middle -- the wipe divider between a
+    // before and after half.
+    compare: "M4 5h16v14H4z M12 5v14",
   };
 </script>
 

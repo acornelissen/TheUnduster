@@ -301,7 +301,12 @@ export class TileRenderer {
 
   /** Draw one frame. tiles come from visibleTiles(), coarse first.
    * overlay.enabled/threshold drive uniforms only — never triggers a fetch;
-   * prob textures already hold raw probabilities fetched via ensure(). */
+   * prob textures already hold raw probabilities fetched via ensure().
+   *
+   * `clip`, when given, scissors the whole pass (clear included) to the
+   * horizontal band [x0, x1) in canvas px: the wipe compare calls draw()
+   * twice — original tiles clipped left of the divider, healed tiles
+   * clipped right — and each pass clears only its own band. */
   draw(
     tiles: {
       path: string;
@@ -316,9 +321,16 @@ export class TileRenderer {
     canvasW: number,
     canvasH: number,
     overlay: { enabled: boolean; threshold: number },
+    clip?: { x0: number; x1: number },
   ): void {
     const gl = this.gl;
     gl.viewport(0, 0, canvasW, canvasH);
+    if (clip) {
+      gl.enable(gl.SCISSOR_TEST);
+      // Scissor is bottom-left-origin, but a full-height horizontal band is
+      // origin-agnostic in y.
+      gl.scissor(Math.round(clip.x0), 0, Math.max(0, Math.round(clip.x1 - clip.x0)), canvasH);
+    }
     gl.clearColor(0.15, 0.15, 0.15, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.useProgram(this.program);
@@ -360,6 +372,9 @@ export class TileRenderer {
       gl.activeTexture(gl.TEXTURE1);
       gl.bindTexture(gl.TEXTURE_2D, probTex ?? this.zeroTex);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
+    if (clip) {
+      gl.disable(gl.SCISSOR_TEST);
     }
   }
 

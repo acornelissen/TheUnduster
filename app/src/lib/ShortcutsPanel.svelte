@@ -39,6 +39,7 @@
         <li><kbd class="kbd">d</kbd> detect</li>
         <li><kbd class="kbd">h</kbd> heal</li>
         <li><kbd class="kbd">space</kbd> before/after (healed)</li>
+        <li><kbd class="kbd">c</kbd> compare wipe (drag divider)</li>
         <li><kbd class="kbd">m</kbd> overlay</li>
         <li><kbd class="kbd">z</kbd> / <kbd class="kbd">shift-z</kbd> cycle defects</li>
         <li><kbd class="kbd">delete</kbd> / <kbd class="kbd">backspace</kbd> delete selected defect</li>

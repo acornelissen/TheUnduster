@@ -69,6 +69,21 @@
   let detections: [number, number, number, number][] = $state([]);
   let current = -1;
   let showHealed = $state(false);
+  // Wipe compare (c): a draggable vertical divider, original left, healed
+  // right. Exclusive with the brush (entering either exits the other) and
+  // with the SPACE wholesale toggle (space exits wipe). `wipeT` is the
+  // divider position as a fraction of canvas width.
+  let wipeActive = $state(false);
+  let wipeT = $state(0.5);
+  // $state: the `wipe-grab` class binding reads it reactively (unlike
+  // `dragging`/`painting`, which only gate imperative handlers).
+  let wipeDragging = $state(false);
+  // True while the pointer hovers within grab range of the divider (and not
+  // dragging), so the canvas can show the ew-resize cursor -- the "you can
+  // grab this" affordance the plain divider line alone doesn't give.
+  let wipeHover = $state(false);
+  /** Grab tolerance around the divider, canvas px. */
+  const WIPE_GRAB = 8;
   // The threshold `detections` was last populated for -- via a fresh
   // `components` fetch (refreshDetections) or a caller-supplied result
   // (setDetections). Lets the slider $effect below tell "the threshold
@@ -121,6 +136,8 @@
     current = -1;
     lastFetchedThreshold = null;
     showHealed = false;
+    wipeActive = false;
+    wipeDragging = false;
     // Strokes themselves arrive per-frame via props and belong to App; only
     // the transient in-canvas brush mode resets here.
     brushMode = "off";
@@ -141,8 +158,12 @@
   });
 
   $effect(() => {
-    // If healed data vanishes (frame evicted and re-decoded), drop the toggle.
-    if (!healedAvailable) showHealed = false;
+    // If healed data vanishes (frame evicted and re-decoded), drop the
+    // toggle and the wipe with it -- both need healed tiles to show.
+    if (!healedAvailable) {
+      showHealed = false;
+      wipeActive = false;
+    }
   });
 
   export async function refreshDetections(threshold: number) {
@@ -365,7 +386,7 @@
     return segs;
   }
 
-  function tilePaths() {
+  function tilePaths(healed: boolean = showHealed) {
     return visibleTiles(info.levels, zoom, centerX, centerY, canvas.width, canvas.height).map(
       (t) => {
         const l = info.levels[t.level];
@@ -373,7 +394,7 @@
         const tileH = Math.min(l.height - t.ty * TILE, TILE);
         const base = `/${info.id}/${t.level}/${t.tx}/${t.ty}`;
         return {
-          path: showHealed ? `/healed${base}` : base,
+          path: healed ? `/healed${base}` : base,
           probPath: probPathFor(base),
           screenX: t.screenX,
           screenY: t.screenY,
@@ -390,7 +411,28 @@
     if (!running) return; // stopped on unmount; do not re-arm the rAF loop
     if (renderer && needsFrame) {
       needsFrame = false;
-      renderer.draw(tilePaths(), canvas.width, canvas.height, overlay);
+      if (wipeActive) {
+        // Original left of the divider, healed right; each pass clears and
+        // draws only its own scissored band, then a thin line marks the
+        // divider itself.
+        const divider = Math.round(canvas.width * wipeT);
+        renderer.draw(tilePaths(false), canvas.width, canvas.height, overlay, {
+          x0: 0,
+          x1: divider,
+        });
+        renderer.draw(tilePaths(true), canvas.width, canvas.height, overlay, {
+          x0: divider,
+          x1: canvas.width,
+        });
+        renderer.drawStrokes(
+          [{ ax: divider, ay: 0, bx: divider, by: canvas.height, r: 1.5 }],
+          [1.0, 1.0, 1.0, 0.9],
+          canvas.width,
+          canvas.height,
+        );
+      } else {
+        renderer.draw(tilePaths(), canvas.width, canvas.height, overlay);
+      }
       // Rings mark defects; they follow the overlay toggle (m) at every zoom
       // rather than vanishing above 50% zoom -- the operator twice reported
       // the old zoom cutoff as a bug.
@@ -445,7 +487,9 @@
       // The healed "after" view is the exception: strokes annotate the
       // BEFORE state and sit exactly over the healed pixels the operator is
       // trying to inspect, so the space toggle shows the result unobscured.
-      if (!showHealed) {
+      // Same rule for the wipe: its whole point is inspecting the healed
+      // side, and strokes painted across the divider would obscure it.
+      if (!showHealed && !wipeActive) {
         const allStrokes =
           painting && livePoints.length > 0
             ? [
@@ -521,11 +565,27 @@
    * brush on from off -- seeding the cursor at the current view center so the
    * brush ring appears somewhere visible immediately. */
   function toggleBrush(mode: "paint" | "erase") {
+    // Brushing annotates the BEFORE state; the wipe shows the AFTER. They
+    // can't both own the canvas, so turning the brush on drops the wipe.
+    if (wipeActive) wipeActive = false;
     const turningOn = brushMode === "off";
     brushMode = brushMode === mode ? "off" : mode;
     if (turningOn && brushMode !== "off") {
       cursorX = centerX;
       cursorY = centerY;
+    }
+    requestFrame();
+  }
+
+  // Shared by the `c` key and the Compare button. No-op without healed
+  // tiles to show. Turning the wipe on clears the brush and the wholesale
+  // (space) toggle, which both contend for the same canvas.
+  function toggleWipe() {
+    if (!healedAvailable) return;
+    wipeActive = !wipeActive;
+    if (wipeActive) {
+      showHealed = false;
+      brushMode = "off";
     }
     requestFrame();
   }
@@ -545,6 +605,22 @@
   }
 
   function onPointerMove(e: PointerEvent) {
+    if (wipeDragging) {
+      const dpr = window.devicePixelRatio || 1;
+      // Clamped a hair inside the edges so the divider can always be
+      // grabbed again -- at exactly 0 or 1 half its grab zone is offscreen.
+      wipeT = Math.min(0.99, Math.max(0.01, (e.offsetX * dpr) / canvas.width));
+      requestFrame();
+      return;
+    }
+    // Cursor affordance: only meaningful when the wipe is on and the brush
+    // isn't (the brush owns the cursor via its own class).
+    if (wipeActive && brushMode === "off") {
+      const dpr = window.devicePixelRatio || 1;
+      wipeHover = Math.abs(e.offsetX * dpr - canvas.width * wipeT) <= WIPE_GRAB * dpr;
+    } else if (wipeHover) {
+      wipeHover = false;
+    }
     if (brushMode !== "off") {
       const dpr = window.devicePixelRatio || 1;
       const [ix, iy] = screenToImage(
@@ -614,8 +690,21 @@
     } else if (e.key === " ") {
       if (healedAvailable) {
         e.preventDefault();
-        showHealed = !showHealed;
+        if (wipeActive) {
+          // Space is the wholesale toggle; leaving the wipe first keeps the
+          // two compare modes from stacking confusingly.
+          wipeActive = false;
+          showHealed = false;
+        } else {
+          showHealed = !showHealed;
+        }
         requestFrame();
+      }
+      return;
+    } else if (e.key === "c") {
+      if (healedAvailable) {
+        e.preventDefault();
+        toggleWipe();
       }
       return;
     } else if (e.key === "b" || e.key === "e") {
@@ -715,12 +804,23 @@
   <canvas
     bind:this={canvas}
     role="application"
-    aria-label="Scan viewer: arrows pan, plus and minus zoom, 0 fits, 1 is 100%, d detects, m toggles overlay, z and shift-z cycle defects, delete or backspace removes the selected defect, h heals, space toggles before and after, b paints, e erases, bracket keys size the brush, arrows nudge it and enter stamps while brushing, cmd-z undoes, escape exits, shift-cmd-z redoes"
+    aria-label="Scan viewer: arrows pan, plus and minus zoom, 0 fits, 1 is 100%, d detects, m toggles overlay, z and shift-z cycle defects, delete or backspace removes the selected defect, h heals, space toggles before and after, c toggles the wipe compare and its divider drags, b paints, e erases, bracket keys size the brush, arrows nudge it and enter stamps while brushing, cmd-z undoes, escape exits, shift-cmd-z redoes"
     tabindex="0"
     class:brushing={brushMode !== "off" && !showHealed}
+    class:wipe-grab={(wipeHover || wipeDragging) && brushMode === "off"}
     onwheel={onWheel}
     onpointerdown={(e) => {
       canvas.setPointerCapture(e.pointerId);
+      if (wipeActive) {
+        const dpr = window.devicePixelRatio || 1;
+        const x = e.offsetX * dpr;
+        // Grabbing at or near the divider drags it; anywhere else keeps the
+        // normal pan, so the wipe never steals navigation.
+        if (Math.abs(x - canvas.width * wipeT) <= WIPE_GRAB * dpr) {
+          wipeDragging = true;
+          return;
+        }
+      }
       if (brushMode !== "off") {
         // Compute from the event directly rather than trusting cursorX/Y: a
         // pointerdown with no preceding pointermove over the canvas (the very
@@ -747,6 +847,7 @@
     }}
     onpointerup={() => {
       dragging = false;
+      wipeDragging = false;
       if (painting) {
         painting = false;
         commitStroke(livePoints);
@@ -756,6 +857,7 @@
     }}
     onpointercancel={() => {
       dragging = false;
+      wipeDragging = false;
       painting = false;
       livePoints = [];
     }}
@@ -797,6 +899,18 @@
             canvas.focus();
           }}><Icon name="overlay" /> Overlay</button
         >
+        <button
+          class="btn"
+          class:btn-toggle-on={wipeActive}
+          title="Compare healed with a draggable wipe (c)"
+          aria-label="Compare healed with a wipe"
+          aria-pressed={wipeActive}
+          disabled={!healedAvailable}
+          onclick={() => {
+            toggleWipe();
+            canvas.focus();
+          }}><Icon name="compare" /> Compare</button
+        >
         {#if brushMode !== "off"}
           <span class="radius-readout">{brushRadius}px</span>
         {/if}
@@ -827,6 +941,9 @@
   }
   canvas.brushing {
     cursor: none;
+  }
+  canvas.wipe-grab {
+    cursor: ew-resize;
   }
   .palette {
     position: absolute;
