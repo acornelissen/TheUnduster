@@ -58,6 +58,25 @@
     el?.focus();
   }
 
+  // Everything the badges say visually (color/title only, invisible to AT)
+  // folded into each option's accessible name, so a screen reader hears
+  // "raw0002.tif, 12 defects, approved, exported, healed, heal running"
+  // instead of just the file name (TheUnduster-dm2 follow-up note).
+  function frameLabel(frame: FrameInfo): string {
+    const parts = [frame.file_name];
+    if (frame.defect_count !== null) {
+      parts.push(`${frame.defect_count} ${frame.defect_count === 1 ? "defect" : "defects"}`);
+    } else {
+      parts.push("scanning");
+    }
+    if (frame.approved) parts.push("approved");
+    if (frame.exported) parts.push("exported");
+    if (healedCached[frame.index]) parts.push("healed");
+    const job = jobStates[frame.index];
+    if (job) parts.push(`${job.kind} ${job.state}`);
+    return parts.join(", ");
+  }
+
   function onKey(e: KeyboardEvent) {
     if (e.key === "ArrowRight" || e.key === "ArrowDown") {
       e.preventDefault();
@@ -83,6 +102,7 @@
       id={`frame-${frame.index}`}
       data-index={frame.index}
       role="option"
+      aria-label={frameLabel(frame)}
       aria-selected={frame.index === currentIndex}
       tabindex={frame.index === focusIndex ? 0 : -1}
       class="frame"
@@ -234,7 +254,11 @@
     display: flex;
     align-items: center;
     gap: 2px;
-    background: rgba(39, 39, 39, 0.85); /* --bg-2 @ 85% */
+    /* Near-black at 80%, matching the approved/exported badges: the old
+       --bg-2 @ 85% backdrop left --text-1 at a borderline ~4.2:1 over
+       bright thumbnail content; this floors the effective contrast well
+       above AA regardless of the image underneath. */
+    background: rgba(0, 0, 0, 0.8);
     color: var(--text-1);
   }
   /* Paired with the defect chip rather than a fifth corner (all four are

@@ -43,7 +43,7 @@ describe("composeActivity", () => {
         isHealing: true,
         isDetecting: true,
       }),
-    ).toBe("exporting — raw0002.jpg: healing 3/9");
+    ).toBe("exporting · raw0002.jpg: healing 3/9");
   });
 
   it("renders exporting without per-frame detail when none is available", () => {

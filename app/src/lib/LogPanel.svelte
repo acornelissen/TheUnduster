@@ -6,7 +6,8 @@
     message: string;
   }
 
-  let { entries, id }: { entries: LogEntry[]; id: string } = $props();
+  let { entries, id, open = true }: { entries: LogEntry[]; id: string; open?: boolean } =
+    $props();
 
   // Newest-first: reverse a copy, never mutate the prop array.
   const reversed = $derived([...entries].reverse());
@@ -17,9 +18,13 @@
      other focusable descendant; WKWebView won't let keyboard users scroll
      it without an explicit tabindex, which is the standard accessible
      pattern for scrollable regions (ARIA APG, MDN). -->
-<div class="log-panel" {id} role="log" aria-label="Activity log" tabindex="0">
+<!-- Rendered from load and toggled with `hidden` rather than {#if}-mounted:
+     the status bar's Log button points aria-controls at this id, and a
+     reference to an element that does not exist yet is invalid ARIA -- the
+     log region must exist before it is first opened. -->
+<div class="log-panel" {id} role="log" aria-label="Activity log" tabindex="0" hidden={!open}>
   {#if reversed.length === 0}
-    <p class="log-empty">No activity yet.</p>
+    <p class="log-empty">no activity yet</p>
   {:else}
     <ul>
       {#each reversed as entry (entry.id)}
@@ -44,6 +49,10 @@
     border-left: 1px solid var(--border);
     overflow-y: auto;
     padding: var(--space-3);
+  }
+  .log-panel[hidden] {
+    /* position: fixed would otherwise override the UA's [hidden] rule */
+    display: none;
   }
   .log-panel:focus-visible {
     outline: 3px solid var(--focus);

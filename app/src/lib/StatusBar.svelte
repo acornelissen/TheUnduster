@@ -19,6 +19,15 @@
 </script>
 
 <div class="status-bar">
+  <!-- aria-live is a deliberate three-way split (TheUnduster-dm2): the
+       CENTER zone is activity narration (downloading/healing/exporting) and
+       is polite-live -- that is the one stream worth announcing unprompted.
+       The LEFT zone is frame identity, which changes on every navigation;
+       announcing it would talk over the operator's own actions (the
+       filmstrip option's accessible name already announces selection). The
+       RIGHT zone is standing state (engine, counts); its transitions ride
+       along with the events that caused them (toasts, job events), so it
+       stays non-live too and is read on demand. -->
   <span class="zone zone-left">{left}</span>
   <span class="zone zone-activity" aria-live="polite">
     {#if activity}

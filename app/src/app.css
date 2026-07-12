@@ -88,7 +88,13 @@ body {
   outline-offset: 1px;
 }
 .btn:disabled {
-  opacity: 0.45;
+  /* Designed disabled state, not an opacity wash: sunk to the chrome
+     background with the muted-label token and a hairline inset border so
+     the control's footprint stays visible. --text-3 sits below body-copy AA
+     on purpose -- disabled controls are exempt, and receding is the point. */
+  background: var(--bg-1);
+  color: var(--text-3);
+  box-shadow: inset 0 0 0 1px var(--border);
   cursor: default;
 }
 

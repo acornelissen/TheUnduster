@@ -26,7 +26,7 @@ export function composeActivity(input: ActivityInput): string | null {
     return `downloading healing model ${input.modelProgressText}`;
   }
   if (input.exporting) {
-    return input.exportDetail ? `exporting — ${input.exportDetail}` : "exporting";
+    return input.exportDetail ? `exporting · ${input.exportDetail}` : "exporting";
   }
   if (input.isHealing) {
     return input.healProgress

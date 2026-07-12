@@ -605,7 +605,7 @@
       if (e.payload.engine === "placeholder" && !placeholderExportWarned) {
         placeholderExportWarned = true;
         pushError(
-          "Exporting with the placeholder healing model — download the real one and re-export",
+          "Exporting with the placeholder healing model: download the real one and re-export",
         );
       }
     });
@@ -1879,7 +1879,7 @@
         <button
           class="btn btn-primary"
           title={healingStubbed
-            ? "Heal (h) — placeholder healing model: download the real one for quality results"
+            ? "Heal (h) · placeholder healing model: download the real one for quality results"
             : "Heal (h)"}
           onclick={requestHeal}
           disabled={loading !== null || isDetecting || isHealing || !info}
@@ -1909,7 +1909,7 @@
         <button
           class="btn btn-primary"
           title={healingStubbed
-            ? "Heal approved — placeholder healing model: download the real one for quality results"
+            ? "Heal approved · placeholder healing model: download the real one for quality results"
             : "Heal approved"}
           onclick={healApproved}
           disabled={roll.frames.every((f) => !f.approved)}
@@ -1918,7 +1918,7 @@
         </button>
         <button
           class="btn"
-          title="Export approved — skips frames unchanged since their last export; shift-click re-exports everything"
+          title="Export approved: skips frames unchanged since their last export; shift-click re-exports everything"
           onclick={exportApproved}
           disabled={roll.frames.every((f) => !f.approved)}
         >
@@ -2074,17 +2074,17 @@
 </div>
 
 <Toasts toasts={toastList} onDismiss={dismissToastById} />
-{#if logOpen}
-  <LogPanel entries={activityLog} id="activity-log-panel" />
-{/if}
-{#if queueOpen}
-  <QueuePanel
-    entries={queueEntries}
-    id="job-queue-panel"
-    onCancel={cancelQueueEntry}
-    onCancelAll={cancelAllQueueJobs}
-  />
-{/if}
+<!-- Both panels render from load and toggle via `hidden` (see each
+     component's comment): the status bar's toggle buttons aria-controls
+     these ids, which must always resolve to real elements. -->
+<LogPanel entries={activityLog} id="activity-log-panel" open={logOpen} />
+<QueuePanel
+  entries={queueEntries}
+  id="job-queue-panel"
+  open={queueOpen}
+  onCancel={cancelQueueEntry}
+  onCancelAll={cancelAllQueueJobs}
+/>
 {#if shortcutsOpen}
   <ShortcutsPanel onClose={() => (shortcutsOpen = false)} />
 {/if}

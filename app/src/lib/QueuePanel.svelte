@@ -16,11 +16,13 @@
   let {
     entries,
     id,
+    open = true,
     onCancel,
     onCancelAll,
   }: {
     entries: QueueEntry[];
     id: string;
+    open?: boolean;
     onCancel: (entry: QueueEntry) => void;
     onCancelAll: () => void;
   } = $props();
@@ -32,8 +34,10 @@
 
 <!-- svelte-ignore a11y_no_noninteractive_tabindex -- same rationale as
      LogPanel: a scrollable region with no other focusable descendant needs
-     an explicit tabindex for keyboard users to scroll it in WKWebView. -->
-<div class="queue-panel" {id} role="region" aria-label="Job queue" tabindex="0">
+     an explicit tabindex for keyboard users to scroll it in WKWebView.
+     Rendered from load and toggled with `hidden`, also like LogPanel: the
+     status bar's Queue button aria-controls this id, which must exist. -->
+<div class="queue-panel" {id} role="region" aria-label="Job queue" tabindex="0" hidden={!open}>
   {#if entries.length === 0}
     <p class="queue-empty">queue is empty</p>
   {:else}
@@ -104,6 +108,10 @@
     border-left: 1px solid var(--border);
     overflow-y: auto;
     padding: var(--space-3);
+  }
+  .queue-panel[hidden] {
+    /* position: fixed would otherwise override the UA's [hidden] rule */
+    display: none;
   }
   .queue-panel:focus-visible {
     outline: 3px solid var(--focus);
@@ -190,7 +198,9 @@
     outline-offset: 1px;
   }
   .queue-cancel:disabled {
-    opacity: 0.4;
+    /* Matches .btn:disabled's designed state (app.css): recede via the
+       muted-label token instead of a blanket opacity wash. */
+    color: var(--text-3);
     cursor: default;
   }
   .queue-progress {

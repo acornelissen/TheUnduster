@@ -17,7 +17,9 @@
     roll: "M3 7h13v10H3z M16 10h5v4h-5z M6 7v10 M13 7v10",
     detect: "M11 4a7 7 0 1 0 0 14 a7 7 0 0 0 0-14 M16 16l4 4",
     heal: "M12 4v16 M4 12h16",
-    export: "M12 4v10 M8 10l4 4 4-4 M5 18h14",
+    // Up-and-out over a base line -- the mirror of download's down-into-a-
+    // tray, so the two no longer differ by a single pixel of baseline y.
+    export: "M12 14V4 M8 8l4-4 4 4 M5 18h14",
     approve: "M5 13l4 4 10-10",
     unapprove: "M6 6l12 12 M18 6L6 18",
     download: "M12 4v10 M8 10l4 4 4-4 M5 20h14",

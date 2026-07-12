@@ -52,7 +52,7 @@ export function composeQueueEntries(
   cancellingKey?: string | null,
 ): QueueEntry[] {
   const label = (index: number, kind: string) =>
-    `${frames[index]?.file_name ?? `frame ${index}`} — ${kind}`;
+    `${frames[index]?.file_name ?? `frame ${index}`} · ${kind}`;
 
   const runningEntries: QueueEntry[] = running.map((j) => ({
     key: `${j.kind}:${j.index}`,
