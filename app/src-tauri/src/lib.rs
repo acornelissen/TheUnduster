@@ -634,6 +634,50 @@ fn close_roll(
     Ok(())
 }
 
+/// Backs the "Reset roll decisions" File-menu action (TheUnduster-vem):
+/// clears operator decisions in the sidecar, keeps caches and scan results.
+/// The frontend reopens the roll afterwards so its in-memory state reloads
+/// from the reset sidecar under a fresh generation.
+#[tauri::command]
+fn reset_roll_decisions(roll: State<'_, roll::RollState>) -> Result<(), String> {
+    roll.reset_decisions()
+}
+
+/// Backs the "Delete roll data" File-menu action (TheUnduster-vem): closes
+/// the roll (generation bump strands any straggler job's writes), drops
+/// queued jobs, cancels the running one, releases activated images, then
+/// removes the whole `.unduster` directory -- sidecar, caches, thumbnails.
+/// Returns the roll directory so the frontend can reopen it (which rescans
+/// from scratch). The scans themselves are never touched.
+#[tauri::command]
+fn delete_roll_data(
+    roll: State<'_, roll::RollState>,
+    images: State<'_, Mutex<Images>>,
+    queue: State<'_, jobs::JobQueue>,
+) -> Result<String, String> {
+    let dir = roll.dir()?;
+    let stale_ids = roll.close()?;
+    queue.clear()?;
+    // A running job could otherwise recreate cache files right after the
+    // delete; the cooperative abort stops it at its next check-in. Its
+    // straggler writes would be harmless either way (provenance-keyed) --
+    // this just avoids surprising leftovers.
+    queue.request_cancel_running();
+    if !stale_ids.is_empty() {
+        let mut images = images.lock().map_err(|e| e.to_string())?;
+        for id in stale_ids {
+            images.close(id);
+        }
+    }
+    let sidecar = roll::sidecar_dir(&dir);
+    match std::fs::remove_dir_all(&sidecar) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // never scanned: fine
+        Err(e) => return Err(format!("{}: {e}", sidecar.display())),
+    }
+    Ok(dir.to_string_lossy().into_owned())
+}
+
 /// Retained-pixel budget for activated roll frames. Frames stay decoded
 /// until this is exceeded, then the least-recently-viewed release first
 /// (never the current frame or its immediate neighbors). Big-memory
@@ -2721,10 +2765,21 @@ fn build_menu(handle: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<taur
     let open_roll = MenuItemBuilder::with_id("open-roll", "Open Roll...")
         .accelerator("CmdOrCtrl+Shift+O")
         .build(handle)?;
+    // The destructive pair (TheUnduster-vem). No accelerators on purpose --
+    // these are deliberate, occasional actions, and both confirm in the
+    // frontend before touching anything.
+    let reset_roll = MenuItemBuilder::with_id("reset-roll-decisions", "Reset Roll Decisions...")
+        .build(handle)?;
+    let delete_roll_data =
+        MenuItemBuilder::with_id("delete-roll-data", "Delete Roll Data...").build(handle)?;
 
-    // Prepended (position 0) so the two app-specific actions read first,
-    // above the platform-provided Close Window; a separator keeps them
-    // visually distinct from it.
+    // Prepended (position 0), so insert in reverse of the intended reading
+    // order: open actions first, then a separator, then the destructive
+    // pair, then the original separator above the platform-provided Close
+    // Window.
+    file_submenu.insert(&PredefinedMenuItem::separator(handle)?, 0)?;
+    file_submenu.insert(&delete_roll_data, 0)?;
+    file_submenu.insert(&reset_roll, 0)?;
     file_submenu.insert(&PredefinedMenuItem::separator(handle)?, 0)?;
     file_submenu.insert(&open_roll, 0)?;
     file_submenu.insert(&open_scan, 0)?;
@@ -2750,6 +2805,12 @@ pub fn run() {
             "open-roll" => {
                 let _ = app.emit("menu-open-roll", ());
             }
+            "reset-roll-decisions" => {
+                let _ = app.emit("menu-reset-roll-decisions", ());
+            }
+            "delete-roll-data" => {
+                let _ = app.emit("menu-delete-roll-data", ());
+            }
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![
@@ -2765,6 +2826,8 @@ pub fn run() {
             components,
             open_roll,
             close_roll,
+            reset_roll_decisions,
+            delete_roll_data,
             path_kind,
             activate_frame,
             set_frame_threshold,

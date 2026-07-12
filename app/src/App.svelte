@@ -2,7 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
-  import { open, save } from "@tauri-apps/plugin-dialog";
+  import { confirm, open, save } from "@tauri-apps/plugin-dialog";
   import Viewer from "./lib/Viewer.svelte";
   import Icon from "./lib/Icon.svelte";
   import Filmstrip from "./lib/Filmstrip.svelte";
@@ -866,6 +866,67 @@
       un.then((f) => f());
     };
   });
+
+  $effect(() => {
+    const un = listen("menu-reset-roll-decisions", () => {
+      void resetRollDecisions();
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  $effect(() => {
+    const un = listen("menu-delete-roll-data", () => {
+      void deleteRollData();
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  // The destructive File-menu pair (TheUnduster-vem). Both confirm before
+  // touching anything and reopen the roll afterwards, so all in-memory
+  // state (jobStates, strokes, healed badges) reloads coherently under a
+  // fresh generation instead of being patched piecemeal.
+  async function resetRollDecisions() {
+    if (!roll) {
+      pushInfo("Open a roll first");
+      return;
+    }
+    const dir = roll.dir;
+    const ok = await confirm(
+      "Clear thresholds, approvals, brush strokes, and exported flags for every frame in this roll? Detection caches and thumbnails are kept, so re-detecting is instant.",
+      { title: "Reset roll decisions", kind: "warning" },
+    );
+    if (!ok) return;
+    try {
+      await invoke("reset_roll_decisions");
+      await openRollPath(dir);
+      pushInfo("Roll decisions reset");
+    } catch (e) {
+      pushError(String(e));
+    }
+  }
+
+  async function deleteRollData() {
+    if (!roll) {
+      pushInfo("Open a roll first");
+      return;
+    }
+    const ok = await confirm(
+      "Delete ALL of this roll's app data: decisions, detection caches, and thumbnails? Your scan files are not touched. The roll will rescan from scratch.",
+      { title: "Delete roll data", kind: "warning" },
+    );
+    if (!ok) return;
+    try {
+      const dir = await invoke<string>("delete_roll_data");
+      await openRollPath(dir);
+      pushInfo("Roll data deleted; rescanning");
+    } catch (e) {
+      pushError(String(e));
+    }
+  }
 
   async function openScan() {
     const path = await open({

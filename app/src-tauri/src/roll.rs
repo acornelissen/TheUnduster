@@ -79,7 +79,9 @@ pub struct Roll {
 
 const IMAGE_EXTENSIONS: &[&str] = &["tif", "tiff", "png", "jpg", "jpeg"];
 
-fn sidecar_dir(dir: &Path) -> PathBuf {
+/// Pub for the delete-roll-data command (TheUnduster-vem), which removes
+/// this whole directory after closing the roll.
+pub fn sidecar_dir(dir: &Path) -> PathBuf {
     dir.join(SIDECAR_SUBDIR)
 }
 
@@ -985,6 +987,28 @@ impl RollState {
         Ok(guard.as_ref().ok_or("no roll open")?.dir.clone())
     }
 
+    /// Clears every frame's operator decisions -- threshold, approval,
+    /// strokes, exported flag and provenance -- while KEEPING scan results
+    /// (defect counts/bboxes were computed at the default threshold, and
+    /// the on-disk caches self-invalidate by provenance anyway). Backs the
+    /// "Reset roll decisions" menu action (TheUnduster-vem); the caller
+    /// reopens the roll afterwards so in-memory state reloads coherently.
+    pub fn reset_decisions(&self) -> Result<(), String> {
+        let mut guard = self.roll.lock().map_err(|e| e.to_string())?;
+        let roll = guard.as_mut().ok_or("no roll open")?;
+        for frame in &mut roll.frames {
+            frame.threshold = default_threshold();
+            frame.approved = false;
+            frame.exported = false;
+            frame.export_provenance = None;
+            frame.strokes = Vec::new();
+            frame.redo_strokes = Vec::new();
+        }
+        let pending = self.snapshot_sidecar(roll)?;
+        drop(guard); // the disk write below must not hold the roll lock
+        self.commit_sidecar(pending)
+    }
+
     pub fn set_export_dest(&self, dest: PathBuf) -> Result<(), String> {
         let mut guard = self.export_dest.lock().map_err(|e| e.to_string())?;
         *guard = Some(dest);
@@ -1412,6 +1436,56 @@ mod state_tests {
         std::fs::write(dir.path().join("a.png"), b"x").unwrap();
         state.open(dir.path()).unwrap();
         assert!(state.frame_snapshot(5).unwrap_err().contains("no frame"));
+    }
+
+    #[test]
+    fn reset_decisions_clears_operator_state_but_keeps_scan_results() {
+        // The "Reset roll decisions" menu action (TheUnduster-vem):
+        // thresholds, approvals, strokes, exported flags and provenance all
+        // go; defect counts and bboxes are SCAN results, not decisions, and
+        // survive (they were computed at the default threshold anyway).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"x").unwrap();
+        let state = RollState::default();
+        state.open(dir.path()).unwrap();
+        let generation = state.generation();
+        state
+            .set_threshold_and_components(generation, 0, 0.8, Some(4), Some(vec![[1, 1, 2, 2]]))
+            .unwrap();
+        state.set_approved(0, true).unwrap();
+        state
+            .set_exported(generation, 0, Some("cafe01".to_string()))
+            .unwrap();
+        let stroke = crate::masks::Stroke {
+            erase: false,
+            radius: 5.0,
+            points: vec![[1.0, 2.0]],
+        };
+        state.set_strokes(0, vec![stroke], Vec::new()).unwrap();
+
+        state.reset_decisions().unwrap();
+
+        // Persisted: reopen from disk and inspect.
+        let (info, _) = state.open(dir.path()).unwrap();
+        let f = &info.frames[0];
+        assert_eq!(f.threshold, default_threshold());
+        assert!(!f.approved);
+        assert!(!f.exported);
+        assert!(f.strokes.is_empty());
+        assert!(f.redo_strokes.is_empty());
+        assert_eq!(f.defect_count, Some(4), "scan results must survive");
+        assert_eq!(f.bboxes.as_deref(), Some(&[[1, 1, 2, 2]][..]));
+        // Export provenance cleared too: a reset frame must never be
+        // skipped by the next "Export approved".
+        let mut guard = state.roll.lock().unwrap();
+        let roll = guard.as_mut().unwrap();
+        assert_eq!(roll.frames[0].export_provenance, None);
+    }
+
+    #[test]
+    fn reset_decisions_errors_when_no_roll_open() {
+        let state = RollState::default();
+        assert!(state.reset_decisions().unwrap_err().contains("no roll"));
     }
 
     #[test]
