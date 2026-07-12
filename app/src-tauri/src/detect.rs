@@ -16,11 +16,24 @@ struct LoadedDetector {
 /// Cheaply cloneable handle: Task 3's detect command clones it into a
 /// spawn_blocking closure (which needs 'static).
 #[derive(Clone)]
-pub struct DetectorState(Arc<Mutex<Option<LoadedDetector>>>);
+pub struct DetectorState {
+    model: Arc<Mutex<Option<LoadedDetector>>>,
+    /// The loaded model's file hash, mirrored out of `model` into its own
+    /// briefly-held lock so `hash()` never waits on `model`. Detection holds
+    /// `model` for the whole tile sweep (~9s per frame, a full roll during a
+    /// scan), and `enqueue_exports` reads this hash from the main thread --
+    /// reading it through `model` would freeze the app for that window, the
+    /// same defect fixed for the inpainter (TheUnduster-2jv). Written only at
+    /// load, so this lock is never held long enough to contend.
+    hash: Arc<Mutex<Option<[u8; 32]>>>,
+}
 
 impl Default for DetectorState {
     fn default() -> Self {
-        DetectorState(Arc::new(Mutex::new(None)))
+        DetectorState {
+            model: Arc::new(Mutex::new(None)),
+            hash: Arc::new(Mutex::new(None)),
+        }
     }
 }
 
@@ -38,7 +51,10 @@ impl DetectorState {
         // writes concurrently (TOCTOU note -- the app is the only writer in
         // practice, via `models::download_inpaint_model`'s atomic rename).
         let hash = crate::models::file_sha256(path)?;
-        *self.0.lock().map_err(|e| e.to_string())? = Some(LoadedDetector {
+        // Mirror the hash before taking `model`, matching the inpainter: the
+        // standalone `hash()` read stays cheap and current.
+        *self.hash.lock().map_err(|e| e.to_string())? = Some(hash);
+        *self.model.lock().map_err(|e| e.to_string())? = Some(LoadedDetector {
             detector: det,
             hash,
         });
@@ -66,7 +82,7 @@ impl DetectorState {
         img: &ImageBuf,
         progress: &mut dyn FnMut(usize, usize) -> ControlFlow<()>,
     ) -> Result<Vec<f32>, String> {
-        let mut guard = self.0.lock().map_err(|e| e.to_string())?;
+        let mut guard = self.model.lock().map_err(|e| e.to_string())?;
         match guard.as_mut() {
             Some(loaded) => loaded
                 .detector
@@ -99,7 +115,7 @@ impl DetectorState {
         img: &ImageBuf,
         progress: &mut dyn FnMut(usize, usize) -> ControlFlow<()>,
     ) -> Result<(Vec<f32>, [u8; 32]), String> {
-        let mut guard = self.0.lock().map_err(|e| e.to_string())?;
+        let mut guard = self.model.lock().map_err(|e| e.to_string())?;
         match guard.as_mut() {
             Some(loaded) => {
                 let probs = loaded
@@ -117,9 +133,12 @@ impl DetectorState {
     /// sibling methods, poisoning is not propagated as `Err` here: a
     /// poisoned state already fails `detect()` loudly on the hot path, so a
     /// cache write/read on this path just skips instead of erroring.
+    ///
+    /// Reads the `hash` mirror, NOT `model`: detection holds `model` for
+    /// seconds-to-minutes and this runs on the main-thread `enqueue_exports`
+    /// command, so locking `model` here would freeze the app (TheUnduster-2jv).
     pub fn hash(&self) -> Option<[u8; 32]> {
-        let guard = self.0.lock().ok()?;
-        guard.as_ref().map(|loaded| loaded.hash)
+        *self.hash.lock().ok()?
     }
 }
 
@@ -150,6 +169,14 @@ pub struct InpainterState {
     /// `inpainter_status` already uses, instead of the previous eprintln-only
     /// dead end. Cleared on the next successful `load`.
     load_error: Arc<Mutex<Option<String>>>,
+    /// The loaded model's file hash, mirrored out of `inner` into its own
+    /// briefly-held lock so `hash()` can read it WITHOUT waiting on `inner`.
+    /// A heal holds `inner` for its entire multi-minute run (see
+    /// `with_inpainter_hashed`), and `enqueue_exports` reads this hash from
+    /// the main thread -- reading it through `inner` froze the whole app
+    /// until the heal finished (TheUnduster-2jv). Written only at load, so
+    /// this lock is never held long enough to contend.
+    hash: Arc<Mutex<Option<[u8; 32]>>>,
 }
 
 impl Default for InpainterState {
@@ -158,6 +185,7 @@ impl Default for InpainterState {
             inner: Arc::new(Mutex::new(None)),
             fixture: Arc::new(AtomicBool::new(false)),
             load_error: Arc::new(Mutex::new(None)),
+            hash: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -190,6 +218,12 @@ impl InpainterState {
         // CoreML-first like the detector without re-measuring.
         let inp = fd_heal::Inpainter::load(path, fd_infer::Ep::Cpu).map_err(|e| e.to_string())?;
         let hash = crate::models::file_sha256(path)?;
+        // Mirror the hash into its own lock BEFORE taking `inner`, so a
+        // standalone `hash()` read is never even briefly stale against the
+        // model that's about to become current, and never has to wait on
+        // `inner`. `with_inpainter_hashed` still reads its paired hash from
+        // `inner` for the provenance atomicity guarantee it documents.
+        *self.hash.lock().map_err(|e| e.to_string())? = Some(hash);
         *self.inner.lock().map_err(|e| e.to_string())? = Some(LoadedInpainter {
             inpainter: inp,
             hash,
@@ -255,9 +289,12 @@ impl InpainterState {
     /// callers where a racing model swap is harmless, like the export skip
     /// decision (`export_provenance_hex`), where a mismatch only causes a
     /// spare re-export.
+    ///
+    /// Reads the `hash` mirror, NOT `inner`: a running heal holds `inner` for
+    /// minutes, and this is called from the main-thread `enqueue_exports`
+    /// command, so locking `inner` here froze the app (TheUnduster-2jv).
     pub fn hash(&self) -> Option<[u8; 32]> {
-        let guard = self.inner.lock().ok()?;
-        guard.as_ref().map(|loaded| loaded.hash)
+        *self.hash.lock().ok()?
     }
 }
 
@@ -442,6 +479,45 @@ mod tests {
     }
 
     #[test]
+    fn detector_hash_does_not_block_while_a_detect_holds_the_model() {
+        // Detection holds `model` for its whole tile sweep; `hash()` must read
+        // the mirror instead, so the main-thread enqueue_exports command never
+        // waits on it. Mirror of the inpainter test. See TheUnduster-2jv.
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let state = DetectorState::default();
+        state.load(&fixture()).unwrap();
+
+        // Hold `model` the way a running detect does, releasing on command.
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let detect_state = state.clone();
+        let detect = std::thread::spawn(move || {
+            let _guard = detect_state.model.lock().unwrap();
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        entered_rx.recv().unwrap();
+
+        let hash_state = state.clone();
+        let (hash_tx, hash_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = hash_tx.send(hash_state.hash());
+        });
+        let answered = hash_rx.recv_timeout(Duration::from_secs(2));
+
+        release_tx.send(()).unwrap();
+        detect.join().unwrap();
+
+        assert!(
+            matches!(answered, Ok(Some(_))),
+            "hash() blocked on the model lock held by a running detect"
+        );
+    }
+
+    #[test]
     fn loaded_inpainter_exposes_file_hash() {
         let state = InpainterState::default();
         assert!(state.hash().is_none());
@@ -470,6 +546,54 @@ mod tests {
             })
             .unwrap();
         assert!(saw_matching_pair);
+    }
+
+    #[test]
+    fn hash_does_not_block_while_a_heal_holds_the_inpainter() {
+        // A running heal holds `inner` for its whole duration (minutes) via
+        // with_inpainter_hashed. `hash()` must NOT contend on that lock:
+        // enqueue_exports calls it on the main thread, so a blocked hash()
+        // freezes the entire app until the heal finishes. See TheUnduster-2jv.
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let state = InpainterState::default();
+        state.load(&inpaint_fixture()).unwrap();
+
+        // Stand-in for a long-running heal: hold `inner` inside the closure
+        // until the test explicitly releases it.
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let heal_state = state.clone();
+        let heal = std::thread::spawn(move || {
+            heal_state
+                .with_inpainter_hashed(|_pair| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .unwrap();
+        });
+
+        // Wait until the heal is inside the closure with the lock held.
+        entered_rx.recv().unwrap();
+
+        // Read the hash off-thread so a blocking lock shows up as a timeout
+        // instead of wedging the test runner.
+        let hash_state = state.clone();
+        let (hash_tx, hash_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = hash_tx.send(hash_state.hash());
+        });
+        let answered = hash_rx.recv_timeout(Duration::from_secs(2));
+
+        // Let the heal finish regardless of the assertion outcome.
+        release_tx.send(()).unwrap();
+        heal.join().unwrap();
+
+        assert!(
+            matches!(answered, Ok(Some(_))),
+            "hash() blocked on the inpainter lock held by a running heal"
+        );
     }
 
     #[test]
