@@ -1402,6 +1402,10 @@ fn scan_roll(
                         let _ = roll_state.record_scan_result(generation, index, None, None);
                         let _ = app_for_task
                             .emit("roll-frame-error", RollFrameError { index, message });
+                        // Recorded for the re-arm recheck below, same as a
+                        // pass-1 decode failure: a frame that just failed to
+                        // detect must not re-arm the whole drain.
+                        failed_indices.insert(index);
                     }
                 }
             }
@@ -1435,10 +1439,20 @@ fn scan_roll(
             let setup = roll_state
                 .dir()
                 .and_then(|dir| Ok((dir, roll_state.frames_to_scan()?)));
-            let (next_roll_dir, next_indices) = match setup {
+            let (next_roll_dir, mut next_indices) = match setup {
                 Ok(v) => v,
                 Err(_) => break 'rearm, // no roll open (or lookup failed): nothing to re-arm for
             };
+            // Frames that just failed (decode or detect) stay unscanned in
+            // the sidecar, so frames_to_scan re-lists them -- and re-arming
+            // for them alone would re-drain the roll up to the cap for one
+            // undecodable file, duplicating its error toast each time and
+            // burning the re-arm budget meant for swap races. Only valid
+            // against the SAME roll: a new generation's indices are
+            // different frames that merely reuse the index space.
+            if next_generation == generation {
+                next_indices.retain(|i| !failed_indices.contains(i));
+            }
             if next_indices.is_empty() {
                 break 'rearm;
             }
