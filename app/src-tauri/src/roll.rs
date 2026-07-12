@@ -279,28 +279,56 @@ impl Roll {
         })
     }
 
-    /// Atomic sidecar write: previous file (if any) renamed to `.bak` first,
-    /// new content written to `.tmp`, then renamed into place. A crash
-    /// between these steps leaves either the old file, the `.bak`, or the
-    /// new file intact -- never a half-written `roll.json`.
-    pub fn save(&self) -> Result<(), String> {
-        let dir = sidecar_dir(&self.dir);
-        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let path = sidecar_path(&self.dir);
-        let tmp = path.with_extension("json.tmp");
-        let bak = path.with_extension("json.bak");
+    /// Serializes the sidecar envelope to bytes -- the in-lock half of a
+    /// save. Cheap relative to the file I/O it used to be welded to; see
+    /// `RollState::snapshot_sidecar` for why the two halves are split.
+    fn serialize_sidecar(&self) -> Result<Vec<u8>, String> {
         let envelope = SidecarEnvelope {
             version: CURRENT_VERSION,
             frames: self.frames.clone(),
         };
-        let bytes = serde_json::to_vec_pretty(&envelope).map_err(|e| e.to_string())?;
-        std::fs::write(&tmp, &bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
-        if path.exists() {
-            std::fs::rename(&path, &bak).map_err(|e| format!("{}: {e}", bak.display()))?;
-        }
-        std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(())
+        serde_json::to_vec_pretty(&envelope).map_err(|e| e.to_string())
     }
+
+    /// Atomic sidecar write: previous file (if any) renamed to `.bak` first,
+    /// new content written to `.tmp`, then renamed into place. A crash
+    /// between these steps leaves either the old file, the `.bak`, or the
+    /// new file intact -- never a half-written `roll.json`.
+    ///
+    /// No production caller since TheUnduster-vd5: every RollState setter
+    /// now snapshots under the lock and writes outside it (see
+    /// `snapshot_sidecar`/`commit_sidecar`). Kept as the one-call form the
+    /// Roll-level persistence tests exercise.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn save(&self) -> Result<(), String> {
+        write_sidecar_bytes(&self.dir, &self.serialize_sidecar()?)
+    }
+}
+
+/// The out-of-lock half of a save: the `.bak`/`.tmp`/rename dance on
+/// already-serialized bytes. Free function -- it must be callable without
+/// holding any reference into the roll.
+fn write_sidecar_bytes(roll_dir: &Path, bytes: &[u8]) -> Result<(), String> {
+    let dir = sidecar_dir(roll_dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let path = sidecar_path(roll_dir);
+    let tmp = path.with_extension("json.tmp");
+    let bak = path.with_extension("json.bak");
+    std::fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    if path.exists() {
+        std::fs::rename(&path, &bak).map_err(|e| format!("{}: {e}", bak.display()))?;
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// One serialized-but-unwritten sidecar state: the bytes, where they go, and
+/// the order they were taken in. Produced under the roll lock by
+/// `RollState::snapshot_sidecar`, consumed outside it by `commit_sidecar`.
+pub struct PendingSave {
+    roll_dir: PathBuf,
+    bytes: Vec<u8>,
+    seq: u64,
 }
 
 /// `(file_name, threshold, strokes)` -- the subset of a frame's fields the
@@ -405,6 +433,17 @@ pub struct RollState {
     /// each time the operator picks a directory; export jobs read it at run
     /// time, so re-queuing with a new directory redirects still-queued jobs.
     pub export_dest: Mutex<Option<PathBuf>>,
+    /// Order stamp for sidecar snapshots, bumped under the roll lock by
+    /// `snapshot_sidecar`. Together with `sidecar_written` it lets the file
+    /// write happen OUTSIDE the roll lock (the write used to block tile and
+    /// thumb serving behind disk I/O -- TheUnduster-vd5) while still
+    /// guaranteeing last-serialized wins on disk.
+    save_seq: AtomicU64,
+    /// The seq of the newest snapshot actually written. `commit_sidecar`
+    /// holds this lock across the write, so writes are serial and a
+    /// superseded snapshot (its seq below this) is skipped instead of
+    /// clobbering newer bytes.
+    sidecar_written: Mutex<u64>,
 }
 
 /// Outcome of `RollState::set_image_id`: either the write landed (carrying
@@ -425,6 +464,35 @@ pub enum SetImageId {
 }
 
 impl RollState {
+    /// The in-lock half of a setter's save: serialize the roll's current
+    /// state and stamp it with the next seq. The caller then DROPS the roll
+    /// guard and hands the snapshot to `commit_sidecar` -- the disk write no
+    /// longer holds the roll mutex hostage (a large-bbox sidecar write used
+    /// to stall tile/thumb serving behind it, TheUnduster-vd5).
+    fn snapshot_sidecar(&self, roll: &Roll) -> Result<PendingSave, String> {
+        Ok(PendingSave {
+            roll_dir: roll.dir.clone(),
+            bytes: roll.serialize_sidecar()?,
+            // fetch_add under the roll lock: seq order == serialization
+            // order, which is the whole guarantee commit_sidecar enforces.
+            seq: self.save_seq.fetch_add(1, Ordering::SeqCst) + 1,
+        })
+    }
+
+    /// The out-of-lock half: writes `pending` unless a newer snapshot
+    /// already landed. Holding `sidecar_written` across the write keeps
+    /// writes serial; a superseded snapshot returns Ok as a no-op -- its
+    /// state is fully contained in the newer bytes already on disk.
+    fn commit_sidecar(&self, pending: PendingSave) -> Result<(), String> {
+        let mut written = self.sidecar_written.lock().map_err(|e| e.to_string())?;
+        if *written >= pending.seq {
+            return Ok(());
+        }
+        write_sidecar_bytes(&pending.roll_dir, &pending.bytes)?;
+        *written = pending.seq;
+        Ok(())
+    }
+
     /// Opens `dir` as the new roll, replacing whatever roll was previously
     /// held. Returns the fresh roll's info alongside any `image_id`s that
     /// were still live on the *old* roll's frames -- the wholesale
@@ -727,7 +795,9 @@ impl RollState {
         frame.threshold = threshold;
         frame.defect_count = count;
         frame.bboxes = bboxes;
-        roll.save()?;
+        let pending = self.snapshot_sidecar(roll)?;
+        drop(guard); // the disk write below must not hold the roll lock
+        self.commit_sidecar(pending)?;
         Ok(true)
     }
 
@@ -739,7 +809,9 @@ impl RollState {
             .get_mut(index)
             .ok_or_else(|| format!("no frame {index}"))?;
         frame.approved = approved;
-        roll.save()
+        let pending = self.snapshot_sidecar(roll)?;
+        drop(guard); // the disk write below must not hold the roll lock
+        self.commit_sidecar(pending)
     }
 
     pub fn set_strokes(
@@ -756,7 +828,9 @@ impl RollState {
             .ok_or_else(|| format!("no frame {index}"))?;
         frame.strokes = strokes;
         frame.redo_strokes = redo_strokes;
-        roll.save()
+        let pending = self.snapshot_sidecar(roll)?;
+        drop(guard); // the disk write below must not hold the roll lock
+        self.commit_sidecar(pending)
     }
 
     /// Frame indices still missing a defect count, in order.
@@ -872,7 +946,9 @@ impl RollState {
             .ok_or_else(|| format!("no frame {index}"))?;
         frame.defect_count = count;
         frame.bboxes = bboxes;
-        roll.save()
+        let pending = self.snapshot_sidecar(roll)?;
+        drop(guard); // the disk write below must not hold the roll lock
+        self.commit_sidecar(pending)
     }
 
     /// Records that a frame was exported -- flag plus the heal provenance
@@ -899,7 +975,9 @@ impl RollState {
             .ok_or_else(|| format!("no frame {index}"))?;
         frame.exported = true;
         frame.export_provenance = provenance;
-        roll.save()
+        let pending = self.snapshot_sidecar(roll)?;
+        drop(guard); // the disk write below must not hold the roll lock
+        self.commit_sidecar(pending)
     }
 
     pub fn dir(&self) -> Result<PathBuf, String> {
@@ -1334,6 +1412,35 @@ mod state_tests {
         std::fs::write(dir.path().join("a.png"), b"x").unwrap();
         state.open(dir.path()).unwrap();
         assert!(state.frame_snapshot(5).unwrap_err().contains("no frame"));
+    }
+
+    #[test]
+    fn a_superseded_sidecar_snapshot_never_clobbers_a_newer_write() {
+        // The sidecar write happens OUTSIDE the roll lock (vd5): two
+        // commands can snapshot in order but reach the file writer in the
+        // opposite order. The seq guard must make the stale write a no-op
+        // -- last-serialized wins, never last-scheduled.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), b"x").unwrap();
+        let state = RollState::default();
+        state.open(dir.path()).unwrap();
+        let (older, newer) = {
+            let mut guard = state.roll.lock().unwrap();
+            let roll = guard.as_mut().unwrap();
+            roll.frames[0].approved = true;
+            let older = state.snapshot_sidecar(roll).unwrap();
+            roll.frames[0].approved = false;
+            let newer = state.snapshot_sidecar(roll).unwrap();
+            (older, newer)
+        };
+        state.commit_sidecar(newer).unwrap();
+        state.commit_sidecar(older).unwrap(); // superseded: must not write
+        state.open(dir.path()).unwrap(); // reload from disk
+        let guard = state.roll.lock().unwrap();
+        assert!(
+            !guard.as_ref().unwrap().frames[0].approved,
+            "stale snapshot clobbered the newer write"
+        );
     }
 
     #[test]
