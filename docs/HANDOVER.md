@@ -1,10 +1,16 @@
 # TheUnduster — Handover
 
-Snapshot for a fresh Claude Code session. Updated 2026-07-11 (58s fixed).
+Snapshot for a fresh Claude Code session. Updated 2026-07-12 (cancellation + backlog sweep landed).
 
 ## Where things stand
 
-- Branch `main`, HEAD is the tip of `main` after the 58s fix (`git log --oneline -5` to see it: fixture-status commits fe46be6 / a82ab92 / 02c147c). Working tree clean, everything pushed (`.beads/interactions.jsonl` may show as modified — it is a passive bd export, leave it).
+- Branch `main`, working tree clean apart from `.beads/interactions.jsonl` (a passive bd export, leave it). The 2026-07-11/12 sessions landed a large sweep — highlights:
+  - **Job/export cancellation (1jc)**: queue-panel row cancel + cancel-all; cooperative abort via `ControlFlow` progress callbacks (per defect / per tile / between export stages); `job-cancelled` event; no partial files, nothing committed on abort.
+  - **Model download UX (np6, 36w)**: progress bar + MB counter, stall timeout, cancel button, per-pid temp + startup sweep. The dev fixture is now called the "placeholder model" everywhere, and the status bar always names the healing engine (LaMa / placeholder model / classical only).
+  - **Export skip (jhk)**: export provenance recorded in the sidecar; "Export approved" skips unchanged frames, shift-click forces all. Per-frame engine receipts in the log (80i).
+  - **Correctness**: activation-time stamps travel with registry pixels to every cache write (02y); classical_fill onion-peels to the core of large defects (cm2); one failed frame no longer re-drains the scan (sol).
+  - **Perf/hygiene**: sidecar writes moved off the roll mutex with an ordered-write guard (vd5); last sync CCL off the Images lock (u98); capped component walk (csb); stale cache-temp sweeps (ckv).
+  - **UI/a11y pass (dm2)**: register, separators, designed disabled state, chip contrast, always-mounted ARIA panels, filmstrip accessible names, distinct export icon.
 - The app is a macOS Tauri 2 + Svelte 5 desktop tool over a Rust engine that removes dust/scratches from scanned film: scan a roll -> review -> detect (neural) -> adjust sensitivity -> brush corrections -> heal (LaMa inpainting) -> approve -> export.
 - Two halves of the product have very different maturity:
   - **Healing/brushing/export: real and solid.** LaMa inpainting, bit-exact outside the mask, grain re-synthesis. Tonality-agnostic (works on negatives and positives alike).
@@ -12,7 +18,12 @@ Snapshot for a fresh Claude Code session. Updated 2026-07-11 (58s fixed).
 
 ## Suggested first task
 
-No P1 open. The highest-value next piece of work is **TheUnduster-1jc (P2) — cancel queued/running jobs and exports**: the biggest remaining UX gap, since a wrong "Export approved" currently commits the operator to minutes of healing with no abort. `bd show 1jc` has the shape (queue-row removal for queued jobs; cooperative abort for the running job via the existing per-defect/per-tile progress callbacks; a job-cancelled event the frontend clears state from). Alternatively **4wj (release detector story)** if Albert is ready to decide bundle-vs-download and colour/bw variant selection — that one needs his input before planning. See the full backlog below.
+No P1 open. Everything doable without Albert's input or the trained model has been swept; what remains needs one of those:
+
+- **Needs Albert's decisions**: 4wj (release detector: bundle vs download, colour/bw variant selection), obr (detection in a separate worker process — architectural), fuj (split/wipe compare modes — UX direction), vem (menu action to clear the .unduster sidecar — destructive-action design).
+- **Needs a fresh focused session**: rcb (frontend component tests — App.svelte's whole state machine is untested; requires test infra: mocking @tauri-apps/api invoke/listen).
+- **Needs the running app / hardware**: jn3 (profile the tile protocol under pan/zoom), fag (Windows port).
+- **Awaiting Albert's manual gate**: 1cy, 2vf (implemented and reviewed; close after an app session confirms).
 
 ## How work is done here (match this)
 
@@ -38,6 +49,9 @@ No P1 open. The highest-value next piece of work is **TheUnduster-1jc (P2) — c
 - **Bit-exactness outside the mask** is structural: `fd_heal::write_back` writes native-depth pixels only at mask-true positions.
 - **Component walks are memoized and off the main thread** (bead 89m fix): `components` and `set_frame_threshold` are async + `spawn_blocking`, probs stored as `Arc<Vec<u8>>` so the CCL runs lock-free, result memoized per quantized threshold in the registry, cleared by every probs writer. The mask loop lives in `fd-tiles` for opt-3 in dev. Don't reintroduce a sync walk under the `Images` lock (the one remaining is `run_detect`'s post-detect prime — bead u98).
 - **CoreML is detector-only.** The LaMa inpainter is CPU on purpose — measured 2026-07-10: CoreML fragments it into 621 partitions, runs ~3x slower, diverges up to ~44/255. The comment at the `Ep::Cpu` site records this; do not "upgrade" it without re-measuring.
+- **Source stamps travel with the pixels they describe** (02y fix): every decode captures its `SourceStamp` immediately BEFORE reading pixels, stores it on the registry entry, and every cache write from those pixels reuses that stamp. Never stat at cache-write time for registry-backed data — an overwritten source would pair a fresh stamp with stale pixels and persist stale results across relaunch. A failed stat means "skip the cache interaction", never "fail the operation".
+- **Sidecar writes happen outside the roll mutex** (vd5 fix): setters serialize + take a seq under the lock (`snapshot_sidecar`), then write after release (`commit_sidecar`, serial via its own lock, superseded snapshots skipped). Don't reintroduce `roll.save()` inside a roll-lock critical section.
+- **Cancellation is cooperative and flag-decided** (1jc): engine progress callbacks return `ControlFlow`; the worker records the running job under the same lock cancel requests take, clears the flag before each job, and decides job-cancelled vs job-error by the flag, not by matching error strings. File writes are never interrupted mid-write.
 - **The dev fixture inpainter is a mean-fill stub, not LaMa.** In debug builds, if `lama.onnx` is absent or fails to load, `lib.rs` setup autoloads `engine/fixtures/tiny-inpaint.onnx` via `InpainterState::load_fixture` — a mean-fill stub that produces flat grey fills on large brush strokes. As of the 58s fix this is now reported honestly: `inpainter_status` returns `"fixture"`, the UI shows the download card + a "healing: development stub" hint + the Heal button title warns, and a real-LaMa load failure toasts (release too). But the underlying behaviour is unchanged — if you heal in a dev build without real LaMa, results are stub-quality by design. Download real LaMa to heal for real. Caches made by the stub correctly miss when LaMa arrives (provenance binds the model hash — do not special-case this).
 
 ## Landed but pending Albert's manual gate (likely fine, just unconfirmed)
@@ -48,8 +62,9 @@ No P1 open. The highest-value next piece of work is **TheUnduster-1jc (P2) — c
 ## Open backlog, prioritized
 
 - **P1**: none open.
-- **P2**: 1jc (cancel queued/running jobs + exports — the biggest UX gap: a wrong "Export approved" commits minutes with no abort), 4wj (release detector story — needs Albert's decisions: bundle vs download, colour/bw variant selection), jhk (re-export only what changed), 36w (model-download timeout/cancel), 3uz (benchmark CoreML vs CPU detection on the real model).
-- **P3**: 80i, cm2, u98 (nav-lag residual), ckv (sweep orphaned cache temps), dm2 (UI register/contrast nits), 1cy/2vf close-out, jb2 (IR channel — also near-free training labels), rcb (frontend component tests — real debt: App.svelte carries the whole state machine untested), plus perf/Windows/compare-mode items (jn3, vd5, obr, fag, fuj, csb, sol, 02y).
+- **P2**: 4wj (release detector story — needs Albert's decisions: bundle vs download, colour/bw variant selection), 3uz (benchmark CoreML vs CPU detection on the real model — blocked on the model existing).
+- **P3**: rcb (frontend component tests — the biggest remaining debt), obr (detection worker process), fuj (split/wipe compare modes), vem (clear-sidecar menu action), jn3 (tile-protocol profiling), fag (Windows port), jb2 (IR channel), 1cy/2vf close-out.
+- Closed in the 07-11/12 sweep: 1jc, np6, 36w, jhk, ckv, 80i, cm2, u98, sol, 02y, dm2, csb, vd5.
 
 ## The critical path
 
