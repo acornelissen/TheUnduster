@@ -91,6 +91,39 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Removes `atomic_write` temps (`*.tmp-unduster-*`) in `dir` whose mtime
+/// is older than `max_age`, returning how many went. In-process failures
+/// clean up after themselves (see `atomic_write`); this catches the temps a
+/// crash orphans -- a pyramid temp is hundreds of MB, too big to leave
+/// behind forever. The age gate makes the sweep safe to run at roll open
+/// while a straggler write finishes: anything actively being written is
+/// seconds old, not an hour. A missing dir (roll never cached) is a no-op.
+/// Mirrors `models::sweep_stale_temps` (different name filter, same shape);
+/// third copy consolidates them.
+pub fn sweep_stale_temps(dir: &Path, max_age: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.contains(".tmp-unduster-") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| mtime.elapsed().ok())
+            .is_some_and(|age| age >= max_age);
+        if stale && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Writes width*height u8-quantized probabilities (see
 /// `fd_tiles::quantize_prob` for the quantization rule -- callers quantize
 /// once at their own boundary; this function no longer quantizes), zstd-
@@ -975,6 +1008,47 @@ pub fn prune_pyramid_cache(dir: &Path, budget_bytes: u64, keep: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sweep_removes_only_stale_write_temps() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale_a = dir.path().join("frame.tif.probs.tmp-unduster-999-0");
+        let stale_b = dir.path().join("frame.tif.pyr.tmp-unduster-999-3");
+        let real_probs = dir.path().join("frame.tif.probs");
+        let real_pyr = dir.path().join("frame.tif.pyr");
+        for p in [&stale_a, &stale_b, &real_probs, &real_pyr] {
+            std::fs::write(p, b"x").unwrap();
+        }
+
+        // max_age zero: everything counts as stale, so only the filename
+        // filter decides what goes.
+        let removed = sweep_stale_temps(dir.path(), std::time::Duration::ZERO);
+        assert_eq!(removed, 2);
+        assert!(!stale_a.exists());
+        assert!(!stale_b.exists());
+        assert!(real_probs.exists());
+        assert!(real_pyr.exists());
+
+        // A temp younger than max_age survives: it may belong to a write
+        // still in flight (a straggler job finishing against this roll).
+        let live = dir.path().join("frame.tif.heal.tmp-unduster-1000-0");
+        std::fs::write(&live, b"x").unwrap();
+        assert_eq!(
+            sweep_stale_temps(dir.path(), std::time::Duration::from_secs(3600)),
+            0
+        );
+        assert!(live.exists());
+    }
+
+    #[test]
+    fn sweep_of_a_missing_dir_is_a_quiet_noop() {
+        // A roll that has never cached anything has no cache dir at all.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            sweep_stale_temps(&dir.path().join("nope"), std::time::Duration::ZERO),
+            0
+        );
+    }
 
     // The same on-disk bytes the pre-u8 write path produced by quantizing
     // ((i % 97) / 96.0): compressible enough that the corruption tests'

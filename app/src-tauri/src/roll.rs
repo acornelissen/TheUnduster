@@ -267,6 +267,12 @@ impl Roll {
             }
         }
 
+        // Best-effort: a crash mid-cache-write orphans its temp file (a
+        // pyramid temp is hundreds of MB), and roll open is the natural
+        // moment to reclaim the space. The hour age gate keeps a straggler
+        // job's in-flight write safe -- see sweep_stale_temps.
+        crate::cache::sweep_stale_temps(&cache_dir(dir), std::time::Duration::from_secs(3600));
+
         Ok(Roll {
             dir: dir.to_path_buf(),
             frames,
