@@ -22,6 +22,7 @@
     composeLeft,
     composeRight,
     formatModelProgress,
+    healingEngineFor,
   } from "./lib/status";
   import { pushToast, dismissToast, pushLog, type Toast } from "./lib/toasts";
 
@@ -1685,17 +1686,10 @@
       totalCount: r ? r.frames.length : 0,
     });
   });
-  // Which engine a heal would run with right now, from the same modelStatus
-  // the Model toolbar group renders. "missing"/"available"/"downloading" all
-  // mean nothing is loaded, i.e. classical fill only. (Dev-build nuance:
-  // during a download started FROM the fixture state this briefly says
-  // "classical only" while the fixture would still heal -- same transient
-  // imprecision the old stub hint had, and healing mid-download is rare.)
-  const healingEngine = $derived.by((): "lama" | "placeholder" | "classical" => {
-    if (modelStatus === "loaded") return "lama";
-    if (modelStatus === "fixture") return "placeholder";
-    return "classical";
-  });
+  // Which engine a heal would run with right now, mapped from modelStatus by
+  // the pure helper in lib/status.ts (tested there); feeds the status bar,
+  // the heal-button warnings, and the placeholder export toast.
+  const healingEngine = $derived(healingEngineFor(modelStatus));
   // Shared by the status bar and the Heal button titles below -- one
   // definition of "is healing currently the placeholder" so both surfaces
   // can never disagree.

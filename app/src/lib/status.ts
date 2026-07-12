@@ -135,6 +135,22 @@ export interface RightZoneInput {
   healingEngine: "lama" | "placeholder" | "classical";
 }
 
+/** Which engine a heal would run with right now, from the model status the
+ * Model toolbar group renders. "loaded" is real LaMa; "fixture" is the
+ * mean-fill placeholder; "missing"/"available"/"downloading" all mean
+ * nothing is loaded, i.e. classical fill only. (Dev-build nuance: during a
+ * download started FROM the fixture state this briefly reads "classical"
+ * while the fixture would still heal -- an accepted transient, healing
+ * mid-download is rare.) Feeds `composeRight`'s `healingEngine`, the heal
+ * button warnings, and the placeholder export toast, so all three agree. */
+export function healingEngineFor(
+  modelStatus: ActivityInput["modelStatus"],
+): RightZoneInput["healingEngine"] {
+  if (modelStatus === "loaded") return "lama";
+  if (modelStatus === "fixture") return "placeholder";
+  return "classical";
+}
+
 const HEALING_ENGINE_LABEL: Record<RightZoneInput["healingEngine"], string> = {
   lama: "healing: LaMa",
   placeholder: "healing: placeholder model",

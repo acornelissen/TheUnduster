@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { composeActivity, composeLeft, composeRight, formatModelProgress } from "./status";
+import {
+  composeActivity,
+  composeLeft,
+  composeRight,
+  formatModelProgress,
+  healingEngineFor,
+} from "./status";
 
 describe("composeActivity", () => {
   const base = {
@@ -289,5 +295,21 @@ describe("composeRight", () => {
         healingEngine: "placeholder",
       }),
     ).toBe("healing: placeholder model  2/4 approved  1 job queued");
+  });
+});
+
+describe("healingEngineFor", () => {
+  it("maps a loaded model to LaMa", () => {
+    expect(healingEngineFor("loaded")).toBe("lama");
+  });
+
+  it("maps the fixture to the placeholder engine", () => {
+    expect(healingEngineFor("fixture")).toBe("placeholder");
+  });
+
+  it("maps every not-loaded status to classical only", () => {
+    expect(healingEngineFor("missing")).toBe("classical");
+    expect(healingEngineFor("available")).toBe("classical");
+    expect(healingEngineFor("downloading")).toBe("classical");
   });
 });
