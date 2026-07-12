@@ -58,6 +58,61 @@ fn probabilities_match_python_reference() {
     );
 }
 
+/// The app loads the detector CoreML-first with a CPU fallback (see
+/// DetectorState::load), so its scans run on the CoreML EP while the parity
+/// guarantee above is only proven for CPU. This asserts the EP swap the app
+/// actually ships does not move the result: CoreML must match the CPU EP
+/// within tolerance on the raw probabilities, and produce a bit-identical
+/// thresholded mask -- the mask is what every downstream stage consumes.
+/// macOS-only: the CoreML EP does not exist on other targets.
+#[cfg(target_os = "macos")]
+#[test]
+fn coreml_matches_the_cpu_ep() {
+    let (img, w, h, _tol) = load_parity_input();
+    let model = fixtures().join("tiny-detector.onnx");
+
+    let mut cpu = Detector::load(&model, Ep::Cpu).unwrap();
+    let cpu_probs = cpu.probabilities(&img).unwrap();
+
+    // The app tolerates a CoreML load failure by falling back to CPU; a test
+    // machine without a usable CoreML EP has nothing to compare, so skip
+    // rather than fail (the CPU parity test above still covers correctness).
+    let Ok(mut ml) = Detector::load(&model, Ep::CoreML) else {
+        eprintln!("CoreML EP unavailable on this machine; skipping parity check");
+        return;
+    };
+    let ml_probs = ml.probabilities(&img).unwrap();
+    assert_eq!(ml_probs.len(), (w * h) as usize);
+
+    let mut max_diff = 0f32;
+    for (a, b) in cpu_probs.iter().zip(ml_probs.iter()) {
+        max_diff = max_diff.max((a - b).abs());
+    }
+    eprintln!("CoreML-vs-CPU max prob diff: {max_diff}");
+
+    // Thresholded parity is the operational contract: the mask, not the raw
+    // probability, is what tiling/healing consume.
+    for (t, &p_cpu) in cpu_probs.iter().enumerate() {
+        assert_eq!(
+            p_cpu > 0.5,
+            ml_probs[t] > 0.5,
+            "CoreML and CPU disagree on the 0.5 mask at pixel {t}: cpu={p_cpu}, coreml={}",
+            ml_probs[t]
+        );
+    }
+
+    // Raw-probability tolerance: EP arithmetic differs, so this is looser than
+    // the Python-reference tolerance, but still tight enough to catch a real
+    // regression. The measured deviation on this fixture is ~9e-8 (pure fp
+    // noise -- the tiny model runs near-identically on both EPs), so 0.01
+    // leaves wide margin while still failing on any material divergence.
+    const COREML_CPU_TOL: f32 = 0.01;
+    assert!(
+        max_diff < COREML_CPU_TOL,
+        "CoreML deviates from CPU by {max_diff} (tolerance {COREML_CPU_TOL})"
+    );
+}
+
 #[test]
 fn mask_thresholds_probabilities() {
     let (img, ..) = load_parity_input();
