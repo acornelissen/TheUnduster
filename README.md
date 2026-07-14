@@ -88,6 +88,30 @@ When you open a roll (a folder of scans), the app keeps its working state next t
 Nothing here touches your original scan files. The app processes everything on
 your machine — it never uploads your scans and sends no telemetry.
 
+## Roadmap
+
+Where the project is headed, roughly in priority order. None of this is fixed —
+issues and discussion shape it, and help on any of it is welcome.
+
+### Highest priority — needed before the app is genuinely useful
+
+- **Train the real defect detector.** Replace the development fixture model with
+  one trained on real film scans that passes the benchmark gate. This is the
+  single biggest gap; see [`training/`](training/README.md) and `training/DATA.md`.
+
+### Near-term
+
+- **More formats and defect types.** Broaden file-format and bit-depth support,
+  and extend detection beyond dust and scratches to defects like hairs, mold,
+  and water spots.
+- **Batch and workflow polish.** Faster batch processing, better export presets,
+  richer undo/history, and general UX refinement.
+
+### Later — larger efforts
+
+- **Broader platform support.** Beyond Apple Silicon macOS, bring builds to Intel
+  Macs, Windows, and Linux.
+
 ## Contributing
 
 Contributions are welcome, whether that's a bug report, a documentation fix, a
