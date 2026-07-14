@@ -1,10 +1,34 @@
+# Build output
+target/
+app/node_modules/
+app/dist/
+app/build/
+app/src-tauri/target/
 
-# Beads / Dolt files (added by bd init)
+# Python / training
+training/.venv/
+__pycache__/
+*.pyc
+
+# Models downloaded at runtime (verified by SHA-256 before use)
+*.onnx.download
+
+# Per-roll working state written next to a user's scans
+.unduster/
+
+# Local tooling and issue tracking (not part of the public project)
+.beads/
 .dolt/
 *.db
 .beads-credential-key
-.beads/proxieddb/
+.claude/
+.codex/
+.agents/
+CLAUDE.md
+AGENTS.md
 
-# Rust build output (workspace root moved here in app 3a task 1)
-target/
+# OS / editor
 .DS_Store
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,49 @@
+name: Bug report
+description: Report something that isn't working the way you expect
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. The more detail you give,
+        the faster it can be fixed. Please do not attach scans you can't share
+        publicly; a small, safe sample that reproduces the problem is ideal.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+      placeholder: I opened a roll and clicked Detect, and the app...
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open a folder of scans
+        2. Set sensitivity to...
+        3. Click...
+    validations:
+      required: true
+  - type: input
+    id: macos-version
+    attributes:
+      label: macOS version
+      placeholder: "e.g. macOS 15.5 (Apple Silicon)"
+    validations:
+      required: true
+  - type: input
+    id: app-version
+    attributes:
+      label: App version or commit
+      placeholder: "e.g. commit abc1234, or a build date"
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Paste any relevant log output or drag in screenshots.
+    validations:
+      required: false

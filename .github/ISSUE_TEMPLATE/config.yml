@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and discussion
+    url: https://github.com/acornelissen/TheUnduster/discussions
+    about: Ask questions, share scans, and discuss ideas with the community.
+  - name: Report a security vulnerability
+    url: https://github.com/acornelissen/TheUnduster/security/advisories/new
+    about: Please report security issues privately, not as a public issue.

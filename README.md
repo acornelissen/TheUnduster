@@ -1,8 +1,19 @@
 # TheUnduster
 
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+![Platform: Apple Silicon macOS](https://img.shields.io/badge/platform-Apple%20Silicon%20macOS-black.svg)
+
 TheUnduster is a macOS desktop app that finds and removes dust and scratches from scanned film. It's a Tauri 2 + Svelte 5 frontend over a Rust engine. Defect detection runs a neural network through ONNX Runtime, using CoreML on Apple Silicon with a CPU fallback. Healing uses LaMa inpainting, downloaded on first run (207 MB). The app targets Apple Silicon Macs first.
 
 See [docs/user-manual.md](docs/user-manual.md) for how to use the app.
+
+> **Project status: the defect detector is not trained yet.**
+> The app currently ships with a small *fixture* detector model used for
+> development, not a model trained on real film. Detection will miss real dust
+> and scratches until a proper model is trained on real data and passes the
+> benchmark gate. Training that model is the biggest open piece of work — see
+> [Models](#models) and [`training/`](training/README.md) below. Contributions
+> of labelled scans and training help are especially welcome.
 
 ## Repository layout
 
@@ -27,13 +38,13 @@ Rust builds run through `cargo`, the frontend through `npm`, training through `u
 
 ## Build and run
 
-```
+```bash
 cd app && npm install && mise exec -- npm run tauri dev
 ```
 
 Release build:
 
-```
+```bash
 cd app && npm run tauri build
 ```
 
@@ -41,7 +52,7 @@ cd app && npm run tauri build
 
 Rust workspace (from the repo root):
 
-```
+```bash
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
@@ -49,14 +60,14 @@ cargo fmt --all --check
 
 Frontend (from `app/`):
 
-```
+```bash
 npm run test
 npm run check
 ```
 
 Training (from `training/`):
 
-```
+```bash
 uv run pytest
 ```
 
@@ -64,7 +75,7 @@ uv run pytest
 
 The healing model (LaMa, ONNX) is not bundled. The app downloads it on first use from a pinned Hugging Face revision and verifies it against a pinned SHA-256 before it's used (`app/src-tauri/src/models.rs`). Until it's downloaded, healing falls back to a classical fill with no neural inpainting.
 
-The defect detector currently ships as a fixture model for development, not a trained model — see `training/DATA.md` for the data collection plan and `training/README.md` for the training pipeline. Detection quality is expected to improve once a model is trained on real data and passes the benchmark gate described there.
+**The defect detector is not trained yet.** It currently ships as a fixture model for development, not a model trained on real film — see `training/DATA.md` for the data collection plan and `training/README.md` for the training pipeline. Detection quality is expected to improve once a model is trained on real data and passes the benchmark gate described there.
 
 ## Working state per roll
 
@@ -74,4 +85,21 @@ When you open a roll (a folder of scans), the app keeps its working state next t
 - `thumbs/` — filmstrip thumbnails.
 - `cache/` — cached detection probabilities (`.probs`) and healed-pixel deltas (`.heal`), each keyed to the source file's content and the model that produced them, so a changed file or a changed model invalidates the cache automatically (`app/src-tauri/src/cache.rs`).
 
-Nothing here touches your original scan files.
+Nothing here touches your original scan files. The app processes everything on
+your machine — it never uploads your scans and sends no telemetry.
+
+## Contributing
+
+Contributions are welcome, whether that's a bug report, a documentation fix, a
+test scan, or code. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for setup and
+the checks to run, and please follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+Use [GitHub Issues](https://github.com/acornelissen/TheUnduster/issues) for bugs
+and features, and [Discussions](https://github.com/acornelissen/TheUnduster/discussions)
+for questions and ideas. To report a security problem, see
+[SECURITY.md](SECURITY.md).
+
+## License
+
+TheUnduster is free software licensed under the
+[GNU General Public License v3.0](LICENSE). You may use, study, share, and modify
+it; if you distribute a modified version, it must stay under the same license.
