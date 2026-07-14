@@ -15,6 +15,31 @@ See [docs/user-manual.md](docs/user-manual.md) for how to use the app.
 > [Models](#models) and [`training/`](training/README.md) below. Contributions
 > of labelled scans and training help are especially welcome.
 
+## Screenshots
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <img src="docs/images/detection.png" width="100%" alt="TheUnduster with a scanned film frame open; red circles mark each detected dust spot and scratch, and a filmstrip of the roll runs along the bottom">
+      <br><sub>Detection marks dust and scratches with red circles.</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="docs/images/roll-filmstrip.png" width="100%" alt="Browsing a roll of black and white scans; the filmstrip along the bottom shows every frame in the folder with its defect count">
+      <br><sub>A roll is a folder of scans; the filmstrip tracks every frame.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src="docs/images/heal-before.png" width="100%" alt="Close-up of a scan before healing: dozens of dust spots across the frame, each circled by the detector">
+      <br><sub>Before: detected defects, up close.</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="docs/images/heal-after.png" width="100%" alt="The same close-up after healing: the dust spots are gone and the surface is clean">
+      <br><sub>After: the same area healed with LaMa inpainting.</sub>
+    </td>
+  </tr>
+</table>
+
 ## Repository layout
 
 - `app/` — the desktop app. `app/src/` is the Svelte 5 frontend (Viewer, Filmstrip, StatusBar, queue and log panels). `app/src-tauri/` is the Rust backend: roll and sidecar state, the job queue, model download/verification, and the Tauri commands the frontend calls.
