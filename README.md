@@ -106,6 +106,10 @@ issues and discussion shape it, and help on any of it is welcome.
   and water spots.
 - **Batch and workflow polish.** Faster batch processing, better export presets,
   richer undo/history, and general UX refinement.
+- **Infrared (IR) channel handling.** Read the infrared channel that many film
+  scanners capture alongside RGB (Digital ICE and similar), where dust and
+  scratches show up directly because they block infrared. Use it as a defect
+  mask to guide detection and healing, and support scans that ship an IR layer.
 
 ### Later — larger efforts
 
